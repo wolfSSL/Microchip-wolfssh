@@ -133,6 +133,7 @@ void* wolfSSH_GetIOWriteCtx(WOLFSSH* ssh)
         #include <errno.h>
     #elif defined(WOLFSSH_ZEPHYR)
         #include <zephyr/net/socket.h>
+        #include <zephyr/version.h>
     #else
         #include <sys/types.h>
         #include <errno.h>
@@ -249,6 +250,15 @@ void* wolfSSH_GetIOWriteCtx(WOLFSSH* ssh)
 #elif defined(WOLFSSL_NUCLEUS)
     #define SEND_FUNCTION NU_Send
     #define RECV_FUNCTION NU_Recv
+#elif defined(WOLFSSH_ZEPHYR)
+    #if KERNEL_VERSION_NUMBER >= 0x40100
+        /* Zephyr 4.1 dropped the POSIX socket names; zsock_ is always there. */
+        #define SEND_FUNCTION zsock_send
+        #define RECV_FUNCTION zsock_recv
+    #else
+        #define SEND_FUNCTION send
+        #define RECV_FUNCTION recv
+    #endif
 #else
     #define SEND_FUNCTION send
     #define RECV_FUNCTION recv
@@ -399,12 +409,13 @@ int wsEmbedSend(WOLFSSH* ssh, void* data, word32 sz, void* ctx)
     }
 
     /* not enough space to send */
-    if ((sent = TCPIP_TCP_PutIsReady(sd)) < sz) {
-        sz = sent;
-    }
+    sent = (int)TCPIP_TCP_PutIsReady(sd);
     if (sent == 0) {
         /* In the case that 0 is returned the main TCP loop needs to be called */
         return WS_CBIO_ERR_WANT_WRITE;
+    }
+    if ((word32)sent < sz) {
+        sz = (word32)sent;
     }
 #endif /* MICROCHIP_MPLAB_HARMONY */
 

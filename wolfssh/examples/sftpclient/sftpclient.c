@@ -24,6 +24,9 @@
 #include <wolfssh/ssh.h>
 #include <wolfssh/internal.h>
 #include <wolfssh/wolfsftp.h>
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    #include <wolfssh/certman.h>
+#endif
 #include <wolfssh/test.h>
 #include <wolfssh/port.h>
 #include <wolfssl/wolfcrypt/ecc.h>
@@ -38,6 +41,14 @@
 #ifdef WOLFSSH_CERTS
     #include <wolfssl/wolfcrypt/asn.h>
 #endif
+
+/* Shared by sftpclient_test() and the -W pre-scan in main(). */
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    #define SFTPC_OPTLIST_STORE "W:"
+#else
+    #define SFTPC_OPTLIST_STORE ""
+#endif
+#define SFTPC_OPTLIST "?d:gh:i:j:k:l:p:r:u:EGNP:J:A:X" SFTPC_OPTLIST_STORE
 
 #if defined(WOLFSSH_SFTP) && !defined(NO_WOLFSSH_CLIENT)
 
@@ -96,7 +107,7 @@ static void err_msg(const char* s)
     static word32 startTime;
     #define TIMEOUT_VALUE 120
 
-    word32 current_time(int);
+    word32 current_time(int reset);
 #ifdef USE_WINDOWS_API
     #include <time.h>
     #define WIN32_LEAN_AND_MEAN
@@ -147,6 +158,7 @@ static void myStatusCb(WOLFSSH* sshIn, word32* bytes, char* name)
     static word32 lastOutputTime = 0;
     static word32 lastPrintedBytes[2] = {0, 0};
     word32 elapsedTime;
+    word32 nameSz;
 #endif
     char buf[80];
     word64 longBytes = ((word64)bytes[1] << 32) | bytes[0];
@@ -155,25 +167,31 @@ static void myStatusCb(WOLFSSH* sshIn, word32* bytes, char* name)
     currentTime = current_time(0);
     if (currentTime == lastOutputTime) {
         if (bytes[0] != lastPrintedBytes[0] || bytes[1] != lastPrintedBytes[1]) {
-            /* Progress made in the same second — throttle but track latest */
+            /* Progress made in the same second - throttle but track latest */
             lastPrintedBytes[0] = bytes[0];
             lastPrintedBytes[1] = bytes[1];
             return;
         }
-        /* bytes unchanged: EOF final call — fall through to print */
+        /* bytes unchanged: EOF final call - fall through to print */
     }
     else {
         lastOutputTime = currentTime;
     }
     lastPrintedBytes[0] = bytes[0];
     lastPrintedBytes[1] = bytes[1];
-    if (WSTRNCMP(currentFile, name, WSTRLEN(name)) != 0) {
+    /* clamp over-long names: currentFile holds the truncated prefix, so the
+     * comparison must use the same bound or every call looks like a new file */
+    nameSz = (word32)WSTRLEN(name);
+    if (nameSz >= sizeof(currentFile))
+        nameSz = (word32)sizeof(currentFile) - 1;
+    if (WSTRNCMP(currentFile, name, nameSz) != 0 ||
+            currentFile[nameSz] != '\0') {
         startTime = current_time(1);
         lastOutputTime = 0; /* Reset timer for new file transfer */
         lastPrintedBytes[0] = 0;
         lastPrintedBytes[1] = 0;
-        WMEMSET(currentFile, 0, WOLFSSH_MAX_FILENAME);
-        WSTRNCPY(currentFile, name, WOLFSSH_MAX_FILENAME);
+        WMEMSET(currentFile, 0, sizeof(currentFile));
+        WMEMCPY(currentFile, name, nameSz);
     }
     elapsedTime = currentTime - startTime;
     WSNPRINTF(buf, sizeof(buf), "Processed %8llu\t bytes in %d seconds\r",
@@ -182,7 +200,7 @@ static void myStatusCb(WOLFSSH* sshIn, word32* bytes, char* name)
     if (elapsedTime > TIMEOUT_VALUE) {
         WSNPRINTF(buf, sizeof(buf), "\nProcess timed out at %d seconds, "
                 "stopping\r", elapsedTime);
-        WMEMSET(currentFile, 0, WOLFSSH_MAX_FILENAME);
+        WMEMSET(currentFile, 0, sizeof(currentFile));
         wolfSSH_SFTP_Interrupt(ssh);
     }
 #endif
@@ -259,7 +277,7 @@ static void sig_handler(const int sig)
     (void)sig;
 
     interrupt = 1;
-    wolfSSH_SFTP_Interrupt(ssh);
+    wolfSSH_SFTP_Interrupt(ssh); /* NOLINT(bugprone-signal-handler) */
 }
 #endif /* WS_NO_SIGNAL */
 
@@ -348,6 +366,7 @@ static void ShowCommands(void)
     printf("\n\nCommands :\n");
     printf("\tcd  <string>                      change directory\n");
     printf("\tchmod <mode> <path>               change mode\n");
+    printf("\tcreat <mode> <path>               create file with given permissions\n");
     printf("\tget <remote file> <local file>    pulls file(s) from server\n");
     printf("\tlcd <path>                        change local directory\n");
     printf("\tlls                               list local directory\n");
@@ -381,6 +400,23 @@ static void ShowUsage(void)
     printf(" -g            put local filename as remote filename\n");
     printf(" -G            get remote filename as local filename\n");
     printf(" -i <filename> filename for the user's private key\n");
+    printf(" -k <list>     set the comma separated list of server host key "
+           "algos to accept\n");
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    printf(" -W <spec>     Windows cert store: \"store:subject[:flags]\"\n");
+    printf("               Example: -W \"My:CN=MyCert:CURRENT_USER\"\n");
+    printf("               flags: CURRENT_USER (default), LOCAL_MACHINE,\n");
+    printf("               USERS, CURRENT_SERVICE, SERVICES,\n");
+    printf("               CURRENT_USER_GROUP_POLICY,\n");
+    printf("               LOCAL_MACHINE_GROUP_POLICY,\n");
+    printf("               LOCAL_MACHINE_ENTERPRISE, each also with a\n");
+    printf("               CERT_SYSTEM_STORE_ prefix, or a number.\n");
+    printf("               -W supplies both keys; it can not be used with "
+           "-i, -j or -J.\n");
+    printf("               -W also skips the wolfssh home directory search,\n");
+    printf("               so -A/-d/-l resolve against the current "
+           "directory\n");
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
 #ifdef WOLFSSH_CERTS
     printf(" -J <filename> filename for DER certificate to use\n");
     printf("               Certificate example : client -u orange \\\n");
@@ -424,6 +460,76 @@ static INLINE char* SFTP_FGETS(func_args* args, char* msg, int msgSz)
 }
 
 
+/*
+ * Parse "<mode> <path>" from a SFTP command argument string.
+ * pt:         points past the command keyword (caller advanced by sizeof).
+ * modeBuf:    caller buffer of WOLFSSH_MAX_OCTET_LEN bytes; receives the
+ *             null-terminated octal mode token on success.
+ * pathOut:    receives a pointer to the resolved remote path on success.
+ * allocOut:   receives a malloc'd absolute-path buffer when pt was relative
+ *             (caller must WFREE); NULL when the path was already absolute.
+ * remoteDir:  current remote working directory.
+ * Returns  0 on success,
+ *          1 if no mode token found (caller prints error and continues),
+ *         -1 on malloc failure (caller returns -1).
+ */
+static int sftpParseModeAndPath(char* pt, char* modeBuf, char** pathOut,
+        char** allocOut, const char* remoteDir)
+{
+    word32 sz, idx;
+    char*  f;
+
+    *allocOut = NULL;
+    *pathOut  = NULL;
+
+    sz = (word32)WSTRLEN(pt);
+    if (sz > 0 && pt[sz - 1] == '\n') {
+        pt[sz - 1] = '\0';
+        sz--;
+    }
+
+    for (idx = 0; idx < sz && (pt[0] == ' ' || pt[0] == '\t'); idx++, pt++);
+    sz = (word32)WSTRLEN(pt);
+
+    sz = (sz < WOLFSSH_MAX_OCTET_LEN - 1) ? sz : WOLFSSH_MAX_OCTET_LEN - 1;
+    WMEMCPY(modeBuf, pt, sz);
+    modeBuf[sz] = '\0';
+    for (idx = 0; idx < sz; idx++) {
+        if (modeBuf[idx] == ' ' || modeBuf[idx] == '\t') {
+            modeBuf[idx] = '\0';
+            break;
+        }
+    }
+    if (idx == 0 || (idx == sz && pt[sz] != ' ' && pt[sz] != '\t'))
+        return 1;
+
+    pt += (word32)WSTRLEN(modeBuf);
+    sz = (word32)WSTRLEN(pt);
+    for (idx = 0; idx < sz && (pt[0] == ' ' || pt[0] == '\t'); idx++, pt++);
+
+    if (pt[0] == '\0')
+        return 1;
+
+    if (pt[0] != '/') {
+        int maxSz = (int)WSTRLEN(remoteDir) + (int)WSTRLEN(pt) + 2;
+        f = (char*)WMALLOC(maxSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        if (f == NULL)
+            return -1;
+        f[0] = '\0';
+        WSTRNCAT(f, remoteDir, maxSz);
+        if (WSTRLEN(remoteDir) > 1)
+            WSTRNCAT(f, "/", maxSz);
+        WSTRNCAT(f, pt, maxSz);
+        *allocOut = f;
+        *pathOut  = f;
+    }
+    else {
+        *pathOut = pt;
+    }
+    return 0;
+}
+
+
 /* main loop for handling commands */
 static int doCmds(func_args* args)
 {
@@ -456,6 +562,100 @@ static int doCmds(func_args* args)
             return -1;
         }
         msg[WOLFSSH_MAX_FILENAME * 2 - 1] = '\0';
+
+        /* Anchored to the start of the line so a file name containing
+         * "creat" in another command does not match, and dispatched ahead
+         * of the unanchored substring matchers below so none of them can
+         * steal a creat line whose mode or path contains "get", "cd", etc.
+         * The keyword may be followed by a space, tab, or end of line; the
+         * bare-keyword form still reaches sftpParseModeAndPath so its
+         * empty-argument handling stays covered. */
+        pt = msg;
+        while (*pt == ' ' || *pt == '\t')
+            pt++;
+        if (WSTRNCMP(pt, "creat", 5) == 0 &&
+                (pt[5] == '\0' || pt[5] == ' ' || pt[5] == '\t' ||
+                 pt[5] == '\n')) {
+            char*            f = NULL;
+            char*            path;
+            char             mode[WOLFSSH_MAX_OCTET_LEN];
+            byte             handle[WOLFSSH_MAX_HANDLE];
+            word32           handleSz = WOLFSSH_MAX_HANDLE;
+            WS_SFTP_FILEATRB atr;
+            int              parseRet;
+            int              openRet = WS_FATAL_ERROR;
+            unsigned long    perVal;
+            char*            modeEnd;
+
+            pt += 5;
+            while (*pt == ' ' || *pt == '\t')
+                pt++;
+            parseRet = sftpParseModeAndPath(pt, mode, &path, &f, workingDir);
+            if (parseRet == 1) {
+                printf("error with getting mode\r\n");
+                continue;
+            }
+            if (parseRet == -1) {
+                err_msg("Error malloc'ing");
+                return -1;
+            }
+
+            /* build permission attribute from octal mode string;
+             * wolfSSH_oct2dec is internal scope so strtoul is used here */
+            perVal = strtoul(mode, &modeEnd, 8);
+            if (*modeEnd == '\0' && perVal <= 07777) {
+                WMEMSET(&atr, 0, sizeof(WS_SFTP_FILEATRB));
+                atr.flags = WOLFSSH_FILEATRB_PERM;
+                atr.per   = (word32)perVal;
+
+                /* open (create) remote file with the given permissions */
+                handleSz = WOLFSSH_MAX_HANDLE;
+                do {
+                    while (ret == WS_REKEYING || ssh->error == WS_REKEYING) {
+                        ret = wolfSSH_worker(ssh, NULL);
+                        if (ret != WS_SUCCESS && ret == WS_FATAL_ERROR) {
+                            ret = wolfSSH_get_error(ssh);
+                        }
+                    }
+                    ret = wolfSSH_SFTP_Open(ssh, path,
+                            WOLFSSH_FXF_WRITE | WOLFSSH_FXF_CREAT |
+                            WOLFSSH_FXF_TRUNC, &atr, handle, &handleSz);
+                    err = wolfSSH_get_error(ssh);
+                } while ((err == WS_WANT_READ || err == WS_WANT_WRITE ||
+                            err == WS_REKEYING) && ret != WS_SUCCESS);
+                openRet = ret;
+            }
+            if (openRet == WS_SUCCESS) {
+                do {
+                    while (ret == WS_REKEYING || ssh->error == WS_REKEYING) {
+                        ret = wolfSSH_worker(ssh, NULL);
+                        if (ret != WS_SUCCESS && ret == WS_FATAL_ERROR) {
+                            ret = wolfSSH_get_error(ssh);
+                        }
+                    }
+                    ret = wolfSSH_SFTP_Close(ssh, handle, handleSz);
+                    err = wolfSSH_get_error(ssh);
+                } while ((err == WS_WANT_READ || err == WS_WANT_WRITE ||
+                            err == WS_REKEYING) && ret != WS_SUCCESS);
+                if (ret != WS_SUCCESS) {
+                    if (SFTP_FPUTS(args, "Unable to close file handle\n") < 0) {
+                        err_msg("fputs error");
+                        WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                        return -1;
+                    }
+                }
+            }
+            else {
+                if (SFTP_FPUTS(args, "Unable to create file\n") < 0) {
+                    err_msg("fputs error");
+                    WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    return -1;
+                }
+            }
+
+            WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            continue;
+        }
 
         if ((pt = WSTRNSTR(msg, "mkdir", sizeof(msg))) != NULL) {
             WS_SFTP_FILEATRB atrb;
@@ -587,7 +787,7 @@ static int doCmds(func_args* args)
                     ret == WS_CHAN_RXD || ret == WS_REKEYING);
 
 #ifndef WOLFSSH_NO_TIMESTAMP
-            WMEMSET(currentFile, 0, WOLFSSH_MAX_FILENAME);
+            WMEMSET(currentFile, 0, sizeof(currentFile));
 #endif
 
             if (ret != WS_SUCCESS) {
@@ -698,7 +898,7 @@ static int doCmds(func_args* args)
                     ret == WS_CHAN_RXD || ret == WS_REKEYING);
 
 #ifndef WOLFSSH_NO_TIMESTAMP
-            WMEMSET(currentFile, 0, WOLFSSH_MAX_FILENAME);
+            WMEMSET(currentFile, 0, sizeof(currentFile));
 #endif
 
             if (ret != WS_SUCCESS) {
@@ -813,54 +1013,20 @@ static int doCmds(func_args* args)
         }
 
         if ((pt = WSTRNSTR(msg, "chmod", MAX_CMD_SZ)) != NULL) {
-            word32 sz, idx;
             char* f = NULL;
-            char mode[WOLFSSH_MAX_OCTET_LEN];
+            char* path;
+            char  mode[WOLFSSH_MAX_OCTET_LEN];
+            int   parseRet;
 
             pt += sizeof("chmod");
-            sz = (word32)WSTRLEN(pt);
-
-            if (sz > 0 && pt[sz - 1] == '\n') pt[sz - 1] = '\0';
-
-            /* advance pointer to first location of non space character */
-            for (idx = 0; idx < sz && pt[0] == ' '; idx++, pt++);
-            sz = (word32)WSTRLEN(pt);
-
-            /* get mode */
-            sz = (sz < WOLFSSH_MAX_OCTET_LEN - 1)? sz :
-                                                   WOLFSSH_MAX_OCTET_LEN -1;
-            WMEMCPY(mode, pt, sz);
-            mode[WOLFSSH_MAX_OCTET_LEN - 1] = '\0';
-            for (idx = 0; idx < sz; idx++) {
-                if (mode[idx] == ' ') {
-                    mode[idx] = '\0';
-                    break;
-                }
-            }
-            if (idx == 0) {
+            parseRet = sftpParseModeAndPath(pt, mode, &path, &f, workingDir);
+            if (parseRet == 1) {
                 printf("error with getting mode\r\n");
                 continue;
             }
-            pt += (word32)WSTRLEN(mode);
-            sz = (word32)WSTRLEN(pt);
-            for (idx = 0; idx < sz && pt[0] == ' '; idx++, pt++);
-
-            if (pt[0] != '/') {
-                int maxSz = (int)WSTRLEN(workingDir) + sz + 2;
-                f = (char*)WMALLOC(maxSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-                if (f == NULL) {
-                    err_msg("Error malloc'ing");
-                    return -1;
-                }
-
-                f[0] = '\0';
-                WSTRNCAT(f, workingDir, maxSz);
-                if (WSTRLEN(workingDir) > 1) {
-                    WSTRNCAT(f, "/", maxSz);
-                }
-                WSTRNCAT(f, pt, maxSz);
-
-                pt = f;
+            if (parseRet == -1) {
+                err_msg("Error malloc'ing");
+                return -1;
             }
 
             /* update permissions */
@@ -872,21 +1038,24 @@ static int doCmds(func_args* args)
                     }
                 }
 
-                ret = wolfSSH_SFTP_CHMOD(ssh, pt, mode);
+                ret = wolfSSH_SFTP_CHMOD(ssh, path, mode);
                 err = wolfSSH_get_error(ssh);
             } while ((err == WS_WANT_READ || err == WS_WANT_WRITE ||
                         err == WS_REKEYING) && ret != WS_SUCCESS);
             if (ret != WS_SUCCESS) {
                 if (SFTP_FPUTS(args, "Unable to change permissions of ") < 0) {
                     err_msg("fputs error");
+                    WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                     return -1;
                 }
-                if (SFTP_FPUTS(args, pt) < 0) {
+                if (SFTP_FPUTS(args, path) < 0) {
                     err_msg("fputs error");
+                    WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                     return -1;
                 }
                 if (SFTP_FPUTS(args, "\n") < 0) {
                     err_msg("fputs error");
+                    WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                     return -1;
                 }
             }
@@ -963,6 +1132,10 @@ static int doCmds(func_args* args)
             if (pt[0] != '/') {
                 int maxSz = (int)WSTRLEN(workingDir) + sz + 2;
                 f = (char*)WMALLOC(maxSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                if (f == NULL) {
+                    err_msg("Error malloc'ing");
+                    return -1;
+                }
 
                 f[0] = '\0';
                 WSTRNCAT(f, workingDir, maxSz);
@@ -1051,6 +1224,11 @@ static int doCmds(func_args* args)
             if (to[0] != '/') {
                 int maxSz = (int)WSTRLEN(workingDir) + toSz + 2;
                 fTo = (char*)WMALLOC(maxSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                if (fTo == NULL) {
+                    err_msg("Error malloc'ing");
+                    WFREE(f, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    return -1;
+                }
 
                 fTo[0] = '\0';
                 WSTRNCAT(fTo, workingDir, maxSz);
@@ -1282,6 +1460,33 @@ static int doCmds(func_args* args)
 }
 
 
+/* Resolve the CWD via RealPath (passing "." to get the current directory)
+ * and append the relative remote path into fullpath.  WS_REKEYING and
+ * WS_WINDOW_FULL are intentionally excluded from the retry condition below;
+ * they require a wolfSSH_worker call that the caller's outer loop provides. */
+static int doBuildRemotePath(const char* remote, char* fullpath, word32 fullpathSz,
+                      WS_SFTPNAME** nameOut)
+{
+    int err;
+
+    if (remote == NULL || fullpath == NULL || fullpathSz == 0 || nameOut == NULL)
+        return WS_BAD_ARGUMENT;
+    do {
+        *nameOut = wolfSSH_SFTP_RealPath(ssh, (char*)".");
+        err = wolfSSH_get_error(ssh);
+    } while (err == WS_WANT_READ || err == WS_WANT_WRITE);
+    if (*nameOut == NULL)
+        return (err == WS_SUCCESS) ? WS_FATAL_ERROR : err;
+    if (snprintf(fullpath, fullpathSz, "%s/%s", (*nameOut)->fName, remote)
+            >= (int)fullpathSz) {
+        wolfSSH_SFTPNAME_list_free(*nameOut);
+        *nameOut = NULL;
+        return WS_FATAL_ERROR;
+    }
+    return WS_SUCCESS;
+}
+
+
 /* alternate main loop for the autopilot get/receive */
 static int doAutopilot(int cmd, char* local, char* remote)
 {
@@ -1289,6 +1494,7 @@ static int doAutopilot(int cmd, char* local, char* remote)
     int ret = WS_SUCCESS;
     char fullpath[128] = ".";
     WS_SFTPNAME* name  = NULL;
+    word32 remoteSz;
     byte remoteAbsPath = 0;
 
     /* check if is absolute path before making it one */
@@ -1306,26 +1512,40 @@ static int doAutopilot(int cmd, char* local, char* remote)
 
     if (remoteAbsPath) {
        /* use remote absolute path if provided */
+       remoteSz = (word32)WSTRLEN(remote);
+       if (remoteSz >= sizeof(fullpath))
+           return WS_BUFFER_E;
        WMEMSET(fullpath, 0, sizeof(fullpath));
-       WSTRNCPY(fullpath, remote, sizeof(fullpath) - 1);
+       WMEMCPY(fullpath, remote, remoteSz + 1);
     }
     else {
-        do {
-            name = wolfSSH_SFTP_RealPath(ssh, fullpath);
-            err = wolfSSH_get_error(ssh);
-        } while ((err == WS_WANT_READ || err == WS_WANT_WRITE) &&
-            ret != WS_SUCCESS);
-
-        snprintf(fullpath, sizeof(fullpath), "%s/%s",
-            name == NULL ? "." : name->fName,
-            remote);
+        err = doBuildRemotePath(remote, fullpath, sizeof(fullpath), &name);
+        if (err != WS_SUCCESS && err != WS_REKEYING && err != WS_WINDOW_FULL)
+            return WS_FATAL_ERROR;
     }
 
     do {
-        if (err == WS_REKEYING || err == WS_WINDOW_FULL) { /* handle rekeying state */
+        if (err == WS_REKEYING || err == WS_WINDOW_FULL) { /* handle rekeying and window-full state */
             do {
                 ret = wolfSSH_worker(ssh, NULL);
-            } while (ret == WS_REKEYING);
+            } while (ret == WS_REKEYING || ret == WS_WINDOW_FULL ||
+                     wolfSSH_get_error(ssh) == WS_REKEYING);
+
+            /* wolfSSH_worker returns WS_FATAL_ERROR when the socket
+             * would block (DoReceive -> GetInputData -> WS_WANT_READ),
+             * so check ssh->error rather than ret for blocking conditions. */
+            if (ret != WS_SUCCESS && ret != WS_CHAN_RXD && ret != WS_EOF &&
+                    wolfSSH_get_error(ssh) != WS_WANT_READ &&
+                    wolfSSH_get_error(ssh) != WS_WANT_WRITE)
+                break;
+
+            if (!remoteAbsPath && name == NULL) {
+                err = doBuildRemotePath(remote, fullpath, sizeof(fullpath), &name);
+                if (err != WS_SUCCESS) {
+                    ret = WS_FATAL_ERROR;
+                    continue; /* skip wolfSSH_get_error; outer loop retries on err from doBuildRemotePath */
+                }
+            }
         }
 
         if (cmd == AUTOPILOT_PUT) {
@@ -1341,13 +1561,18 @@ static int doAutopilot(int cmd, char* local, char* remote)
                 ret == WS_FATAL_ERROR);
 
     if (ret != WS_SUCCESS) {
+        /* ret is a generic failure code; the cause is in the session */
+        err = wolfSSH_get_error(ssh);
+
         if (cmd == AUTOPILOT_PUT) {
-            fprintf(stderr, "Unable to copy local file %s to remote file %s\n",
-                   local, fullpath);
+            fprintf(stderr, "Unable to copy local file %s to remote file %s"
+                    ": ret %d, error %d, %s\n",
+                   local, fullpath, ret, err, wolfSSH_ErrorToName(err));
         }
         else if (cmd == AUTOPILOT_GET) {
-            fprintf(stderr, "Unable to copy remote file %s to local file %s\n",
-                    fullpath, local);
+            fprintf(stderr, "Unable to copy remote file %s to local file %s"
+                    ": ret %d, error %d, %s\n",
+                    fullpath, local, ret, err, wolfSSH_ErrorToName(err));
         }
     }
 
@@ -1379,13 +1604,17 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
     char* pubKeyName = NULL;
     char* certName = NULL;
     char* caCert   = NULL;
+    const char* keyList = NULL;
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    const char* certStoreSpec = NULL;  /* Format: "store:subject:flags" */
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
     SFTPC_HEAP_HINT* heap = NULL;
 
     int     argc = ((func_args*)args)->argc;
     char**  argv = ((func_args*)args)->argv;
     ((func_args*)args)->return_code = 0;
 
-    while ((ch = mygetopt(argc, argv, "?d:gh:i:j:l:p:r:u:EGNP:J:A:X")) != -1) {
+    while ((ch = mygetopt(argc, argv, SFTPC_OPTLIST)) != -1) {
         switch (ch) {
             case 'd':
                 defaultSftpPath = myoptarg;
@@ -1447,6 +1676,10 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
                 pubKeyName = myoptarg;
                 break;
 
+            case 'k':
+                keyList = myoptarg;
+                break;
+
         #ifdef WOLFSSH_CERTS
             case 'J':
                 certName = myoptarg;
@@ -1463,6 +1696,12 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
             #endif
         #endif
 
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+            case 'W':
+                certStoreSpec = myoptarg;
+                break;
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
+
             case '?':
                 ShowUsage();
                 exit(EXIT_SUCCESS);
@@ -1476,6 +1715,14 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
 
     if (username == NULL)
         err_sys("client requires a username parameter.");
+
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    if (certStoreSpec != NULL && (privKeyName != NULL || pubKeyName != NULL ||
+            certName != NULL)) {
+        err_sys("-W provides both keys, it can not be used with -i, -j "
+                "or -J.");
+    }
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
 
     if ((pubKeyName == NULL && certName == NULL) && privKeyName != NULL) {
         err_sys("If setting priv key, need pub key.");
@@ -1509,28 +1756,79 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
     }
 #endif /* WOLFSSH_STATIC_MEMORY */
 
-    ret = ClientSetPrivateKey(privKeyName, userEcc, heap, NULL);
-    if (ret != 0) {
-        err_sys("Error setting private key");
-    }
 
-#ifdef WOLFSSH_CERTS
-    /* passed in certificate to use */
-    if (certName) {
-        ret = ClientUseCert(certName, heap);
-    }
-    else
-#endif
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    if (certStoreSpec != NULL) {
+        wchar_t* wStoreName = NULL;
+        wchar_t* wSubjectName = NULL;
+        word32 dwFlags = 0;
+
+        ret = wolfSSH_ParseCertStoreSpec(certStoreSpec, &wStoreName,
+                &wSubjectName, &dwFlags, heap);
+        if (ret != WS_SUCCESS) {
+            err_sys("Invalid cert store spec. Use: store:subject:flags");
+        }
+
+        /* Create context first */
+        ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, heap);
+        if (ctx == NULL) {
+            wolfSSH_FreeCertStoreSpec(wStoreName, wSubjectName, heap);
+            err_sys("Couldn't create wolfSSH client context.");
+        }
+
+        /* Set private key from cert store. The names are only needed for
+         * this call, so release them here and leave the error paths with
+         * nothing to clean up. */
+        ret = ClientSetPrivateKeyFromStore(ctx, wStoreName, dwFlags,
+            wSubjectName);
+        wolfSSH_FreeCertStoreSpec(wStoreName, wSubjectName, heap);
+        wStoreName = NULL;
+        wSubjectName = NULL;
+        if (ret != WS_SUCCESS) {
+            wolfSSH_CTX_free(ctx);
+            err_sys("Error setting private key from certificate store");
+        }
+
+        /* Set up auth callback globals (public key type, cert DER) so
+         * that ClientUserAuth presents the certificate for public key
+         * authentication. */
+        ret = ClientSetupCertStoreAuth(ctx, heap);
+        if (ret != WS_SUCCESS) {
+            wolfSSH_CTX_free(ctx);
+            err_sys("Error setting up cert store auth");
+        }
+    } else
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
     {
-        ret = ClientUsePubKey(pubKeyName, 0, heap);
-    }
-    if (ret != 0) {
-        err_sys("Error setting public key");
-    }
+        ret = ClientSetPrivateKey(privKeyName, userEcc, heap, NULL);
+        if (ret != 0) {
+            err_sys("Error setting private key");
+        }
 
-    ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, heap);
+    #ifdef WOLFSSH_CERTS
+        /* passed in certificate to use */
+        if (certName) {
+            ret = ClientUseCert(certName, heap);
+        }
+        else
+    #endif
+        {
+            ret = ClientUsePubKey(pubKeyName, userEcc, heap);
+        }
+        if (ret != 0) {
+            err_sys("Error setting public key");
+        }
+
+        ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, heap);
+    }
     if (ctx == NULL)
         err_sys("Couldn't create wolfSSH client context.");
+
+    if (keyList) {
+        if (wolfSSH_CTX_SetAlgoListKey(ctx, keyList) != WS_SUCCESS) {
+            err_sys("Error setting key list.");
+        }
+    }
 
     if (((func_args*)args)->user_auth == NULL)
         wolfSSH_SetUserAuth(ctx, ClientUserAuth);
@@ -1589,8 +1887,16 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
         ret = wolfSSH_SFTP_connect(ssh);
     else
         ret = NonBlockSSH_connect();
-    if (ret != WS_SUCCESS)
+    if (ret != WS_SUCCESS) {
+        /* the return is a generic failure code; the real cause is kept in
+         * the session error */
+        int err;
+
+        err = wolfSSH_get_error(ssh);
+        fprintf(stderr, "wolfSSH_SFTP_connect failed: %d, %s\n", err,
+                wolfSSH_ErrorToName(err));
         err_sys("Couldn't connect SFTP");
+    }
 
     {
         /* get current working directory */
@@ -1628,7 +1934,9 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
         int err;
         ret = wolfSSH_shutdown(ssh);
 
-        /* peer hung up or channel already closed, stop trying */
+        /* peer hung up or channel already closed, stop trying.
+         * wolfSSH_shutdown() folds a peer EOF into WS_SUCCESS itself, so
+         * there is no WS_EOF to test for here. */
         if (ret == WS_SOCKET_ERROR_E || ret == WS_ERROR ||
                 ret == WS_CHANNEL_CLOSED) {
             ret = 0;
@@ -1645,7 +1953,7 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
                 err  = wolfSSH_get_error(ssh);
 
                 /* peer successfully closed down gracefully */
-                if (ret == WS_CHANNEL_CLOSED) {
+                if (ret == WS_CHANNEL_CLOSED || ret == WS_EOF) {
                     ret = 0;
                     break;
                 }
@@ -1674,13 +1982,17 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
 
     WCLOSESOCKET(sockFd);
     wolfSSH_free(ssh);
+
+    /* ClientFreeBuffers() releases the certificate copy
+     * ClientSetupCertStoreAuth() made; it must use the same heap that was
+     * passed there. */
+    ClientFreeBuffers(pubKeyName, privKeyName, heap);
     wolfSSH_CTX_free(ctx);
     if (ret != WS_SUCCESS) {
         printf("error %d encountered\n", ret);
         ((func_args*)args)->return_code = ret;
     }
 
-    ClientFreeBuffers(pubKeyName, privKeyName, heap);
 #if !defined(WOLFSSH_NO_ECC) && defined(FP_ECC) && defined(HAVE_THREAD_LS)
     wc_ecc_fp_free();  /* free per thread cache */
 #endif
@@ -1735,7 +2047,30 @@ THREAD_RETURN WOLFSSH_THREAD sftpclient_test(void* args)
 
         wolfSSH_Init();
 
-        ChangeToWolfSshRoot();
+        {
+            int useStore = 0;
+        #ifdef WOLFSSH_WINDOWS_CERT_STORE
+            {
+                int ch;
+
+                /* With -W the keys come from the Windows certificate store
+                 * and no file-based keys are needed, so skip the root
+                 * directory search. Parse rather than match on argv, an
+                 * option value could start with "-W". */
+                myoptind = 0;
+                while ((ch = mygetopt(argc, argv, SFTPC_OPTLIST)) != -1) {
+                    if (ch == 'W') {
+                        useStore = 1;
+                        break;
+                    }
+                }
+                myoptind = 0;
+            }
+        #endif
+            if (!useStore) {
+                ChangeToWolfSshRoot();
+            }
+        }
         sftpclient_test(&args);
 
         wolfSSH_Cleanup();

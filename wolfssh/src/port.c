@@ -120,11 +120,15 @@ int wfopen(WFILE** f, const char* filename, const char* mode)
         int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            int ret;
+            word64 offset;
+            int ret = -1;
 
-            ret = (int)WFSEEK(NULL, &fd, shortOffset[0], SYS_FS_SEEK_SET);
-            if (ret != -1) {
-                ret = (int)WFWRITE(NULL, buf, 1, sz, &fd);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) == 0) {
+                if (WFSEEK_SUCCESS(WFSEEK(NULL, &fd, (int32_t)offset,
+                                   SYS_FS_SEEK_SET))) {
+                    ret = (int)WFWRITE(NULL, buf, 1, sz, &fd);
+                }
             }
 
             return ret;
@@ -133,11 +137,16 @@ int wfopen(WFILE** f, const char* filename, const char* mode)
         int wPread(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            int ret;
+            word64 offset;
+            int ret = -1;
 
-            ret = (int)WFSEEK(NULL, &fd, shortOffset[0], SYS_FS_SEEK_SET);
-            if (ret != -1)
-                ret = (int)WFREAD(NULL, buf, 1, sz, &fd);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) == 0) {
+                if (WFSEEK_SUCCESS(WFSEEK(NULL, &fd, (int32_t)offset,
+                                   SYS_FS_SEEK_SET))) {
+                    ret = (int)WFREAD(NULL, buf, 1, sz, &fd);
+                }
+            }
 
             return ret;
         }
@@ -147,11 +156,14 @@ int wfopen(WFILE** f, const char* filename, const char* mode)
         int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            int ret;
+            word64 offset;
+            int ret = -1;
 
-            ret = (int)lseek(fd, shortOffset[0], SEEK_SET);
-            if (ret != -1)
-                ret = (int)write(fd, buf, sz);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) == 0) {
+                if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1)
+                    ret = (int)write(fd, buf, sz);
+            }
 
             return ret;
         }
@@ -159,11 +171,14 @@ int wfopen(WFILE** f, const char* filename, const char* mode)
         int wPread(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            int ret;
+            word64 offset;
+            int ret = -1;
 
-            ret = (int)lseek(fd, shortOffset[0], SEEK_SET);
-            if (ret != -1)
-                ret = (int)read(fd, buf, sz);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) == 0) {
+                if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1)
+                    ret = (int)read(fd, buf, sz);
+            }
 
             return ret;
         }
@@ -173,24 +188,26 @@ int wfopen(WFILE** f, const char* filename, const char* mode)
         int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            off_t offset = (off_t)shortOffset[0];
+            word64 offset;
 
-        #if SIZEOF_OFF_T == 8
-            offset = ((off_t)shortOffset[1] << 32) | offset;
-        #endif
-            return (int)pwrite(fd, buf, sz, offset);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) != 0)
+                return -1;
+
+            return (int)pwrite(fd, buf, sz, (off_t)offset);
         }
 
 
         int wPread(WFD fd, unsigned char* buf, unsigned int sz,
                 const unsigned int* shortOffset)
         {
-            off_t offset = (off_t)shortOffset[0];
+            word64 offset;
 
-        #if SIZEOF_OFF_T == 8
-            offset = ((off_t)shortOffset[1] << 32) | offset;
-        #endif
-            return (int)pread(fd, buf, sz, offset);
+            if (wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                        &offset) != 0)
+                return -1;
+
+            return (int)pread(fd, buf, sz, (off_t)offset);
         }
 
     #endif /* USE_WINDOWS_API USE_OSE_API */
@@ -224,7 +241,7 @@ void* WS_CreateFileA(const char* fileName, unsigned long desiredAccess,
         unsigned long shareMode, unsigned long creationDisposition,
         unsigned long flags, void* heap)
 {
-    HANDLE fileHandle;
+    HANDLE fileHandle = INVALID_HANDLE_VALUE;
     wchar_t* unicodeFileName;
     size_t unicodeFileNameSz = 0;
     size_t returnSz = 0;
@@ -300,21 +317,35 @@ void* WS_FindFirstFileA(const char* fileName,
 }
 
 
-int WS_FindNextFileA(void* findHandle,
-        char* realFileName, size_t realFileNameSz)
+int WS_FindNextFileA_ex(void* findHandle,
+        char* realFileName, size_t realFileNameSz, unsigned long* lastError)
 {
     BOOL success;
     WIN32_FIND_DATAW findFileData;
-    errno_t error = 0;
+    unsigned long err = 0;
 
     success = FindNextFileW((HANDLE)findHandle, &findFileData);
 
     if (success) {
-        error = wcstombs_s(NULL, realFileName, realFileNameSz,
-            findFileData.cFileName, realFileNameSz);
+        if (wcstombs_s(NULL, realFileName, realFileNameSz,
+                findFileData.cFileName, realFileNameSz) != 0)
+            err = (unsigned long)ERROR_NO_UNICODE_TRANSLATION;
+    }
+    else {
+        err = (unsigned long)GetLastError();
     }
 
-    return (success != 0) && (error == 0);
+    if (lastError != NULL)
+        *lastError = err;
+
+    return (success != 0) && (err == 0);
+}
+
+
+int WS_FindNextFileA(void* findHandle,
+        char* realFileName, size_t realFileNameSz)
+{
+    return WS_FindNextFileA_ex(findHandle, realFileName, realFileNameSz, NULL);
 }
 
 
@@ -447,13 +478,19 @@ int WS_MoveFileA(const char* oldName, const char* newName, void* heap)
 
     error = mbstowcs_s(&returnSz, unicodeOldName, unicodeOldNameSz,
         oldName, oldNameSz);
+    if (error != 0) {
+        WFREE(unicodeOldName, heap, PORT_DYNTYPE_STRING);
+        return 0;
+    }
 
     newNameSz = WSTRLEN(newName);
     newName = TrimFileName(newName, &newNameSz);
 
     error = mbstowcs_s(&unicodeNewNameSz, NULL, 0, newName, 0);
-    if (error != 0)
+    if (error != 0) {
+        WFREE(unicodeOldName, heap, PORT_DYNTYPE_STRING);
         return 0;
+    }
 
     unicodeNewName = (wchar_t*)WMALLOC((unicodeNewNameSz+1)*sizeof(wchar_t),
             heap, PORT_DYNTYPE_STRING);
@@ -509,6 +546,44 @@ int WS_DeleteFileA(const char* fileName, void* heap)
     return success != 0;
 }
 
+
+
+#ifndef _WIN32_WCE
+
+int WS_ChmodA(const char* fileName, int mode, void* heap)
+{
+    int ret = -1;
+    wchar_t* unicodeFileName;
+    size_t unicodeFileNameSz = 0;
+    size_t returnSz = 0;
+    size_t fileNameSz = 0;
+    errno_t error;
+
+    fileNameSz = WSTRLEN(fileName);
+    fileName = TrimFileName(fileName, &fileNameSz);
+
+    error = mbstowcs_s(&unicodeFileNameSz, NULL, 0, fileName, 0);
+    if (error != 0)
+        return -1;
+
+    unicodeFileName = (wchar_t*)WMALLOC((unicodeFileNameSz+1)*sizeof(wchar_t),
+            heap, PORT_DYNTYPE_STRING);
+    if (unicodeFileName == NULL)
+        return -1;
+
+    error = mbstowcs_s(&returnSz, unicodeFileName, unicodeFileNameSz,
+        fileName, fileNameSz);
+
+    if (error == 0) {
+        ret = _wchmod(unicodeFileName, mode);
+    }
+
+    WFREE(unicodeFileName, heap, PORT_DYNTYPE_STRING);
+
+    return ret;
+}
+
+#endif /* !_WIN32_WCE */
 
 #endif /* USE_WINDOWS_API WOLFSSH_SFTP WOLFSSH_SCP */
 
@@ -620,12 +695,15 @@ int wssh_z_close(WFD fd)
 int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
         const unsigned int* shortOffset)
 {
+    word64 offset;
     int ret = -1;
-    if (fd >= 0 && fd < WOLFSSH_MAX_DESCIPRTORS) {
+
+    if (fd >= 0 && fd < WOLFSSH_MAX_DESCIPRTORS &&
+            wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                &offset) == 0) {
         if (wc_LockMutex(&z_fds_mutex) == 0) {
             if (z_fds[fd].open) {
-                const word32* offset = (const word32*)shortOffset;
-                if (fs_seek(&z_fds[fd].zfp, offset[0], FS_SEEK_SET) == 0)
+                if (fs_seek(&z_fds[fd].zfp, (off_t)offset, FS_SEEK_SET) == 0)
                     ret = fs_write(&z_fds[fd].zfp, buf, sz);
             }
             wc_UnLockMutex(&z_fds_mutex);
@@ -637,12 +715,15 @@ int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
 int wPread(WFD fd, unsigned char* buf, unsigned int sz,
         const unsigned int* shortOffset)
 {
+    word64 offset;
     int ret = -1;
-    if (fd >= 0 && fd < WOLFSSH_MAX_DESCIPRTORS) {
+
+    if (fd >= 0 && fd < WOLFSSH_MAX_DESCIPRTORS &&
+            wResolveOffset(shortOffset, WOLFSSH_MAX_FILE_OFFSET,
+                &offset) == 0) {
         if (wc_LockMutex(&z_fds_mutex) == 0) {
             if (z_fds[fd].open) {
-                const word32* offset = (const word32*)shortOffset;
-                if (fs_seek(&z_fds[fd].zfp, offset[0], FS_SEEK_SET) == 0)
+                if (fs_seek(&z_fds[fd].zfp, (off_t)offset, FS_SEEK_SET) == 0)
                     ret = fs_read(&z_fds[fd].zfp, buf, sz);
             }
             wc_UnLockMutex(&z_fds_mutex);
@@ -660,8 +741,7 @@ int wChmod(const char *path, int mode)
     SYS_FS_RESULT ret;
     SYS_FS_FILE_DIR_ATTR attr = 0;
 
-    /* mode is the octal value i.e 666 is 0x1B6 */
-    if ((mode & 0x180) != 0x180) { /* not octal 6XX read only */
+    if ((mode & 0600) != 0600) {
         attr |= SYS_FS_ATTR_RDO;
     }
 
@@ -675,6 +755,114 @@ int wChmod(const char *path, int mode)
 }
 #endif
 #endif /* NO_FILESYSTEM */
+
+#if defined(WOLFSSH_HAVE_SYMLINK) && \
+    (defined(WOLFSSH_SFTP) || defined(WOLFSSH_SCP))
+/* Returns 1 if path is a symbolic link (POSIX) or a reparse point such as a
+ * symlink or junction (Windows), otherwise 0.  A non-existent path (stat
+ * fails) is reported as not-a-link so that create requests for a new leaf are
+ * still permitted by the caller.  Shared by the SFTP and SCP path-confinement
+ * checks. */
+int wIsSymlink(const char* path)
+{
+    int isLink = 0;
+#ifdef USE_WINDOWS_API
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+
+    /* Route through WS_GetFileAttributesExA so the wide-char API and any path
+     * trimming match the other Windows file ops.  GetFileAttributesEx reports
+     * the link's own attributes; it does not follow the reparse point. */
+    if (path != NULL && WS_GetFileAttributesExA(path, &attrs, NULL) != 0 &&
+            (attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        isLink = 1;
+    }
+#else
+    WSTAT_T lst;
+
+    if (path != NULL && WLSTAT(NULL, path, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        isLink = 1;
+    }
+#endif
+    return isLink;
+}
+
+/* Open path for reading without following a final-component symbolic link.
+ * On POSIX this is atomic through O_NOFOLLOW: the open itself fails if the leaf
+ * is a link, closing the check-then-open race.  Where no such primitive exists
+ * (Windows, or O_NOFOLLOW undefined) it falls back to a best-effort wIsSymlink
+ * test before the follow-prone open.  Returns 0 on success and non-zero on
+ * failure, matching the wfopen convention. */
+int wFopenNoFollow(void* fs, WFILE** f, const char* path)
+{
+    int ret = 0;
+#if !defined(USE_WINDOWS_API) && defined(O_NOFOLLOW)
+    WFD fd = -1;
+#endif
+
+    if (f != NULL)
+        *f = NULL;
+    if (f == NULL || path == NULL)
+        ret = 1;
+
+#if !defined(USE_WINDOWS_API) && defined(O_NOFOLLOW)
+    if (ret == 0) {
+        fd = WOPEN(fs, path, WOLFSSH_O_RDONLY | WOLFSSH_O_NOFOLLOW, 0);
+        if (fd < 0)
+            ret = 1;
+    }
+    if (ret == 0 && WFDOPEN(fs, f, fd, "rb") != 0) {
+        WCLOSE(fs, fd);
+        ret = 1;
+    }
+#else
+    if (ret == 0 && wIsSymlink(path))
+        ret = 1;
+    if (ret == 0 && WFOPEN(fs, f, path, "rb") != 0)
+        ret = 1;
+#endif
+    WOLFSSH_UNUSED(fs);
+    return ret;
+}
+
+#if !defined(USE_WINDOWS_API) && !defined(NO_WOLFSSH_DIR)
+/* Open a directory without following a final-component symlink: POSIX uses
+ * O_DIRECTORY|O_NOFOLLOW + fdopendir (atomic), else falls back to wIsSymlink +
+ * opendir.  Returns 0 on success, non-zero on failure (matches WOPENDIR). */
+int wOpendirNoFollow(void* fs, WDIR* dir, const char* path)
+{
+    int ret = 0;
+#if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
+    WFD fd = -1;
+#endif
+
+    if (dir != NULL)
+        *dir = NULL;
+    if (dir == NULL || path == NULL)
+        ret = 1;
+
+#if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
+    if (ret == 0) {
+        fd = WOPEN(fs, path, WOLFSSH_O_RDONLY | WOLFSSH_O_DIRECTORY |
+                   WOLFSSH_O_NOFOLLOW, 0);
+        if (fd < 0)
+            ret = 1;
+    }
+    if (ret == 0 && WFDOPENDIR(fs, dir, fd) != 0) {
+        WCLOSE(fs, fd);
+        ret = 1;
+    }
+#else
+    if (ret == 0 && wIsSymlink(path))
+        ret = 1;
+    if (ret == 0 && WOPENDIR(fs, NULL, dir, path) != 0)
+        ret = 1;
+#endif
+    WOLFSSH_UNUSED(fs);
+    return ret;
+}
+#endif /* !USE_WINDOWS_API && !NO_WOLFSSH_DIR */
+#endif /* WOLFSSH_HAVE_SYMLINK && (WOLFSSH_SFTP || WOLFSSH_SCP) */
+
 #ifndef WSTRING_USER
 
 char* wstrdup(const char* s1, void* heap, int type)
@@ -717,7 +905,18 @@ char* wstrnstr(const char* s1, const char* s2, unsigned int n)
  * end of s1 including a null terminator. */
 char* wstrncat(char* s1, const char* s2, size_t n)
 {
-    size_t freeSpace = n - strlen(s1) - 1;
+    size_t s1_len = 0;
+    size_t freeSpace;
+
+    while (s1_len < n && s1[s1_len] != '\0') {
+        s1_len++;
+    }
+
+    if (s1_len >= n) {
+        return NULL;
+    }
+
+    freeSpace = n - s1_len - 1;
 
     if (freeSpace >= strlen(s2)) {
         #ifndef USE_WINDOWS_API
@@ -730,5 +929,33 @@ char* wstrncat(char* s1, const char* s2, size_t n)
 
     return NULL;
 }
+
+
+#ifdef USE_WINDOWS_API
+/* strsep() equivalent for platforms whose C library does not provide the
+ * BSD extension (MSVCRT/MinGW). Splits *s1 on the first character found
+ * in delim, NUL-terminates the token in place, and advances *s1 past it
+ * (NULL when no delimiter remains). Returns the start of the token, or
+ * NULL if *s1 was already NULL. */
+char* wstrsep(char** s1, const char* delim)
+{
+    char* start = *s1;
+    char* p;
+
+    if (start == NULL)
+        return NULL;
+
+    for (p = start; *p != '\0'; p++) {
+        if (WSTRCHR(delim, *p) != NULL) {
+            *p = '\0';
+            *s1 = p + 1;
+            return start;
+        }
+    }
+
+    *s1 = NULL;
+    return start;
+}
+#endif /* USE_WINDOWS_API */
 
 #endif /* WSTRING_USER */

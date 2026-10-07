@@ -14,12 +14,41 @@
 
 typedef struct WOLFSSHD_CONFIG WOLFSSHD_CONFIG;
 
+/* Expose otherwise-static wolfsshd internals to the unit tests while keeping
+ * them file-local in normal builds. Shared so configuration.c and auth.c use
+ * the same convention. */
+#ifdef WOLFSSHD_UNIT_TEST
+#define WOLFSSHD_STATIC
+#else
+#define WOLFSSHD_STATIC static
+#endif
+
+/* The Windows cert-store config plumbing (parse, copy, get/set) is plain
+ * string handling with no Windows dependency, so compile it for unit tests
+ * on every platform; only the consumers in wolfsshd.c/auth.c need the real
+ * WOLFSSH_WINDOWS_CERT_STORE build. */
+#if defined(WOLFSSH_WINDOWS_CERT_STORE) || defined(WOLFSSHD_UNIT_TEST)
+#define WOLFSSHD_WIN_STORE_CONFIG
+#endif
+
 #include "auth.h"
 
 /* 0 so that privilege separation is default on after struct memset'd on init */
 #define WOLFSSHD_PRIV_SEPARAT 0
 #define WOLFSSHD_PRIV_SANDBOX 1
 #define WOLFSSHD_PRIV_OFF     2
+
+#ifndef MAX_PATH_SZ
+    #define MAX_PATH_SZ 80
+#endif
+
+/* 0 so that root login is default off after struct memset'd on init */
+#define WOLFSSHD_PERMIT_ROOT_NO           0
+#define WOLFSSHD_PERMIT_ROOT_YES          1
+#define WOLFSSHD_PERMIT_ROOT_PROHIBIT_PW  2
+/* Prohibits passwords; pubkey logins require a configured ForceCommand
+ * (ignores authorized_keys command="..." restrictions). */
+#define WOLFSSHD_PERMIT_ROOT_FORCED_CMD   3
 
 WOLFSSHD_CONFIG* wolfSSHD_ConfigNew(void* heap);
 void wolfSSHD_ConfigFree(WOLFSSHD_CONFIG* conf);
@@ -31,26 +60,54 @@ char* wolfSSHD_ConfigGetChroot(const WOLFSSHD_CONFIG* conf);
 char* wolfSSHD_ConfigGetHostKeyFile(const WOLFSSHD_CONFIG* conf);
 char* wolfSSHD_ConfigGetHostCertFile(const WOLFSSHD_CONFIG* conf);
 char* wolfSSHD_ConfigGetUserCAKeysFile(const WOLFSSHD_CONFIG* conf);
+char* wolfSSHD_ConfigGetAuthorizedUPNDomains(const WOLFSSHD_CONFIG* conf);
+const WOLFSSHD_CONFIG* wolfSSHD_ConfigGetNext(const WOLFSSHD_CONFIG* conf);
 int wolfSSHD_ConfigSetHostKeyFile(WOLFSSHD_CONFIG* conf, const char* file);
 int wolfSSHD_ConfigSetHostCertFile(WOLFSSHD_CONFIG* conf, const char* file);
+#ifdef WOLFSSHD_WIN_STORE_CONFIG
+char* wolfSSHD_ConfigGetHostKeyStore(const WOLFSSHD_CONFIG* conf);
+char* wolfSSHD_ConfigGetHostKeyStoreSubject(const WOLFSSHD_CONFIG* conf);
+char* wolfSSHD_ConfigGetHostKeyStoreFlags(const WOLFSSHD_CONFIG* conf);
+#endif /* WOLFSSHD_WIN_STORE_CONFIG */
+int wolfSSHD_ConfigSetSystemCA(WOLFSSHD_CONFIG* conf, const char* value);
+int wolfSSHD_ConfigGetSystemCA(const WOLFSSHD_CONFIG* conf);
+int wolfSSHD_ConfigSetUserCAStore(WOLFSSHD_CONFIG* conf, const char* value);
+int wolfSSHD_ConfigGetUserCAStore(const WOLFSSHD_CONFIG* conf);
+#ifdef WOLFSSHD_WIN_STORE_CONFIG
+char* wolfSSHD_ConfigGetWinUserStores(const WOLFSSHD_CONFIG* conf);
+int wolfSSHD_ConfigSetWinUserStores(WOLFSSHD_CONFIG* conf, const char* value);
+char* wolfSSHD_ConfigGetWinUserDwFlags(const WOLFSSHD_CONFIG* conf);
+int wolfSSHD_ConfigSetWinUserDwFlags(WOLFSSHD_CONFIG* conf, const char* value);
+char* wolfSSHD_ConfigGetWinUserPvPara(const WOLFSSHD_CONFIG* conf);
+int wolfSSHD_ConfigSetWinUserPvPara(WOLFSSHD_CONFIG* conf, const char* value);
+#endif /* WOLFSSHD_WIN_STORE_CONFIG */
 int wolfSSHD_ConfigSetUserCAKeysFile(WOLFSSHD_CONFIG* conf, const char* file);
 word16 wolfSSHD_ConfigGetPort(const WOLFSSHD_CONFIG* conf);
 char* wolfSSHD_ConfigGetAuthKeysFile(const WOLFSSHD_CONFIG* conf);
 int wolfSSHD_ConfigGetAuthKeysFileSet(const WOLFSSHD_CONFIG* conf);
 int wolfSSHD_ConfigSetAuthKeysFile(WOLFSSHD_CONFIG* conf, const char* file);
+int wolfSSHD_ConfigGetStrictModes(const WOLFSSHD_CONFIG* conf);
 byte wolfSSHD_ConfigGetPermitEmptyPw(const WOLFSSHD_CONFIG* conf);
 byte wolfSSHD_ConfigGetPermitRoot(const WOLFSSHD_CONFIG* conf);
 byte wolfSSHD_ConfigGetPrivilegeSeparation(const WOLFSSHD_CONFIG* conf);
 long wolfSSHD_ConfigGetGraceTime(const WOLFSSHD_CONFIG* conf);
 byte wolfSSHD_ConfigGetPwAuth(const WOLFSSHD_CONFIG* conf);
+byte wolfSSHD_ConfigGetPubKeyAuth(const WOLFSSHD_CONFIG* conf);
+/* Resolves the configuration for one connection. Every Match block that applies
+ * contributes, one keyword at a time, and the first block to name a keyword
+ * wins it; keywords no matching block names keep the global value. Returns a
+ * newly allocated config the caller frees with wolfSSHD_ConfigFree(), or NULL
+ * on failure. */
 WOLFSSHD_CONFIG* wolfSSHD_GetUserConf(const WOLFSSHD_CONFIG* conf,
-        const char* usr, const char* grp, const char* host,
+        const char* usr, const char** grps, word32 grpCount, const char* host,
         const char* localAdr, word16* localPort, const char* RDomain,
         const char* adr);
 void wolfSSHD_ConfigSavePID(const WOLFSSHD_CONFIG* conf);
 
 #ifdef WOLFSSHD_UNIT_TEST
-int ParseConfigLine(WOLFSSHD_CONFIG** conf, const char* l, int lSz);
+int ParseConfigLine(WOLFSSHD_CONFIG** conf, const char* l, int lSz, int depth);
+int wolfSSHD_ConfigOptionPrefixShadow(const char** earlier,
+        const char** later);
 #endif
 
 #endif /* WOLFSSHD_H */

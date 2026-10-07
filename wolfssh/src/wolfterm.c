@@ -308,11 +308,25 @@ static int isCommand(byte c)
 }
 
 
+/* Bounded VT100 parameter parse. atoi() has UB on overflow (C99 7.20.1),
+ * cannot report errors, and lets peer-supplied "-1" wrap to 0xFFFFFFFF.
+ * Clamp to 0 any param that is empty, has bytes left over after the
+ * digits, or falls outside 0..65535, which covers the VT100 params. */
+static word32 parseArg(const byte* s)
+{
+    char* endp;
+    long v = strtol((const char*)s, &endp, 10);
+    if (endp == (const char*)s || *endp != '\0' || v < 0 || v > 65535L) {
+        v = 0;
+    }
+    return (word32)v;
+}
+
+
 /* returns the number of args found */
 static int getArgs(byte* buf, word32 bufSz, word32* idx, word32* out)
 {
     word32 i = 0, numArgs = 0;
-    word32 maxIdx = WOLFSSH_MAX_CONSOLE_ARGS * 4;
     byte tmpBuf[WOLFSSH_MAX_CONSOLE_ARGS * 4];
     word32 tmpBufIdx = 0;
 
@@ -322,7 +336,7 @@ static int getArgs(byte* buf, word32 bufSz, word32* idx, word32* out)
 
         if (buf[*idx + i] == ';') {
             tmpBuf[tmpBufIdx] = '\0';
-            out[numArgs] = atoi(tmpBuf);
+            out[numArgs] = parseArg(tmpBuf);
             numArgs++;
             tmpBufIdx = 0;
         }
@@ -334,7 +348,7 @@ static int getArgs(byte* buf, word32 bufSz, word32* idx, word32* out)
 
     if (i > 0 && tmpBufIdx > 0) {
         tmpBuf[tmpBufIdx] = '\0';
-        out[numArgs] = atoi(tmpBuf);
+        out[numArgs] = parseArg(tmpBuf);
         numArgs++;
     }
 
@@ -347,6 +361,17 @@ static int getArgs(byte* buf, word32 bufSz, word32* idx, word32* out)
 static int wolfSSH_DoOSC(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
         word32 bufSz, word32* idx)
 {
+    /* A truncated OSC sequence is dropped rather than resumed: OSC state is
+     * not saved to escBuf and escState is never set to WS_ESC_OSC, so there is
+     * no resume path. Returning WS_SUCCESS lets the caller advance past the
+     * sequence and reset escState cleanly. */
+    WOLFSSH_UNUSED(handle);
+
+    if (*idx >= bufSz) {
+        /* missing the OSC command byte, drop the sequence */
+        return WS_SUCCESS;
+    }
+
     if (buf[*idx] == 'P') { /* color pallet */
         WLOG(WS_LOG_DEBUG, "Color pallet not yet supported");
         return WS_SUCCESS;
@@ -366,6 +391,9 @@ static int wolfSSH_DoOSC(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
             word32 i;
 
             *idx += 1;
+            if (*idx >= bufSz) {
+                break; /* truncated sequence, drop it */
+            }
             if (buf[*idx] == ';') {
                 *idx += 1;
             }
@@ -376,8 +404,11 @@ static int wolfSSH_DoOSC(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
             /* BEL (0x07) ends string */
             i = *idx;
             while (i < bufSz && buf[i] != 0x07) i++;
-            if (buf[i] != 0x07) {
-                break; /*bell not found, possible want read? */
+            if (i >= bufSz) {
+                /* bell not found, consume and drop the truncated sequence so
+                 * the partial title is not emitted as raw output */
+                *idx = bufSz;
+                break;
             }
 
             /* sanity check on underflow */
@@ -415,11 +446,21 @@ static int wolfSSH_DoControlSeq(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf, 
     if (ssh->escState == WS_ESC_CSI || ssh->escBufSz > 0) {
         /* check for left overs */
         if (ssh->escBufSz > 0) {
-            word32 tmpSz = min(bufSz - *idx,
-                    WOLFSSH_MAX_CONSOLE_ARGS - (word32)ssh->escBufSz);
+            word32 tmpSz;
+
+            if (ssh->escBufSz >= WOLFSSL_MAX_ESCBUF) {
+                WLOG(WS_LOG_ERROR, "escBuf state exceeds capacity");
+                return WS_FATAL_ERROR;
+            }
+            tmpSz = min(bufSz - *idx,
+                    (word32)WOLFSSL_MAX_ESCBUF - (word32)ssh->escBufSz);
             WMEMCPY(ssh->escBuf + ssh->escBufSz, buf + *idx, tmpSz);
             i = 0;
             numArgs = getArgs(ssh->escBuf, ssh->escBufSz + tmpSz, &i, args);
+            if (i >= ssh->escBufSz + tmpSz) {
+                ssh->escBufSz += tmpSz;
+                return WS_WANT_READ;
+            }
             c = ssh->escBuf[i++];
             if (!isCommand(c)) {
                 /* expecting a command when in CSI state */
@@ -439,6 +480,16 @@ static int wolfSSH_DoControlSeq(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf, 
         }
         else {
             numArgs = getArgs(buf, bufSz, &i, args);
+            if (i >= bufSz) {
+                /* save left overs for next call */
+                if (bufSz - *idx >= WOLFSSL_MAX_ESCBUF) {
+                    WLOG(WS_LOG_ERROR, "escBuf state exceeds capacity");
+                    return WS_FATAL_ERROR;
+                }
+                WMEMCPY(ssh->escBuf, buf + *idx, bufSz - *idx);
+                ssh->escBufSz = bufSz - *idx;
+                return WS_WANT_READ;
+            }
             c = buf[i]; i++;
         }
     }
@@ -448,6 +499,10 @@ static int wolfSSH_DoControlSeq(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf, 
 
         if (i >= bufSz) {
             /* save left overs for next call */
+            if (bufSz - *idx >= WOLFSSL_MAX_ESCBUF) {
+                WLOG(WS_LOG_ERROR, "escBuf state exceeds capacity");
+                return WS_FATAL_ERROR;
+            }
             WMEMCPY(ssh->escBuf, buf + *idx, bufSz - *idx);
             ssh->escBufSz = bufSz - *idx;
             return WS_WANT_READ;
@@ -458,8 +513,12 @@ static int wolfSSH_DoControlSeq(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf, 
     switch (c) {
         case 'H': /* move cursor to indicated row and column  -1 to account
                    * for 1,1 on linux vs 0,0 on windows */
-            wolfSSH_CursorMove(handle, args[1] - OFST, args[0] - OFST, 1);
+        {
+            word32 row = (args[0] > 0) ? args[0] : 1;
+            word32 col = (args[1] > 0) ? args[1] : 1;
+            wolfSSH_CursorMove(handle, col - OFST, row - OFST, 1);
             break;
+        }
 
         case 'C': /* move cursor right */
             wolfSSH_CursorMove(handle, args[0], 0, 0);
@@ -631,6 +690,7 @@ int wolfSSH_ConvertConsole(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
             if (ret == WS_WANT_READ) {
                 return ret;
             }
+            ssh->escState = WC_ESC_NONE;
             ssh->escBufSz = 0;
             break;
 
@@ -639,6 +699,7 @@ int wolfSSH_ConvertConsole(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
             if (ret == WS_WANT_READ) {
                 return ret;
             }
+            ssh->escState = WC_ESC_NONE;
             ssh->escBufSz = 0;
             break;
 
@@ -699,7 +760,7 @@ int wolfSSH_ConvertConsole(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
 
                 case 'D':
                     /* linefeed */
-                    if (WS_WRITECONSOLE(handle, "\n", sizeof("\n"), &wrt, NULL)
+                    if (WS_WRITECONSOLE(handle, "\n", 1, &wrt, NULL)
                         == 0) {
                         WLOG(WS_LOG_DEBUG, "Error writing newline to handle");
                         return WS_FATAL_ERROR;
@@ -707,7 +768,7 @@ int wolfSSH_ConvertConsole(WOLFSSH* ssh, WOLFSSH_HANDLE handle, byte* buf,
                     break;
 
                 case 'E': /* newline */
-                    if (WS_WRITECONSOLE(handle, "\n", sizeof("\n"), &wrt, NULL)
+                    if (WS_WRITECONSOLE(handle, "\n", 1, &wrt, NULL)
                             == 0) {
                         WLOG(WS_LOG_DEBUG, "Error writing newline to handle");
                         return WS_FATAL_ERROR;

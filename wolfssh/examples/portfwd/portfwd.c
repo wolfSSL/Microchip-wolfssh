@@ -35,6 +35,7 @@
 #include <wolfssh/test.h>
 #include <wolfssh/port.h>
 #include <wolfssl/wolfcrypt/ecc.h>
+#include <wolfssl/wolfcrypt/memory.h>
 
 #ifndef NO_WOLFSSH_CLIENT
 #include "examples/portfwd/wolfssh_portfwd.h"
@@ -60,12 +61,31 @@
 #endif
 
 #define INVALID_FWD_PORT 0
+/* wolfSSH_worker() calls to wait for a want-reply tcpip-forward answer. */
+#define MAX_REPLY_TRIES 100
 static const char defaultFwdFromHost[] = "0.0.0.0";
 
 
 static inline int findMax(int a, int b)
 {
     return (a > b) ? a : b;
+}
+
+
+/* Parse a port option. atoi() would wrap an out of range value into a valid
+ * looking port; 65536 becoming 0 is the bad one, since 0 asks the peer to
+ * allocate the reverse listener. */
+static word16 parsePort(const char* arg, const char* opt)
+{
+    char* end = NULL;
+    long val;
+
+    val = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0' || val < 0 || val > 65535) {
+        printf("Port for %s must be 0 to 65535, got \"%s\".\n", opt, arg);
+        err_sys("bad port argument");
+    }
+    return (word16)val;
 }
 
 static void ShowUsage(void)
@@ -77,9 +97,13 @@ static void ShowUsage(void)
            " -u <username> username to authenticate as (REQUIRED)\n"
            " -P <password> password for username, prompted if omitted\n"
            " -F <host>     host to forward from, default %s\n"
-           " -f <num>      host port to forward from (REQUIRED)\n"
+           " -f <num>      host port to forward from (REQUIRED), 0 with -r\n"
+           "               lets the peer pick the listener port\n"
            " -T <host>     host to forward to, default to host\n"
-           " -t <num>      port to forward to (REQUIRED)\n",
+           " -t <num>      port to forward to (REQUIRED)\n"
+           " -r            remote (reverse) forward: ask the SSH server to\n"
+           "               listen on -F/-f and tunnel connections back to\n"
+           "               the local -T/-t target\n",
            LIBWOLFSSH_VERSION_STRING,
            LIBWOLFSSL_VERSION_STRING,
            wolfSshIp, wolfSshPort, defaultFwdFromHost);
@@ -149,7 +173,7 @@ static int SetEcho(int on)
 }
 
 
-byte userPassword[256];
+static byte userPassword[256];
 
 
 static int wsUserAuth(byte authType,
@@ -163,6 +187,8 @@ static int wsUserAuth(byte authType,
     (void)authType;
     if (defaultPassword != NULL) {
         passwordSz = (word32)strlen(defaultPassword);
+        if (passwordSz > (word32)sizeof(userPassword))
+            passwordSz = (word32)sizeof(userPassword);
         memcpy(userPassword, defaultPassword, passwordSz);
     }
     else {
@@ -203,6 +229,199 @@ static int wsPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
 }
 
 
+/* State shared with the remote-forward callbacks. One reverse connection at a
+ * time; a second concurrent channel is refused rather than tracked, since a
+ * single appFd cannot carry two. A production tool would key a table by
+ * channel id. */
+typedef struct PortfwdState {
+    const char* fwdToHost;  /* local target to connect inbound channels to */
+    word16 fwdToPort;
+    SOCKADDR_IN_T targetAddr;  /* fwdToHost:fwdToPort, resolved at startup */
+    SOCKET_T appFd;         /* socket to the local target, -1 when idle */
+    word32 channelId;       /* id of the inbound forwarded-tcpip channel */
+    int pending;            /* a new channel is waiting to be wired up */
+    int cleanupRxd;         /* LOCAL_CLEANUP closed appFd for us */
+    int replied;            /* peer answered the tcpip-forward request */
+    int refused;            /* ...and the answer was a refusal */
+    int badPort;            /* ...or named a port outside 1..65535 */
+    int wantPortZero;       /* the request asked the peer to pick the port */
+    word16 boundPort;       /* port the peer reported binding */
+} PortfwdState;
+
+
+/* Open a TCP connection to the pre-resolved forward target. Returns -1 on
+ * failure. Unlike tcp_socket(), nothing here exits the process: this runs
+ * inside a channel-open callback, where the right answer is to refuse the one
+ * channel. The address is resolved once at startup so build_addr()'s err_sys()
+ * on an unresolvable host cannot fire from here. */
+static SOCKET_T connectTarget(const SOCKADDR_IN_T* addr)
+{
+    SOCKET_T fd;
+
+    fd = socket(((const struct sockaddr_in*)addr)->sin_family, SOCK_STREAM, 0);
+    if (fd == (SOCKET_T)-1) {
+        return (SOCKET_T)-1;
+    }
+#ifdef SO_NOSIGPIPE
+    {
+        int on = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on,
+                (socklen_t)sizeof(on));
+    }
+#endif
+    if (connect(fd, (const struct sockaddr*)addr, sizeof(*addr)) != 0) {
+        WCLOSESOCKET(fd);
+        return (SOCKET_T)-1;
+    }
+    return fd;
+}
+
+
+/* Forwarding callback for client-side remote forwarding. Each connection to
+ * the peer's listener arrives here as a LOCAL_SETUP then a CHANNEL_ID. */
+static int portfwdRemoteFwdCb(WS_FwdCbAction action, void* ctx,
+        const char* address, word32 port)
+{
+    PortfwdState* st = (PortfwdState*)ctx;
+    int ret = WS_FWD_SUCCESS;
+
+    switch (action) {
+        case WOLFSSH_FWD_LOCAL_SETUP:
+            /* address/port name the peer's listener, not our target. */
+            (void)address;
+            (void)port;
+            if (st->appFd != (SOCKET_T)-1 || st->pending) {
+                /* Only one tunnelled connection is tracked. Refuse the extra
+                 * channel instead of overwriting the live one, which would
+                 * misdeliver its data and orphan its socket. */
+                printf("Refusing a second concurrent forwarded connection.\n");
+                ret = WS_FWD_SETUP_E;
+                break;
+            }
+            st->appFd = connectTarget(&st->targetAddr);
+            if (st->appFd == (SOCKET_T)-1) {
+                printf("Couldn't connect to forward target %s:%u\n",
+                        st->fwdToHost, st->fwdToPort);
+                ret = WS_FWD_SETUP_E;
+            }
+            break;
+        case WOLFSSH_FWD_CHANNEL_ID:
+            /* The new channel's id arrives in the port argument. */
+            st->channelId = port;
+            st->pending = 1;
+            break;
+        case WOLFSSH_FWD_LOCAL_CLEANUP:
+            /* Paired with the LOCAL_SETUP that opened the target socket.
+             * portfwd_worker() keeps its own copy of the descriptor, so tell
+             * it not to close what has already been closed. The closing
+             * channel's id arrives in the port argument. */
+            (void)address;
+            (void)port;
+            if (st->appFd != (SOCKET_T)-1) {
+                WCLOSESOCKET(st->appFd);
+                st->appFd = (SOCKET_T)-1;
+            }
+            st->cleanupRxd = 1;
+            break;
+        case WOLFSSH_FWD_REMOTE_SETUP:
+        case WOLFSSH_FWD_REMOTE_CLEANUP:
+            /* Server-side actions; a requesting client never sees these. */
+        default:
+            break;
+    }
+
+    return ret;
+}
+
+
+/* Request-success callback. Per RFC 4254 7.1 the trailing port is only
+ * meaningful when 0 was requested, so it is consulted only then; for a fixed
+ * port the request already names the listener. */
+static int portfwdReqSuccessCb(WOLFSSH* ssh, void* buf, word32 sz, void* ctx)
+{
+    PortfwdState* st = (PortfwdState*)ctx;
+    const byte* p = (const byte*)buf;
+
+    (void)ssh;
+    if (!st->wantPortZero) {
+        printf("Remote forward established.\n");
+    }
+    else if (p != NULL && sz >= 4) {
+        word32 boundPort = ((word32)p[0] << 24) | ((word32)p[1] << 16) |
+                ((word32)p[2] << 8) | (word32)p[3];
+
+        /* Don't narrow a bogus port into a plausible one. */
+        if (boundPort == 0 || boundPort > 65535) {
+            printf("Peer reported an out of range bound port %u\n", boundPort);
+            st->badPort = 1;
+        }
+        else {
+            st->boundPort = (word16)boundPort;
+            printf("Remote forward established; peer bound port %u\n",
+                    boundPort);
+        }
+    }
+    else {
+        /* A port-0 request has no other way to learn the listener's port. */
+        printf("Peer did not report a bound port for a port 0 request.\n");
+        st->badPort = 1;
+    }
+    st->replied = 1;
+    return WS_SUCCESS;
+}
+
+
+/* Request-failure callback. The peer refused the remote listener. */
+static int portfwdReqFailureCb(WOLFSSH* ssh, void* buf, word32 sz, void* ctx)
+{
+    PortfwdState* st = (PortfwdState*)ctx;
+
+    (void)ssh;
+    (void)buf;
+    (void)sz;
+    st->replied = 1;
+    st->refused = 1;
+    return WS_SUCCESS;
+}
+
+
+/* Reports one open response. The id is our own: a failed open never learns
+ * the peer's, and it is the id portfwd_worker() tracks. */
+static int wsChannelOpenRespCb(WOLFSSH_CHANNEL* channel, void* ctx,
+        const char* result)
+{
+    word32 id = 0;
+    const char* str;
+
+    if (ctx != NULL) {
+        str = (const char*)ctx;
+    }
+    else {
+        str = "<BAD CONTEXT>";
+    }
+    if (wolfSSH_ChannelGetId(channel, &id, WS_CHANNEL_ID_SELF)
+            != WS_SUCCESS) {
+        printf("Channel for %s, unknown id open %s.\n", str, result);
+    }
+    else {
+        printf("Channel for %s, %u open %s.\n", str, id, result);
+    }
+    return WS_SUCCESS;
+}
+
+
+static int wsChannelOpenConfCb(WOLFSSH_CHANNEL* channel, void* ctx)
+{
+    return wsChannelOpenRespCb(channel, ctx, "confirmed");
+}
+
+
+static int wsChannelOpenFailCb(WOLFSSH_CHANNEL* channel, void* ctx)
+{
+    return wsChannelOpenRespCb(channel, ctx, "failed");
+}
+
+
 /*
  * fwdFromHost - address to bind the local listener socket to (default: any)
  * fwdFromHostPort - port number to bind the local listener socket to
@@ -232,7 +451,7 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
     SOCKET_T sshFd;
     SOCKADDR_IN_T fwdFromHostAddr;
     socklen_t fwdFromHostAddrSz = sizeof(fwdFromHostAddr);
-    SOCKET_T listenFd;
+    SOCKET_T listenFd = -1;
     SOCKET_T appFd = -1;
     int argc = ((func_args*)args)->argc;
     char** argv = ((func_args*)args)->argv;
@@ -243,8 +462,15 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
     int ret;
     int ch;
     int appFdSet = 0;
+    int appFdHalfClosed = 0;
+    int appEof = 0;
+    int reverse = 0;
+    int fwdFromPortSet = 0;
+    PortfwdState fwdState;
+    int replyTries;
     struct timeval to;
     WOLFSSH_CHANNEL* fwdChannel = NULL;
+    word32 fwdChannelId = 0;
     byte* appBuffer = NULL;
     byte* sshBuffer = NULL;
     word32 appBufferSz = 0;
@@ -258,7 +484,12 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
 
     ((func_args*)args)->return_code = 0;
 
-    while ((ch = mygetopt(argc, argv, "?f:h:p:t:u:F:P:R:T:")) != -1) {
+    /* Initialized up front: the reads below are guarded by "reverse", but the
+     * guard and the initializer would otherwise sit in different branches. */
+    memset(&fwdState, 0, sizeof(fwdState));
+    fwdState.appFd = (SOCKET_T)-1;
+
+    while ((ch = mygetopt(argc, argv, "?rf:h:p:t:u:F:P:R:T:")) != -1) {
         switch (ch) {
             case 'h':
                 host = myoptarg;
@@ -267,13 +498,14 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
             case 'f':
                 if (myoptarg == NULL)
                     err_sys("null argument found");
-                fwdFromPort = (word16)atoi(myoptarg);
+                fwdFromPort = parsePort(myoptarg, "-f");
+                fwdFromPortSet = 1;
                 break;
 
             case 'p':
                 if (myoptarg == NULL)
                     err_sys("null argument found");
-                port = (word16)atoi(myoptarg);
+                port = parsePort(myoptarg, "-p");
                 #if !defined(NO_MAIN_DRIVER) || defined(USE_WINDOWS_API)
                     if (port == 0)
                         err_sys("port number cannot be 0");
@@ -283,7 +515,7 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
             case 't':
                 if (myoptarg == NULL)
                     err_sys("null argument found");
-                fwdToPort = (word16)atoi(myoptarg);
+                fwdToPort = parsePort(myoptarg, "-t");
                 break;
 
             case 'u':
@@ -306,6 +538,10 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
                 fwdToHost = myoptarg;
                 break;
 
+            case 'r':
+                reverse = 1;
+                break;
+
             case '?':
                 ShowUsage();
                 exit(EXIT_SUCCESS);
@@ -321,8 +557,12 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
         err_sys("client requires a username parameter.");
     if (fwdToPort == INVALID_FWD_PORT)
         err_sys("requires a port to forward to");
-    if (fwdFromPort == INVALID_FWD_PORT)
+    if (!fwdFromPortSet)
         err_sys("requires a port to forward from");
+    /* Port 0 asks the peer to allocate the port, so it needs a peer that
+     * listens. */
+    if (fwdFromPort == INVALID_FWD_PORT && !reverse)
+        err_sys("port 0 to forward from requires reverse mode");
 
     if (fwdToHost == NULL)
         fwdToHost = host;
@@ -330,10 +570,9 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
     printf("portfwd options\n"
            " * ssh host: %s:%u\n"
            " * username: %s\n"
-           " * password: %s\n"
            " * forward from: %s:%u\n"
            " * forward to: %s:%u\n",
-           host, port, username, password ? password : "",
+           host, port, username,
            fwdFromHost, fwdFromPort,
            fwdToHost, fwdToPort);
 
@@ -372,20 +611,43 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
 
     wolfSSH_CTX_SetPublicKeyCheck(ctx, wsPublicKeyCheck);
     wolfSSH_SetPublicKeyCheckCtx(ssh, (void*)"You've been sampled.");
+    wolfSSH_CTX_SetChannelOpenRespCb(ctx,
+            wsChannelOpenConfCb, wsChannelOpenFailCb);
+    wolfSSH_SetChannelOpenCtx(ssh, (void*)"port forward");
 
     ret = wolfSSH_SetUsername(ssh, username);
     if (ret != WS_SUCCESS)
         err_sys("Couldn't set the username.");
 
+    if (reverse) {
+        /* The peer listens; its inbound channels reach us through the
+         * forwarding callback, the bound port through request-success. */
+        fwdState.fwdToHost = fwdToHost;
+        fwdState.fwdToPort = fwdToPort;
+        fwdState.wantPortZero = (fwdFromPort == 0);
+        /* Resolved once here, where err_sys() on a bad host is appropriate,
+         * so the per-channel callback never has to resolve. */
+        build_addr(&fwdState.targetAddr, fwdToHost, fwdToPort);
+        wolfSSH_CTX_SetFwdCb(ctx, portfwdRemoteFwdCb, NULL);
+        wolfSSH_SetFwdCbCtx(ssh, &fwdState);
+        wolfSSH_SetReqSuccess(ctx, portfwdReqSuccessCb);
+        wolfSSH_SetReqSuccessCtx(ssh, &fwdState);
+        wolfSSH_SetReqFailure(ctx, portfwdReqFailureCb);
+        wolfSSH_SetReqFailureCtx(ssh, &fwdState);
+    }
+
     /* Socket to SSH peer. */
     build_addr(&hostAddr, host, port);
     tcp_socket(&sshFd, ((struct sockaddr_in *)&hostAddr)->sin_family);
 
-    /* Receive from client application or connect to server application. */
-    build_addr(&fwdFromHostAddr, fwdFromHost, fwdFromPort);
-    tcp_socket(&listenFd, ((struct sockaddr_in *)&fwdFromHostAddr)->sin_family);
+    if (!reverse) {
+        /* Receive from client application or connect to server application. */
+        build_addr(&fwdFromHostAddr, fwdFromHost, fwdFromPort);
+        tcp_socket(&listenFd,
+                ((struct sockaddr_in *)&fwdFromHostAddr)->sin_family);
 
-    tcp_listen(&listenFd, &fwdFromPort, 1);
+        tcp_listen(&listenFd, &fwdFromPort, 1);
+    }
 
     printf("Connecting to the SSH server...\n");
     ret = connect(sshFd, (const struct sockaddr *)&hostAddr, hostAddrSz);
@@ -397,18 +659,53 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
         err_sys("Couldn't set the session's socket.");
 
     ret = wolfSSH_connect(ssh);
+    /* User authentication is done with the buffer either way. */
+    wc_ForceZero(userPassword, sizeof(userPassword));
     if (ret != WS_SUCCESS)
         err_sys("Couldn't connect SFTP");
+
+    if (reverse) {
+        /* Ask the server to open a listener and tunnel connections back. */
+        ret = wolfSSH_FwdRemoteSetup(ssh, fwdFromHost, fwdFromPort, 1);
+        if (ret != WS_SUCCESS)
+            err_sys("Couldn't request remote port forward.");
+
+        /* No listener until the peer answers, and want-reply owes us one.
+         * Back-pressure and a rekey are progress, not failure. Bounded so a
+         * peer that never answers is distinguishable from one that refuses. */
+        for (replyTries = 0; !fwdState.replied && replyTries < MAX_REPLY_TRIES;
+                replyTries++) {
+            ret = wolfSSH_worker(ssh, NULL);
+            if (ret != WS_SUCCESS && ret != WS_CHAN_RXD &&
+                    ret != WS_WANT_READ && ret != WS_WANT_WRITE &&
+                    ret != WS_WINDOW_FULL && ret != WS_REKEYING &&
+                    ret != WS_EOF)
+                err_sys("Couldn't get the remote forward reply.");
+        }
+        if (!fwdState.replied)
+            err_sys("Peer never answered the remote port forward request.");
+        if (fwdState.refused)
+            err_sys("Peer refused the remote port forward request.");
+        if (fwdState.badPort)
+            err_sys("Peer reported an unusable bound port.");
+
+        /* With -f 0 the peer picked the port. It is the listener's real port,
+         * so both the ready file and the cancel below must name it. */
+        if (fwdState.wantPortZero)
+            fwdFromPort = fwdState.boundPort;
+    }
 
     if (readyFile != NULL) {
     #ifndef NO_FILESYSTEM
         WFILE* f = NULL;
+        word16 readyPort = fwdFromPort;
+
         ret = WFOPEN(NULL, &f, readyFile, "w");
         if (f != NULL && ret == 0) {
             char portStr[10];
             int l;
 
-            l = WSNPRINTF(portStr, sizeof(portStr), "%d\n", (int)fwdFromPort);
+            l = WSNPRINTF(portStr, sizeof(portStr), "%d\n", (int)readyPort);
             if (l > 0) {
                 WFWRITE(NULL, portStr, MIN((size_t)l, sizeof(portStr)), 1, f);
             }
@@ -421,44 +718,146 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
 
     FD_ZERO(&templateFds);
     FD_SET(sshFd, &templateFds);
-    FD_SET(listenFd, &templateFds);
-    nFds = findMax(sshFd, listenFd) + 1;
+    if (!reverse) {
+        FD_SET(listenFd, &templateFds);
+        nFds = findMax(sshFd, listenFd) + 1;
+    }
+    else {
+        nFds = (int)sshFd + 1;
+    }
 
     for (;;) {
         rxFds = templateFds;
         errFds = templateFds;
 
+        /* A readable appFd with a full buffer would spin select(). Mask the
+         * read set only, so errors are still noticed. */
+        if (appFdSet && appBufferUsed == appBufferSz)
+            FD_CLR(appFd, &rxFds);
+
         to.tv_sec = 1;
         to.tv_usec = 0;
         ret = select(nFds, &rxFds, NULL, &errFds, &to);
+        if (ret < 0)
+            err_sys("select failed\n");
         if (ret == 0) {
+            /* Fall through rather than continue, a short send leaves a tail
+             * owed another attempt. select() cleared the sets. */
             ret = wolfSSH_SendIgnore(ssh, NULL, 0);
             if (ret != WS_SUCCESS)
                 err_sys("Couldn't send an ignore message.");
-            continue;
         }
-        else if (ret < 0)
-            err_sys("select failed\n");
 
         if ((appFdSet && FD_ISSET(appFd, &errFds)) ||
             FD_ISSET(sshFd, &errFds) ||
-            FD_ISSET(listenFd, &errFds)) {
+            (!reverse && FD_ISSET(listenFd, &errFds))) {
 
                 err_sys("some socket had an error");
             }
-        if (appFdSet && FD_ISSET(appFd, &rxFds)) {
+        /* Skip the read when the buffer is full, a zero length recv() returns
+         * 0 and would be mistaken for the peer closing. */
+        if (appFdSet && appBufferUsed < appBufferSz &&
+                FD_ISSET(appFd, &rxFds)) {
             int rxd;
             rxd = (int)recv(appFd,
                     appBuffer + appBufferUsed, appBufferSz - appBufferUsed, 0);
             if (rxd > 0)
                 appBufferUsed += rxd;
-            else
-                break;
+            else {
+                /* Local end-of-input. Stop polling the socket and leave once
+                 * what is buffered has gone out; leaving now would drop it. */
+                appEof = 1;
+                FD_CLR(appFd, &templateFds);
+            }
         }
         if (FD_ISSET(sshFd, &rxFds)) {
             word32 channelId = 0;
 
             ret = wolfSSH_worker(ssh, &channelId);
+
+            /* The worker may have taken a reverse channel. Wire its target
+             * socket in before the read below, which would otherwise consume
+             * the first chunk with nowhere to put it. */
+            if (reverse && fwdState.pending && !appFdSet) {
+                WOLFSSH_CHANNEL* newChannel;
+
+                newChannel = wolfSSH_ChannelFind(ssh, fwdState.channelId,
+                        WS_CHANNEL_ID_SELF);
+                if (fwdState.appFd != (SOCKET_T)-1 && newChannel != NULL) {
+                    appFd = fwdState.appFd;
+                    /* The latch describes this descriptor now, not one an
+                     * earlier failed open already cleaned up. */
+                    fwdState.cleanupRxd = 0;
+                    fwdChannel = newChannel;
+                    fwdChannelId = fwdState.channelId;
+                    FD_SET(appFd, &templateFds);
+                    nFds = findMax((int)sshFd, (int)appFd) + 1;
+                    appFdSet = 1;
+                }
+                else if (fwdState.appFd != (SOCKET_T)-1) {
+                    /* The channel did not survive the open. Drop the target
+                     * socket rather than leave it connected but unpolled. */
+                    WCLOSESOCKET(fwdState.appFd);
+                    fwdState.appFd = (SOCKET_T)-1;
+                }
+                fwdState.pending = 0;
+            }
+
+            if (ret == WS_CHANNEL_CLOSED) {
+                /* The worker tore down the forwarding channel; fwdChannel now
+                 * dangles. Stop before the send at the bottom of the loop can
+                 * touch the freed channel. */
+                fwdChannel = NULL;
+                break;
+            }
+
+            /* A refused open frees the channel and reports a fatal
+             * error, not a close, so the guard above does not run.
+             * Re-resolve by id rather than trust the pointer. */
+            if (fwdChannel != NULL) {
+                fwdChannel = wolfSSH_ChannelFind(ssh, fwdChannelId,
+                        WS_CHANNEL_ID_SELF);
+                if (fwdChannel == NULL)
+                    break;
+            }
+
+            /* Relay the half-close so a local reader waiting on end-of-input
+             * returns; nothing else relays it. Driven off the latched channel
+             * state, not the once-only WS_EOF status. Only the channel appFd
+             * is wired to: half-closing the wrong socket truncates a live
+             * transfer. */
+            if (appFdSet && fwdChannel != NULL && !appFdHalfClosed
+                    && wolfSSH_ChannelGetEof(fwdChannel)) {
+                int drained;
+
+                /* Hand over the backlog first, or the local reader sees a
+                 * clean end-of-input short of what the peer sent. A negative
+                 * read is a rekey or a stalled channel, not a drained one, so
+                 * only an empty read earns the half-close; the latch stays
+                 * clear and a later pass tries again. */
+                do {
+                    drained = wolfSSH_ChannelRead(fwdChannel, sshBuffer,
+                            sshBufferSz);
+                    if (drained > 0) {
+                        if ((int)send(appFd, sshBuffer, drained, 0) != drained)
+                            break;
+                    }
+                } while (drained > 0);
+
+                if (drained == 0) {
+                    appFdHalfClosed = 1;
+                #ifdef SHUT_WR
+                    shutdown(appFd, SHUT_WR);
+                #elif defined(SD_SEND)
+                    shutdown(appFd, SD_SEND);
+                #else
+                    printf("No way to half-close the local socket, "
+                            "the local reader may wait for input that is "
+                            "not coming.\n");
+                #endif
+                }
+            }
+
             if (ret == WS_CHAN_RXD) {
                 WOLFSSH_CHANNEL* readChannel;
 
@@ -480,7 +879,7 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
                 }
             }
         }
-        if (!appFdSet && FD_ISSET(listenFd, &rxFds)) {
+        if (!reverse && !appFdSet && FD_ISSET(listenFd, &rxFds)) {
             appFd = accept(listenFd,
                     (struct sockaddr*)&fwdFromHostAddr, &fwdFromHostAddrSz);
             if (appFd < 0)
@@ -490,27 +889,61 @@ THREAD_RETURN WOLFSSH_THREAD portfwd_worker(void* args)
             appFdSet = 1;
             fwdChannel = wolfSSH_ChannelFwdNew(ssh, fwdToHost, fwdToPort,
                     fwdFromHost, fwdFromPort);
+            if (fwdChannel != NULL
+                    && wolfSSH_ChannelGetId(fwdChannel, &fwdChannelId,
+                        WS_CHANNEL_ID_SELF) != WS_SUCCESS)
+                fwdChannel = NULL;
             continue;
         }
         if (appBufferUsed > 0) {
             ret = wolfSSH_ChannelSend(fwdChannel, appBuffer, appBufferUsed);
-            if (ret > 0)
+            if (ret > 0) {
+                if ((word32)ret != appBufferUsed) {
+                    WMEMMOVE(appBuffer, appBuffer + ret, appBufferUsed - ret);
+                }
                 appBufferUsed -= ret;
+            }
             else if (ret == WS_CHANNEL_NOT_CONF || ret == WS_CHAN_RXD) {
             #ifdef SHELL_DEBUG
                 printf("Waiting for channel open confirmation.\n");
             #endif
             }
         }
+        /* Nothing left to hand over, or nothing left to hand it to: without
+         * the channel check a failed open would leave the buffer forever
+         * unsendable and the loop with no way out. */
+        if (appEof && (appBufferUsed == 0 || fwdChannel == NULL))
+            break;
+    }
+
+    if (reverse) {
+        /* Best effort: the session is going away regardless, but a failure
+         * here means the peer's listener may outlive us. */
+        ret = wolfSSH_FwdRemoteCancel(ssh, fwdFromHost, fwdFromPort, 0);
+        if (ret != WS_SUCCESS)
+            printf("Couldn't cancel the remote port forward, ret = %d\n", ret);
     }
 
     ret = wolfSSH_shutdown(ssh);
-    if (ret != WS_SUCCESS)
+    /* The socket closes next, so a queued write and a retired channel are
+     * both done as far as this teardown is concerned. */
+    if (ret != WS_SUCCESS && ret != WS_WANT_WRITE && ret != WS_CHANNEL_CLOSED)
         err_sys("Closing port forward stream failed.");
 
     WCLOSESOCKET(sshFd);
-    WCLOSESOCKET(listenFd);
-    WCLOSESOCKET(appFd);
+    if (listenFd != (SOCKET_T)-1)
+        WCLOSESOCKET(listenFd);
+    /* Skip a descriptor the cleanup callback already closed; closing it
+     * twice can take down whatever has been handed the number since. */
+    if (fwdState.cleanupRxd)
+        appFd = (SOCKET_T)-1;
+    if (appFd != (SOCKET_T)-1) {
+        WCLOSESOCKET(appFd);
+        /* The loop can leave with the channel still open, and freeing the
+         * session below runs the cleanup handler on this same descriptor. */
+        if (fwdState.appFd == appFd)
+            fwdState.appFd = (SOCKET_T)-1;
+    }
     wolfSSH_free(ssh);
     wolfSSH_CTX_free(ctx);
 #ifdef WOLFSSH_SMALL_STACK

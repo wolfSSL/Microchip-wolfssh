@@ -124,6 +124,8 @@ struct WS_SFTP_FILEATRB_EX {
 #define FILEATRB_PER_DIR       0040000
 #define FILEATRB_PER_DEV_BLOCK 0060000
 #define FILEATRB_PER_MASK_PERM 0000777
+/* Strip setuid/setgid/sticky bits from peer-supplied permissions. */
+#define WOLFSSH_SFTP_SAFE_MODE(m) ((m) & FILEATRB_PER_MASK_PERM)
 
 typedef struct WS_SFTP_FILEATRB {
     word32 flags;
@@ -156,6 +158,14 @@ struct WS_SFTPNAME {
  *     expects the amount requested to be sent, and that's 32kiB.
  * WOLFSSH_MAX_SFTP_RECV: Used as a bounds check on a SFTP message's size.
  *     Is not used to allocate any buffers directly.
+ * WOLFSSH_MAX_SFTP_NAME: Upper bound on the size of a single SFTP NAME
+ *     response (READDIR, REALPATH, LS). The client allocates one buffer of
+ *     this size for the message and then one WS_SFTPNAME node per entry, so
+ *     an unbounded NAME packet lets a malicious or MITM server amplify a
+ *     modest packet into several times that much live heap. The default of
+ *     1 MiB leaves room for very large single-packet directory listings (the
+ *     server sends a whole directory in one NAME packet) while bounding peak
+ *     heap to a few MiB.
  */
 #ifndef WOLFSSH_MAX_SFTP_RW
     #define WOLFSSH_MAX_SFTP_RW 32768
@@ -163,6 +173,27 @@ struct WS_SFTPNAME {
 #ifndef WOLFSSH_MAX_SFTP_RECV
     #define WOLFSSH_MAX_SFTP_RECV 32768
 #endif
+#ifndef WOLFSSH_MAX_SFTP_NAME
+    #define WOLFSSH_MAX_SFTP_NAME (1024 * 1024)
+#endif
+
+/*
+ * WOLFSSH_MAX_SFTP_PACKET: Upper bound on the body size of an inbound SFTP
+ *     request the server accepts in its steady-state receive loop
+ *     (wolfSSH_SFTP_read). The largest legitimate request is a WRITE carrying
+ *     WOLFSSH_MAX_SFTP_RW bytes of file data plus the handle, offset, and
+ *     length framing, so the bound is WOLFSSH_MAX_SFTP_RW plus the message
+ *     overhead allowance of WOLFSSH_MAX_SFTP_RECV. Used to reject an over-large
+ *     client-declared length before any buffer is allocated. This bound does
+ *     not apply to client-side response handling (e.g. NAME directory listings
+ *     or READ data), whose sizes are not derived from WOLFSSH_MAX_SFTP_RW.
+ */
+#ifndef WOLFSSH_MAX_SFTP_PACKET
+    #define WOLFSSH_MAX_SFTP_PACKET (WOLFSSH_MAX_SFTP_RW + WOLFSSH_MAX_SFTP_RECV)
+#endif
+
+#define WOLFSSH_HANDLE_ID_SZ (sizeof(word32) * 2)
+    /* The handle IDs are an array[2] of word32. */
 
 /* functions for establishing a connection */
 WOLFSSH_API int wolfSSH_SFTP_accept(WOLFSSH* ssh);
@@ -174,7 +205,46 @@ WOLFSSH_LOCAL WS_SFTPNAME* wolfSSH_SFTP_ReadDir(WOLFSSH* ssh, byte* handle,
         word32 handleSz);
 WOLFSSH_LOCAL int wolfSSH_SFTP_OpenDir(WOLFSSH* ssh, byte* buf, word32 bufSz);
 
+/* An SFTP session has two independent path settings:
+ *
+ *   start path   where the session begins and what relative requests resolve
+ *                against. Grants and denies nothing.
+ *                Set with wolfSSH_SFTP_SetDefaultPath.
+ *   confinement  the root the session is jailed to. Requests resolving
+ *                outside it are rejected with WS_PERMISSIONS. No root, or a
+ *                root of "/", leaves the session unconfined.
+ *                Set with wolfSSH_SFTP_SetConfinePath.
+ *
+ * Keeping them separate lets a server start a session deep inside a jail
+ * (start /srv/data/user7, confine to /srv/data), confine without moving where
+ * the session opens, or do neither and let the OS bound access instead, as
+ * wolfsshd does by dropping to the authenticated user.
+ *
+ * For both, path is NULL-terminated, a NULL path leaves the current setting
+ * unchanged, and WS_SUCCESS is returned on success.
+ *
+ * Paths are resolved lexically, which cannot prove a link stays in-jail, so
+ * confinement rejects ALL symbolic links below the root - including ones
+ * pointing back inside it (e.g. "current -> releases/v3"). Serve trees without
+ * symlinks, or build with WOLFSSH_NO_SYMLINK_CHECK to drop the check, and the
+ * escape protection with it.
+ *
+ * The root itself is trusted and never checked, so a root reached through a
+ * symbolic link is as wide as that link's target. Give a root the server
+ * controls, with no symlink components.
+ *
+ * That link check is defense in depth, not a boundary: it is a TOCTOU check,
+ * inspecting each component before the operation later acts on the path by
+ * name. A concurrent writer inside the jail, running as the user the server
+ * does file operations as, could swap a checked component for a symlink in
+ * that window; a session cannot race itself, since wolfSSH serves one
+ * session's requests serially. The check reliably blocks static in-jail
+ * symlinks, but closing the race portably needs *at/O_NOFOLLOW primitives some
+ * supported filesystems lack. Hostile multi-tenant deployments want an
+ * OS-level jail (chroot plus dropped privileges).
+ */
 WOLFSSH_API int wolfSSH_SFTP_SetDefaultPath(WOLFSSH* ssh, const char* path);
+WOLFSSH_API int wolfSSH_SFTP_SetConfinePath(WOLFSSH* ssh, const char* path);
 WOLFSSH_API WS_SFTPNAME* wolfSSH_SFTP_RealPath(WOLFSSH* ssh, char* dir);
 WOLFSSH_API int wolfSSH_SFTP_Close(WOLFSSH* ssh, byte* handle, word32 handleSz);
 WOLFSSH_API int wolfSSH_SFTP_Open(WOLFSSH* ssh, char* dir, word32 reason,
@@ -213,7 +283,7 @@ WOLFSSH_API int wolfSSH_SFTP_Rename(WOLFSSH* ssh, const char* old,
 WOLFSSH_API WS_SFTPNAME* wolfSSH_SFTP_LS(WOLFSSH* ssh, char* dir);
 WOLFSSH_API int wolfSSH_SFTP_CHMOD(WOLFSSH* ssh, char* n, char* oct);
 
-typedef void(WS_STATUS_CB)(WOLFSSH*, word32*, char*);
+typedef void(WS_STATUS_CB)(WOLFSSH* ssh, word32* offset, char* fileName);
 WOLFSSH_API int wolfSSH_SFTP_Get(WOLFSSH* ssh, char* from, char* to,
         byte resume, WS_STATUS_CB* statusCb);
 WOLFSSH_API int wolfSSH_SFTP_Put(WOLFSSH* ssh, char* from, char* to,
@@ -266,16 +336,34 @@ WOLFSSH_LOCAL int wolfSSH_SFTP_RecvCloseDir(WOLFSSH* ssh, byte* handle,
 #endif /* NO_WOLFSSH_DIR */
 
 WOLFSSL_LOCAL int wolfSSH_SFTP_free(WOLFSSH* ssh);
-WOLFSSL_LOCAL int SFTP_AddHandleNode(WOLFSSH* ssh, byte* handle,
-        word32 handleSz, char* name);
-WOLFSSL_LOCAL int SFTP_RemoveHandleNode(WOLFSSH* ssh, byte* handle,
-        word32 handleSz);
-
 WOLFSSH_LOCAL void wolfSSH_SFTP_ShowSizes(void);
 
 #ifdef WOLFSSH_TEST_INTERNAL
     WOLFSSH_API int wolfSSH_TestSftpBufferSend(WOLFSSH* ssh,
             byte* data, word32 sz, word32 idx);
+    WOLFSSH_API int wolfSSH_TestSftpRecvSizeCheck(int sz);
+    WOLFSSH_API int wolfSSH_TestSftpDoName(WOLFSSH* ssh);
+    WOLFSSH_API int wolfSSH_TestSftpGetHandle(WOLFSSH* ssh, byte* handle,
+            word32* handleSz);
+    WOLFSSH_API int wolfSSH_TestSftpSetAttributes(byte* buf, word32 bufSz,
+            WS_SFTP_FILEATRB* atr);
+    WOLFSSH_API int wolfSSH_TestSftpParseAttributes(byte* buf, word32 bufSz,
+            WS_SFTP_FILEATRB* atr, word32* idx);
+    WOLFSSH_API int wolfSSH_TestSftpSendCap(WOLFSSH* ssh, word32 cap);
+    WOLFSSH_API int wolfSSH_TestSftpStallPending(WOLFSSH* ssh, word32 count);
+    #if !defined(NO_WOLFSSH_SERVER) && !defined(NO_FILESYSTEM)
+        WOLFSSH_API int wolfSSH_SFTP_TestRecvStateInit(WOLFSSH* ssh);
+        WOLFSSH_API const byte* wolfSSH_SFTP_TestRecvReply(WOLFSSH* ssh,
+                word32* sz);
+        WOLFSSH_API void wolfSSH_SFTP_TestRecvStateFree(WOLFSSH* ssh);
+        WOLFSSH_API int wolfSSH_SFTP_TestFileHandleCount(WOLFSSH* ssh);
+        #ifndef NO_WOLFSSH_DIR
+            WOLFSSH_API int wolfSSH_SFTP_TestDirHandleCount(WOLFSSH* ssh);
+        #endif
+        #ifndef USE_WINDOWS_API
+            WOLFSSH_API int wolfSSH_SFTP_TestInvalidateHeadFd(WOLFSSH* ssh);
+        #endif
+    #endif
     #if defined(WOLFSSL_NUCLEUS) && !defined(NO_WOLFSSH_MKTIME)
         WOLFSSH_API int wolfSSH_TestNucleusMonthFromDate(word16 d);
     #endif

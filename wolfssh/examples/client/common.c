@@ -24,6 +24,7 @@
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/coding.h>
+#include <wolfssl/wolfcrypt/memory.h>
 
 #ifdef WOLFSSH_TPM
     #include <wolftpm/tpm2_wrap.h>
@@ -42,6 +43,7 @@
 
 static byte userPublicKeyBuf[512];
 static byte* userPublicKey = userPublicKeyBuf;
+static byte userPublicKeyAlloc = 0;
 static const byte* userPublicKeyType = NULL;
 static byte userPassword[256];
 static const byte* userPrivateKeyType = NULL;
@@ -59,18 +61,37 @@ static byte isPrivate = 0;
 static word32 keyboardResponseCount = 0;
 static byte** keyboardResponses;
 static word32* keyboardResponseLengths;
-#endif
 
-#ifdef WOLFSSH_CERTS
-#if 0
-/* compiled in for using RSA certificates instead of ECC certificate */
-static const byte publicKeyType[] = "x509v3-ssh-rsa";
-static const byte privateKeyType[] = "ssh-rsa";
-#else
-static const byte publicKeyType[] = "x509v3-ecdsa-sha2-nistp256";
-#endif
-#endif
 
+/* Releases the responses from the previous INFO_REQUEST, if any. Only the
+ * keyboardResponseCount entries that were filled in are touched. */
+static void ClientFreeKeyboardResponses(void)
+{
+    word32 entry;
+
+    if (keyboardResponses != NULL) {
+        for (entry = 0; entry < keyboardResponseCount; entry++) {
+            if (keyboardResponses[entry] == NULL)
+                continue;
+            if (keyboardResponseLengths != NULL &&
+                    keyboardResponseLengths[entry] != 0) {
+                wc_ForceZero(keyboardResponses[entry],
+                        keyboardResponseLengths[entry]);
+            }
+            WFREE(keyboardResponses[entry], NULL, 0);
+        }
+        WFREE(keyboardResponses, NULL, 0);
+        keyboardResponses = NULL;
+    }
+
+    if (keyboardResponseLengths != NULL) {
+        WFREE(keyboardResponseLengths, NULL, 0);
+        keyboardResponseLengths = NULL;
+    }
+
+    keyboardResponseCount = 0;
+}
+#endif
 
 #ifdef WOLFSSH_TPM
     WOLFTPM2_DEV tpmDev;
@@ -192,7 +213,7 @@ static const unsigned int hanselPrivateRsaSz = 1191;
 #endif
 
 
-#ifndef WOLFSSH_NO_ECC
+#ifndef WOLFSSH_NO_ECDSA
 #ifndef WOLFSSH_NO_ECDSA_SHA2_NISTP256
 static const char* hanselPublicEcc =
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAA"
@@ -245,59 +266,25 @@ static const unsigned int hanselPrivateEccSz = 223;
 #endif
 #endif
 
+/* The pair in keys/hansel-key-ed25519.*, the only built-in user key left
+ * when both RSA and ECDSA are compiled out. */
+#if defined(WOLFSSH_NO_RSA) && defined(WOLFSSH_NO_ECDSA) && \
+    !defined(WOLFSSH_NO_ED25519)
+static const char* hanselPublicEd25519 =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHTSoBZIJBO2V0Jb2OWyMWNbkD"
+    "d6ReDfKxnrAPlbPuCe hansel";
+static const byte hanselPrivateEd25519[] = {
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+  0x04, 0x22, 0x04, 0x20, 0x28, 0xc6, 0xe9, 0xd8, 0x37, 0x4d, 0x0c, 0x52,
+  0x7e, 0x5f, 0xb3, 0x4c, 0x81, 0xe8, 0x68, 0xee, 0xc9, 0x7c, 0xad, 0x00,
+  0xad, 0xa0, 0xe3, 0xe2, 0x13, 0x06, 0x55, 0xf1, 0x17, 0xf1, 0x0a, 0xf0
+};
+static const unsigned int hanselPrivateEd25519Sz =
+        (unsigned int)sizeof(hanselPrivateEd25519);
+#endif
+
 
 #if defined(WOLFSSH_CERTS)
-
-static int load_der_file(const char* filename, byte** out, word32* outSz,
-        void* heap)
-{
-    WFILE* file;
-    byte* in;
-    long inSz;
-    int ret;
-
-    if (filename == NULL || out == NULL || outSz == NULL)
-        return -1;
-
-    ret = WFOPEN(NULL, &file, filename, "rb");
-    if (ret != 0 || file == WBADFILE)
-        return -1;
-
-    if (WFSEEK(NULL, file, 0, WSEEK_END) != 0) {
-        WFCLOSE(NULL, file);
-        return -1;
-    }
-    inSz = WFTELL(NULL, file);
-    if (inSz <= 0) {
-        WFCLOSE(NULL, file);
-        return -1;
-    }
-    WREWIND(NULL, file);
-
-    in = (byte*)WMALLOC(inSz, heap, 0);
-    if (in == NULL) {
-        WFCLOSE(NULL, file);
-        return -1;
-    }
-
-    ret = (int)WFREAD(NULL, in, 1, inSz, file);
-    if (ret <= 0 || ret != inSz) {
-        ret = -1;
-        WFREE(in, heap, 0);
-        in = 0;
-        inSz = 0;
-    }
-    else
-        ret = 0;
-
-    *out = in;
-    *outSz = (word32)inSz;
-
-    WFCLOSE(NULL, file);
-
-    return ret;
-}
-
 
 #if (defined(OPENSSL_ALL) || defined(WOLFSSL_IP_ALT_NAME))
 static inline void ato32(const byte* c, word32* u32)
@@ -321,6 +308,9 @@ static int ParseRFC6187(const byte* in, word32 inSz, byte** leafOut,
 
     /* Skip the name */
     ato32(in, &l);
+    if (l > inSz - sizeof(word32))
+        return WS_BUFFER_E;
+
     m += l + sizeof(word32);
 
     /* Get the cert count */
@@ -494,6 +484,13 @@ int ClientUserAuth(byte authType,
     if (authType == WOLFSSH_USERAUTH_PUBLICKEY) {
         WS_UserAuthData_PublicKey* pk = &authData->sf.publicKey;
 
+        if (userPublicKeyType == NULL || userPublicKeySz == 0) {
+            /* Nothing to sign with. SendUserAuthRequest() turns this
+             * into WS_FATAL_ERROR rather than putting an untyped
+             * publickey request on the wire. */
+            return WOLFSSH_USERAUTH_FAILURE;
+        }
+
         pk->publicKeyType = userPublicKeyType;
         pk->publicKeyTypeSz = userPublicKeyTypeSz;
         pk->publicKey = userPublicKey;
@@ -506,6 +503,8 @@ int ClientUserAuth(byte authType,
     else if (authType == WOLFSSH_USERAUTH_PASSWORD) {
         if (defaultPassword != NULL) {
             passwordSz = (word32)strlen(defaultPassword);
+            if (passwordSz > (word32)sizeof(userPassword))
+                passwordSz = (word32)sizeof(userPassword);
             memcpy(userPassword, defaultPassword, passwordSz);
         }
 #ifdef WOLFSSH_TERM
@@ -539,6 +538,8 @@ int ClientUserAuth(byte authType,
     }
 #if defined(WOLFSSH_TERM) && defined(WOLFSSH_KEYBOARD_INTERACTIVE)
     else if (authType == WOLFSSH_USERAUTH_KEYBOARD) {
+        word32 promptCount = authData->sf.keyboard.promptCount;
+
         if (authData->sf.keyboard.promptName &&
             authData->sf.keyboard.promptName[0] != '\0') {
             printf("%s\n", authData->sf.keyboard.promptName);
@@ -547,51 +548,76 @@ int ClientUserAuth(byte authType,
             authData->sf.keyboard.promptInstruction[0] != '\0') {
             printf("%s\n", authData->sf.keyboard.promptInstruction);
         }
-        keyboardResponseCount = authData->sf.keyboard.promptCount;
-        keyboardResponses =
-            (byte**)WMALLOC(sizeof(byte*) * keyboardResponseCount, NULL, 0);
-        if (keyboardResponses == NULL) {
-            ret = WS_MEMORY_E;
-        }
-        if (ret == WS_SUCCESS) {
-            authData->sf.keyboard.responses = (byte**)keyboardResponses;
-            keyboardResponseLengths = (word32*)WMALLOC(
-                sizeof(word32) * keyboardResponseCount, NULL, 0);
-            authData->sf.keyboard.responseLengths = keyboardResponseLengths;
-        }
 
-        if (keyboardResponseLengths == NULL) {
-            ret = WS_MEMORY_E;
-        }
+        /* The server may send another INFO_REQUEST at any time. */
+        ClientFreeKeyboardResponses();
 
-        for (entry = 0; entry < authData->sf.keyboard.promptCount; entry++) {
-            if (ret == WS_SUCCESS) {
-                printf("%s", authData->sf.keyboard.prompts[entry]);
-                if (!authData->sf.keyboard.promptEcho[entry]) {
-                    ClientSetEcho(0);
-                }
-                if (WFGETS((char*)userPassword, sizeof(userPassword), stdin)
-                        == NULL) {
-                    fprintf(stderr, "Getting response failed.\n");
-                    ret = WOLFSSH_USERAUTH_FAILURE;
+        if (promptCount > 0) {
+            keyboardResponses =
+                (byte**)WMALLOC(sizeof(byte*) * promptCount, NULL, 0);
+            if (keyboardResponses == NULL) {
+                ret = WS_MEMORY_E;
+            }
+            else {
+                WMEMSET(keyboardResponses, 0, sizeof(byte*) * promptCount);
+                keyboardResponseLengths =
+                    (word32*)WMALLOC(sizeof(word32) * promptCount, NULL, 0);
+                if (keyboardResponseLengths == NULL) {
+                    ret = WS_MEMORY_E;
                 }
                 else {
-                    char* c = strpbrk((char*)userPassword, "\r\n");
-                    if (c != NULL)
-                        *c = '\0';
+                    WMEMSET(keyboardResponseLengths, 0,
+                            sizeof(word32) * promptCount);
                 }
-                passwordSz = (word32)strlen((const char*)userPassword);
-                ClientSetEcho(1);
-                #ifdef USE_WINDOWS_API
-                    printf("\r\n");
-                #endif
-                WFFLUSH(stdout);
-                authData->sf.keyboard.responses[entry] =
-                    (byte*) WSTRDUP((char*)userPassword, NULL, 0);
-                authData->sf.keyboard.responseLengths[entry] = passwordSz;
-                authData->sf.keyboard.responseCount++;
             }
         }
+
+        authData->sf.keyboard.responses = keyboardResponses;
+        authData->sf.keyboard.responseLengths = keyboardResponseLengths;
+
+        /* ret is a WS_UserAuthResults value here. The allocations above set
+         * WS_MEMORY_E to report OOM distinctly; both spaces put success at 0,
+         * but test the one this function actually returns. */
+        for (entry = 0; ret == WOLFSSH_USERAUTH_SUCCESS && entry < promptCount;
+                entry++) {
+            printf("%s", authData->sf.keyboard.prompts[entry]);
+            if (!authData->sf.keyboard.promptEcho[entry]) {
+                ClientSetEcho(0);
+            }
+            if (WFGETS((char*)userPassword, sizeof(userPassword), stdin)
+                    == NULL) {
+                fprintf(stderr, "Getting response failed.\n");
+                ClientSetEcho(1);
+                ret = WOLFSSH_USERAUTH_FAILURE;
+                break;
+            }
+            else {
+                char* c = strpbrk((char*)userPassword, "\r\n");
+                if (c != NULL)
+                    *c = '\0';
+            }
+            passwordSz = (word32)strlen((const char*)userPassword);
+            ClientSetEcho(1);
+            #ifdef USE_WINDOWS_API
+                printf("\r\n");
+            #endif
+            WFFLUSH(stdout);
+            keyboardResponses[entry] =
+                (byte*) WSTRDUP((char*)userPassword, NULL, 0);
+            if (keyboardResponses[entry] == NULL) {
+                ret = WS_MEMORY_E;
+                break;
+            }
+            keyboardResponseLengths[entry] = passwordSz;
+            keyboardResponseCount = entry + 1;
+            authData->sf.keyboard.responseCount++;
+        }
+    }
+#elif defined(WOLFSSH_KEYBOARD_INTERACTIVE)
+    else if (authType == WOLFSSH_USERAUTH_KEYBOARD) {
+        /* Without a terminal there is nowhere to prompt for the responses, so
+         * this build cannot answer a keyboard-interactive request. */
+        ret = WOLFSSH_USERAUTH_FAILURE;
     }
 #endif
     return ret;
@@ -728,18 +754,31 @@ int ClientSetEcho(int type)
 int ClientUseCert(const char* certName, void* heap)
 {
     int ret = 0;
+#if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+        !defined(WOLFSSH_USER_FILESYSTEM)
+    byte flavor = WOLFSSH_CERT_FLAVOR_UNKNOWN;
+#endif
 
     if (certName != NULL) {
-    #ifdef WOLFSSH_CERTS
-        ret = load_der_file(certName, &userPublicKey, &userPublicKeySz, heap);
-        if (ret == 0) {
-            userPublicKeyType = publicKeyType;
-            userPublicKeyTypeSz = (word32)WSTRLEN((const char*)publicKeyType);
+    #if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+            !defined(WOLFSSH_USER_FILESYSTEM)
+        /* Form comes from the file, algorithm name from the certificate. */
+        ret = wolfSSH_ReadCert_file(certName, &userPublicKey, &userPublicKeySz,
+                &userPublicKeyType, &userPublicKeyTypeSz, &flavor, heap);
+        if (ret == WS_SUCCESS) {
             pubKeyLoaded = 1;
+            userPublicKeyAlloc = 1;
+        }
+        else {
+            /* Out params are cleared on failure; restore the static buf. */
+            userPublicKey = userPublicKeyBuf;
+            userPublicKeySz = 0;
+            userPublicKeyType = NULL;
+            userPublicKeyAlloc = 0;
         }
     #else
         (void)heap;
-        fprintf(stderr, "Certificate support not compiled in");
+        fprintf(stderr, "Certificate file support not compiled in\n");
         ret = WS_NOT_COMPILED;
     #endif
     }
@@ -768,7 +807,10 @@ static int readKeyBlob(const char* filename, WOLFTPM2_KEYBLOB* key)
         rc = BUFFER_E; goto exit;
     }
     if (fp != WBADFILE) {
-        WFSEEK(NULL, fp, 0, WSEEK_END);
+        if (!WFSEEK_SUCCESS(WFSEEK(NULL, fp, 0, WSEEK_END))) {
+            printf("File seek failed\n");
+            rc = BUFFER_E; goto exit;
+        }
         fileSz = WFTELL(NULL, fp);
         WREWIND(NULL, fp);
 
@@ -839,7 +881,7 @@ exit:
 }
 
 static int wolfSSH_TPM_InitKey(WOLFTPM2_DEV* dev, const char* name,
-    WOLFTPM2_KEY* pTpmKey, const char* tpmKeyAuth)
+    WOLFTPM2_KEY* pTpmKey, const char* tpmKeyAuth, void* heap)
 {
     int rc = 0;
     WOLFTPM2_KEY endorse;
@@ -922,11 +964,14 @@ static int wolfSSH_TPM_InitKey(WOLFTPM2_DEV* dev, const char* name,
 
     /* Read public key from buffer and convert key to OpenSSH format */
     if (rc == 0) {
+        /* Allocate from the caller's heap, ClientFreeBuffers() frees it
+         * with the same one. */
         rc = wolfSSH_ReadPublicKey_buffer(userPublicKey, userPublicKeySz,
             WOLFSSH_FORMAT_ASN1, &p, &userPublicKeySz, &userPublicKeyType,
-            &userPublicKeyTypeSz, NULL);
+            &userPublicKeyTypeSz, heap);
         if (rc == 0) {
             userPublicKey = p;
+            userPublicKeyAlloc = 1;
         } else {
             WLOG(WS_LOG_DEBUG, "Reading public key failed, rc: %d", rc);
         }
@@ -978,12 +1023,32 @@ int ClientSetPrivateKey(const char* privKeyName, int userEcc,
     (void)tpmKeyAuth; /* Not used */
 
     if (privKeyName == NULL) {
+    #if defined(WOLFSSH_NO_RSA) && defined(WOLFSSH_NO_ECDSA)
+        (void)userEcc;
+        #ifndef WOLFSSH_NO_ED25519
+        userPrivateKeySz = sizeof(userPrivateKeyBuf);
+        ret = wolfSSH_ReadKey_buffer(hanselPrivateEd25519,
+                hanselPrivateEd25519Sz, WOLFSSH_FORMAT_ASN1,
+                &userPrivateKey, &userPrivateKeySz,
+                &userPrivateKeyType, &userPrivateKeyTypeSz, heap);
+        isPrivate = 1;
+        #else
+        /* No built-in key to load. Leave the client to authenticate
+         * some other way rather than failing here. */
+        userPrivateKeySz = 0;
+        userPrivateKeyType = NULL;
+        (void)heap;
+        #endif
+    #else
         if (userEcc) {
-        #ifndef WOLFSSH_NO_ECC
+        #ifndef WOLFSSH_NO_ECDSA
             userPrivateKeySz = sizeof(userPrivateKeyBuf);
             ret = wolfSSH_ReadKey_buffer(hanselPrivateEcc, hanselPrivateEccSz,
                     WOLFSSH_FORMAT_ASN1, &userPrivateKey, &userPrivateKeySz,
                     &userPrivateKeyType, &userPrivateKeyTypeSz, heap);
+        #else
+            fprintf(stderr, "ECC not compiled in, no default private key\n");
+            ret = WS_NOT_COMPILED;
         #endif
         }
         else {
@@ -992,9 +1057,13 @@ int ClientSetPrivateKey(const char* privKeyName, int userEcc,
             ret = wolfSSH_ReadKey_buffer(hanselPrivateRsa, hanselPrivateRsaSz,
                     WOLFSSH_FORMAT_ASN1, &userPrivateKey, &userPrivateKeySz,
                     &userPrivateKeyType, &userPrivateKeyTypeSz, heap);
+        #else
+            fprintf(stderr, "RSA not compiled in, no default private key\n");
+            ret = WS_NOT_COMPILED;
         #endif
         }
         isPrivate = 1;
+    #endif
     }
     else {
     #if defined(WOLFSSH_TPM)
@@ -1009,8 +1078,9 @@ int ClientSetPrivateKey(const char* privKeyName, int userEcc,
          */
         WMEMSET(&tpmDev, 0, sizeof(tpmDev));
         WMEMSET(&tpmKey, 0, sizeof(tpmKey));
-        ret = wolfSSH_TPM_InitKey(&tpmDev, privKeyName, &tpmKey, tpmKeyAuth);
-    #elif !defined(NO_FILESYSTEM)
+        ret = wolfSSH_TPM_InitKey(&tpmDev, privKeyName, &tpmKey, tpmKeyAuth,
+                heap);
+    #elif !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
         userPrivateKey = NULL; /* create new buffer based on parsed input */
         userPrivateKeyAlloc = 1;
         userPrivateKeySz = sizeof(userPrivateKeyBuf);
@@ -1034,15 +1104,39 @@ int ClientUsePubKey(const char* pubKeyName, int userEcc, void* heap)
     int ret = 0;
 
     if (pubKeyName == NULL) {
+    #if defined(WOLFSSH_NO_RSA) && defined(WOLFSSH_NO_ECDSA)
+        (void)userEcc;
+        #ifndef WOLFSSH_NO_ED25519
+        {
+            byte* p = userPublicKey;
+
+            userPublicKeySz = sizeof(userPublicKeyBuf);
+            ret = wolfSSH_ReadKey_buffer((const byte*)hanselPublicEd25519,
+                    (word32)strlen(hanselPublicEd25519), WOLFSSH_FORMAT_SSH,
+                    &p, &userPublicKeySz,
+                    &userPublicKeyType, &userPublicKeyTypeSz, heap);
+            isPrivate = 1;
+        }
+        #else
+        /* No built-in key to load. Leave the client to authenticate
+         * some other way rather than failing here. */
+        userPublicKeySz = 0;
+        userPublicKeyType = NULL;
+        (void)heap;
+        #endif
+    #else
         byte* p = userPublicKey;
         userPublicKeySz = sizeof(userPublicKeyBuf);
 
         if (userEcc) {
-        #ifndef WOLFSSH_NO_ECC
+        #ifndef WOLFSSH_NO_ECDSA
             ret = wolfSSH_ReadKey_buffer((const byte*)hanselPublicEcc,
                     (word32)strlen(hanselPublicEcc), WOLFSSH_FORMAT_SSH,
                     &p, &userPublicKeySz,
                     &userPublicKeyType, &userPublicKeyTypeSz, heap);
+        #else
+            fprintf(stderr, "ECC not compiled in, no default public key\n");
+            ret = WS_NOT_COMPILED;
         #endif
         }
         else {
@@ -1051,12 +1145,16 @@ int ClientUsePubKey(const char* pubKeyName, int userEcc, void* heap)
                     (word32)strlen(hanselPublicRsa), WOLFSSH_FORMAT_SSH,
                     &p, &userPublicKeySz,
                     &userPublicKeyType, &userPublicKeyTypeSz, heap);
+        #else
+            fprintf(stderr, "RSA not compiled in, no default public key\n");
+            ret = WS_NOT_COMPILED;
         #endif
         }
         isPrivate = 1;
+    #endif
     }
     else {
-    #ifndef NO_FILESYSTEM
+    #if !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
         userPublicKey = NULL; /* create new buffer based on parsed input */
         ret = wolfSSH_ReadKey_file(pubKeyName,
                 &userPublicKey, &userPublicKeySz,
@@ -1065,9 +1163,16 @@ int ClientUsePubKey(const char* pubKeyName, int userEcc, void* heap)
     #else
         printf("file system not compiled in!\n");
         ret = NOT_COMPILED_IN;
-    #endif /* NO_FILESYSTEM */
+    #endif /* !NO_FILESYSTEM && !WOLFSSH_USER_FILESYSTEM */
         if (ret == 0) {
             pubKeyLoaded = 1;
+            userPublicKeyAlloc = 1;
+        }
+        else {
+            userPublicKey = userPublicKeyBuf;
+            userPublicKeySz = 0;
+            userPublicKeyType = NULL;
+            userPublicKeyAlloc = 0;
         }
     }
 
@@ -1080,22 +1185,15 @@ int ClientLoadCA(WOLFSSH_CTX* ctx, const char* caCert)
 
     /* CA certificate to verify host cert with */
     if (caCert) {
-    #ifdef WOLFSSH_CERTS
-        byte* der = NULL;
-        word32 derSz;
-
-        ret = load_der_file(caCert, &der, &derSz, ctx->heap);
-        if (ret == 0) {
-            if (wolfSSH_CTX_AddRootCert_buffer(ctx, der, derSz,
-                WOLFSSH_FORMAT_ASN1) != WS_SUCCESS) {
-                fprintf(stderr, "Couldn't parse in CA certificate.");
-                ret = WS_PARSE_E;
-            }
-            WFREE(der, NULL, 0);
+    #if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+            !defined(WOLFSSH_USER_FILESYSTEM)
+        ret = wolfSSH_CTX_AddRootCert_file(ctx, caCert);
+        if (ret != WS_SUCCESS) {
+            fprintf(stderr, "Couldn't parse in CA certificate.\n");
         }
     #else
         (void)ctx;
-        fprintf(stderr, "Support for certificates not compiled in.");
+        fprintf(stderr, "Support for certificate files not compiled in.\n");
         ret = WS_NOT_COMPILED;
     #endif
     }
@@ -1105,27 +1203,140 @@ int ClientLoadCA(WOLFSSH_CTX* ctx, const char* caCert)
 void ClientFreeBuffers(const char* pubKeyName, const char* privKeyName,
         void* heap)
 {
-#if defined(WOLFSSH_TERM) && defined(WOLFSSH_KEYBOARD_INTERACTIVE)
-    word32 entry;
-#endif
 #ifdef WOLFSSH_TPM
     wolfSSH_TPM_Cleanup(&tpmDev, &tpmKey);
 #endif
-    if (pubKeyName != NULL && userPublicKey != NULL &&
-        userPublicKey != userPublicKeyBuf) {
+    /* The public key buffer is tracked by userPublicKeyAlloc, not by
+     * pubKeyName: ClientUseCert() allocates one without a public key file
+     * name being given. */
+    (void)pubKeyName;
+
+    if (userPublicKeyAlloc && userPublicKey != NULL) {
         WFREE(userPublicKey, heap, DYNTYPE_PRIVKEY);
+        userPublicKey = userPublicKeyBuf;
+        userPublicKeySz = 0;
+        userPublicKeyAlloc = 0;
+        /* The type points at a static name owned by the freed credential's
+         * loader; clear it with the key so nothing reads it stale. */
+        userPublicKeyType = NULL;
+        userPublicKeyTypeSz = 0;
     }
 
-    if (privKeyName != NULL && userPrivateKey != NULL &&
-        userPrivateKeyAlloc) {
-        WFREE(userPrivateKey, heap, DYNTYPE_PRIVKEY);
+    if (privKeyName != NULL && userPrivateKey != NULL) {
+        wc_ForceZero(userPrivateKey, userPrivateKeySz);
+        if (userPrivateKeyAlloc) {
+            WFREE(userPrivateKey, heap, DYNTYPE_PRIVKEY);
+            userPrivateKey = userPrivateKeyBuf;
+            userPrivateKeyAlloc = 0;
+        }
+        userPrivateKeySz = 0;
+        /* The type points at a static name owned by the freed credential's
+         * loader; clear it with the key so nothing reads it stale. */
+        userPrivateKeyType = NULL;
+        userPrivateKeyTypeSz = 0;
     }
 
 #ifdef WOLFSSH_KEYBOARD_INTERACTIVE
-    for (entry = 0; entry < keyboardResponseCount; entry++) {
-        WFREE(keyboardResponses[entry], NULL, 0);
-    }
-    WFREE(keyboardResponses, NULL, 0);
-    WFREE(keyboardResponseLengths, NULL, 0);
+    ClientFreeKeyboardResponses();
 #endif
+    wc_ForceZero(userPrivateKeyBuf, sizeof(userPrivateKeyBuf));
+    userPrivateKeySz = 0;
+    wc_ForceZero(userPassword, sizeof(userPassword));
+    pubKeyLoaded = 0;
 }
+
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+int ClientSetPrivateKeyFromStore(WOLFSSH_CTX* ctx,
+        const wchar_t* storeName, word32 dwFlags, const wchar_t* subjectName)
+{
+    int ret;
+
+    if (ctx == NULL || storeName == NULL || subjectName == NULL) {
+        return WS_BAD_ARGUMENT;
+    }
+
+    ret = wolfSSH_CTX_UsePrivateKey_fromStore(ctx, storeName, dwFlags,
+            subjectName);
+    if (ret != WS_SUCCESS) {
+        fprintf(stderr,
+                "Error loading private key from certificate store: %d\n", ret);
+    }
+
+    return ret;
+}
+
+
+/* After loading a cert store key, populate the global auth callback variables
+ * (userPublicKeyType, userPublicKey, etc.) so that ClientUserAuth can present
+ * the certificate for public key authentication.
+ * For x509 cert auth the "public key" is the DER certificate, and the type
+ * is the x509v3 name that matches the key algorithm. */
+int ClientSetupCertStoreAuth(WOLFSSH_CTX* ctx, void* heap)
+{
+    const char* keyType = NULL;
+    const byte* cert = NULL;
+    word32 certSz = 0;
+    byte* certCopy = NULL;
+
+    if (ctx == NULL)
+        return WS_BAD_ARGUMENT;
+
+    /* wolfSSH_CTX_UsePrivateKey_fromStore() registers a store key under its
+     * plain key type and, when the build has one, under the matching x509v3
+     * type. Only the x509v3 slot can be offered for certificate user auth;
+     * the accessor reports that slot's certificate and algorithm name. */
+    if (wolfSSH_CTX_GetCertStoreCert(ctx, &cert, &certSz, &keyType)
+            != WS_SUCCESS || cert == NULL || certSz == 0) {
+        fprintf(stderr, "No cert store key with an x509v3 algorithm found in "
+                "CTX. In the default build RSA cert store keys carry no "
+                "x509v3 slot because x509v3-ssh-rsa signs with SHA-1, which "
+                "is soft disabled; define WOLFSSH_NO_SHA1_SOFT_DISABLE (and "
+                "keep WOLFSSH_NO_SSH_RSA_SHA1 undefined) to enable it, see "
+                "ide/winvs/user_settings.h.\n");
+        return WS_BAD_ARGUMENT;
+    }
+
+    /* Copy the DER certificate before touching the globals so a failure
+     * leaves them alone. ClientFreeBuffers() frees the copy. */
+    certCopy = (byte*)WMALLOC(certSz, heap, DYNTYPE_PRIVKEY);
+    if (certCopy == NULL) {
+        return WS_MEMORY_E;
+    }
+    WMEMCPY(certCopy, cert, certSz);
+
+    /* Drop anything an earlier file based load left behind, the cert
+     * store key replaces it. Freed with the same heap the loaders in this
+     * file allocate with. */
+    if (userPublicKeyAlloc && userPublicKey != NULL) {
+        WFREE(userPublicKey, heap, DYNTYPE_PRIVKEY);
+        userPublicKey = userPublicKeyBuf;
+        userPublicKeyAlloc = 0;
+    }
+    if (userPrivateKeyAlloc && userPrivateKey != NULL) {
+        wc_ForceZero(userPrivateKey, userPrivateKeySz);
+        WFREE(userPrivateKey, heap, DYNTYPE_PRIVKEY);
+    }
+
+    userPublicKey = certCopy;
+    userPublicKeySz = certSz;
+    userPublicKeyAlloc = 1;
+    userPublicKeyType = (const byte*)keyType;
+    userPublicKeyTypeSz = (word32)WSTRLEN(keyType);
+
+    /* No in-memory private key, signing goes through the cert store. Clear
+     * the alloc flag unconditionally alongside the pointer: a failed
+     * ClientSetPrivateKey() can leave the flag set with a NULL pointer, and
+     * the flag must never be set while the pointer targets the static
+     * buffer (ClientFreeBuffers would WFREE it). */
+    userPrivateKey = userPrivateKeyBuf;
+    userPrivateKeySz = 0;
+    userPrivateKeyAlloc = 0;
+    /* Clear the type a superseded ClientSetPrivateKey() left behind so it
+     * cannot be read against the now-absent in-memory key. */
+    userPrivateKeyType = NULL;
+    userPrivateKeyTypeSz = 0;
+
+    pubKeyLoaded = 1;
+    return WS_SUCCESS;
+}
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */

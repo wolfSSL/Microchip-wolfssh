@@ -44,8 +44,11 @@
 #include <wolfssl/wolfcrypt/wc_port.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/coding.h>
+#include <wolfssl/wolfcrypt/asn_public.h>
 
-#ifdef WOLFSSL_FPKI
+#if defined(WOLFSSH_CERTS) && (defined(WOLFSSL_FPKI) || defined(_WIN32))
+/* Used to bind a client certificate to the requested user name: by UPN
+ * with FPKI, by subject CN on Windows builds without FPKI. */
 #include <wolfssl/wolfcrypt/asn.h>
 #endif
 
@@ -60,14 +63,68 @@
 
 #ifndef _WIN32
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <pwd.h>
 #include <grp.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <limits.h>
+#include <stdlib.h>
+#ifdef WOLFSSH_OSSH_CERTS
+#include <netinet/in.h> /* in6_addr, AF_INET6 */
+#include <arpa/inet.h>  /* inet_pton for source-address matching */
+#endif
+#ifndef O_NOFOLLOW
+    /* Older platforms lack O_NOFOLLOW; the lstat() pre-check and the post-open
+     * st_dev/st_ino comparison still reject a symlinked leaf there. */
+    #define O_NOFOLLOW 0
+#endif
+#ifndef PATH_MAX
+    #define PATH_MAX 4096
+#endif
 #endif
 
 #if !defined(_WIN32) && !(defined(__OSX__) || defined(__APPLE__))
 #include <shadow.h>
 #define HAVE_SHADOW
+
+#if defined(_AIX) || defined(__TOS_AIX__)
+    #define WSSHD_SHADOW_FILE "/etc/security/passwd"
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    #define WSSHD_SHADOW_FILE "/etc/master.passwd"
+#else
+    #define WSSHD_SHADOW_FILE "/etc/shadow"
+#endif
+
+#endif
+
+#if defined(WOLFSSHD_UNIT_TEST) && !defined(_WIN32)
+/* Adapts the platform setgroups(2) to a fixed prototype so unit tests can
+ * swap in a stub regardless of the size argument's native type (int on
+ * macOS, size_t on Linux). */
+static int wsshd_setgroups_default(int size, const WGID_T* list)
+{
+    return setgroups(size, list);
+}
+int (*wsshd_setregid_cb)(WGID_T, WGID_T) = setregid;
+int (*wsshd_setreuid_cb)(WUID_T, WUID_T) = setreuid;
+int (*wsshd_setegid_cb)(WGID_T) = setegid;
+int (*wsshd_seteuid_cb)(WUID_T) = seteuid;
+struct passwd* (*wsshd_getpwnam_cb)(const char*) = getpwnam;
+#define getpwnam wsshd_getpwnam_cb
+int (*wsshd_setgroups_cb)(int, const WGID_T*) = wsshd_setgroups_default;
+#ifdef HAVE_SHADOW
+struct spwd* (*wsshd_getspnam_cb)(const char*) = getspnam;
+#define getspnam wsshd_getspnam_cb
+#endif
+#endif
+
+#ifdef WOLFSSH_OSSH_CERTS
+/* Peer IP string buffer; sized above INET6_ADDRSTRLEN (46) with room to spare. */
+#define WOLFSSHD_PEER_IP_SZ 64
+/* One source-address CIDR entry ("addr/len"); an IPv6 entry is well under this. */
+#define WOLFSSHD_CIDR_ENTRY_SZ 80
 #endif
 
 struct WOLFSSHD_AUTH {
@@ -77,6 +134,7 @@ struct WOLFSSHD_AUTH {
     const WOLFSSHD_CONFIG* conf;
 #if defined(_WIN32)
     HANDLE token; /* a users token */
+    HANDLE profile; /* hive */
 #endif
     int gid;
     int uid;
@@ -84,6 +142,12 @@ struct WOLFSSHD_AUTH {
     int sUid; /* saved uid */
     int attempts;
     void* heap;
+#ifdef WOLFSSH_OSSH_CERTS
+    /* Per-connection cert state, written only on the forked Unix path (the
+     * writes are compiled out on Windows); see HandleConnection. */
+    char peerIp[WOLFSSHD_PEER_IP_SZ]; /* connection peer IP, for source-address */
+    char* certForcedCmd;  /* force-command from an authenticated OpenSSH cert */
+#endif
 };
 
 #ifndef WOLFSSHD_MAX_PASSWORD_ATTEMPTS
@@ -91,10 +155,51 @@ struct WOLFSSHD_AUTH {
 #endif
 
 #ifndef MAX_LINE_SZ
-    #define MAX_LINE_SZ 900
+    /* Max authorized_keys entry size. */
+    #ifndef WOLFSSH_NO_MLDSA
+        #ifndef WOLFSSH_NO_MLDSA87
+            #if defined(WOLFSSH_CERTS)
+                /* Max size for ML-DSA-87 certs plus headroom. */
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_87_PUB_KEY_SIZE + WC_MLDSA_87_SIG_SIZE + \
+                      COMPOSITE_MAX_TRAD_PUB_SZ + 1024 + 2) / 3 * 4 + 640)
+            #else
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_87_PUB_KEY_SIZE + COMPOSITE_MAX_TRAD_PUB_SZ + \
+                      2) / 3 * 4 + 640)
+            #endif
+        #elif !defined(WOLFSSH_NO_MLDSA65)
+            #if defined(WOLFSSH_CERTS)
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_65_PUB_KEY_SIZE + WC_MLDSA_65_SIG_SIZE + \
+                      COMPOSITE_MAX_TRAD_PUB_SZ + 1024 + 2) / 3 * 4 + 640)
+            #else
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_65_PUB_KEY_SIZE + COMPOSITE_MAX_TRAD_PUB_SZ + \
+                      2) / 3 * 4 + 640)
+            #endif
+        #else
+            #if defined(WOLFSSH_CERTS)
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_44_PUB_KEY_SIZE + WC_MLDSA_44_SIG_SIZE + \
+                      COMPOSITE_MAX_TRAD_PUB_SZ + 1024 + 2) / 3 * 4 + 640)
+            #else
+                #define MAX_LINE_SZ \
+                    ((WC_MLDSA_44_PUB_KEY_SIZE + COMPOSITE_MAX_TRAD_PUB_SZ + \
+                      2) / 3 * 4 + 640)
+            #endif
+        #endif
+    #else
+        #define MAX_LINE_SZ 900
+    #endif
 #endif
-#ifndef MAX_PATH_SZ
-    #define MAX_PATH_SZ 80
+
+#ifdef WOLFSSHD_UNIT_TEST
+/* Expose MAX_LINE_SZ for tests. */
+word32 wolfsshd_test_MaxLineSz(void)
+{
+    return (word32)MAX_LINE_SZ;
+}
 #endif
 
 #if 0
@@ -142,14 +247,34 @@ USER_NODE* AddNewUser(USER_NODE* list, byte type, const byte* username,
 }
 #endif
 
-enum {
-    WSSHD_AUTH_FAILURE =  0,
-    WSSHD_AUTH_SUCCESS =  1
-};
+/* Big-endian uint32 read. ato32() is WOLFSSH_LOCAL, so it is unresolvable
+ * in a NO_INLINE build linked against a shared libwolfssh. */
+static word32 AuthReadU32(const byte* c)
+{
+    return ((word32)c[0] << 24) | ((word32)c[1] << 16) |
+           ((word32)c[2] << 8) | (word32)c[3];
+}
+
+/* Maps signature algorithms to key types (e.g. RSA SHA-2 to ssh-rsa). */
+static const char* AuthKeysTokenKeyType(const char* type)
+{
+    if (WSTRCMP(type, "rsa-sha2-256") == 0 ||
+            WSTRCMP(type, "rsa-sha2-512") == 0) {
+        return "ssh-rsa";
+    }
+
+    return type;
+}
 
 /* TODO: Can use wolfSSH_ReadKey_buffer? */
+/* isCert skips the wire-format type/embedded-type cross-check. */
+#ifdef WOLFSSHD_UNIT_TEST
+int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
+                      word32 keySz, int isCert)
+#else
 static int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
-                             word32 keySz)
+                             word32 keySz, int isCert)
+#endif
 {
     int ret = WSSHD_AUTH_SUCCESS;
     char* type = NULL;
@@ -159,50 +284,23 @@ static int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
     word32 keyCandSz = 0;
     char* last = NULL;
 
-    enum {
-    #ifdef WOLFSSH_CERTS
-        NUM_ALLOWED_TYPES = 9
-    #else
-        NUM_ALLOWED_TYPES = 5
-    #endif
-    };
-    static const char* allowedTypes[NUM_ALLOWED_TYPES] = {
-        "ssh-rsa",
-        "ssh-ed25519",
-        "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp521",
-    #ifdef WOLFSSH_CERTS
-        "x509v3-ssh-rsa",
-        "x509v3-ecdsa-sha2-nistp256",
-        "x509v3-ecdsa-sha2-nistp384",
-        "x509v3-ecdsa-sha2-nistp521",
-    #endif
-    };
-    int typeOk = 0;
-    int i;
-
     if (line == NULL || lineSz == 0 || key == NULL || keySz == 0) {
         ret = WS_BAD_ARGUMENT;
     }
 
     if (ret == WSSHD_AUTH_SUCCESS) {
+        /* Skip truncated or whitespace-only lines. */
         if ((type = WSTRTOK(line, " ", &last)) == NULL) {
-            ret = WS_FATAL_ERROR;
+            ret = WSSHD_AUTH_FAILURE;
         }
         else if ((keyCandBase64 = WSTRTOK(NULL, " ", &last)) == NULL) {
-            ret = WS_FATAL_ERROR;
+            ret = WSSHD_AUTH_FAILURE;
         }
     }
     if (ret == WSSHD_AUTH_SUCCESS) {
-        for (i = 0; i < NUM_ALLOWED_TYPES; ++i) {
-            if (WSTRCMP(type, allowedTypes[i]) == 0) {
-                typeOk = 1;
-                break;
-            }
-        }
-        if (!typeOk) {
-            ret = WS_FATAL_ERROR;
+        /* Cert types are verified via CA path, skip literal comparison. */
+        if (WSTRSTR(type, "-cert-v01@openssh.com") != NULL) {
+            ret = WSSHD_AUTH_FAILURE;
         }
     }
     if (ret == WSSHD_AUTH_SUCCESS) {
@@ -215,8 +313,32 @@ static int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
         else {
             if (Base64_Decode((byte*)keyCandBase64, keyCandBase64Sz, keyCand,
                               &keyCandSz) != 0) {
-                ret = WS_FATAL_ERROR;
+                /* Skip non-base64 tokens (e.g. option-prefixed lines). */
+                ret = WSSHD_AUTH_FAILURE;
             }
+        }
+    }
+    if (ret == WSSHD_AUTH_SUCCESS && !isCert) {
+        /* Skip cross-check for raw DER certificate blobs. */
+        word32 typeStrSz;
+        const char* keyType = AuthKeysTokenKeyType(type);
+        word32 keyTypeSz = (word32)XSTRLEN(keyType);
+
+        if (keyCandSz >= 4) {
+            typeStrSz = AuthReadU32(keyCand);
+            if (typeStrSz != keyTypeSz || typeStrSz > keyCandSz - 4 ||
+                XMEMCMP(keyType, keyCand + 4, keyTypeSz) != 0) {
+                /* Skip: token type doesn't match embedded key blob type. */
+                wolfSSH_Log(WS_LOG_DEBUG, "[SSHD] Skipping key line, type %s "
+                    "does not match the type embedded in this line's key "
+                    "blob", type);
+                ret = WSSHD_AUTH_FAILURE;
+            }
+        }
+        else {
+            wolfSSH_Log(WS_LOG_DEBUG,
+                "[SSHD] Skipping key line, blob too short for a type field");
+            ret = WSSHD_AUTH_FAILURE;
         }
     }
     if (ret == WSSHD_AUTH_SUCCESS) {
@@ -233,6 +355,296 @@ static int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
     }
 
     return ret;
+}
+
+#ifdef HAVE_SHADOW
+/* Shared sizing for the dummy-hash buffers used to equalize crypt() timing
+ * across real and fake password checks. Also used in CheckPasswordUnix to
+ * size the real shadow hash copy buffer, so raising this changes both the
+ * fake-hash template capacity and the real-hash fail-closed threshold. */
+#define WSSHD_FAKE_HASH_SZ 256
+/* Modular crypt bcrypt format: "$2<variant>$<cost>$" prefix is 7 bytes,
+ * followed by a 22-byte base64-like salt, before the 31-byte digest. */
+#define WSSHD_BCRYPT_PREFIX_LEN 7
+#define WSSHD_BCRYPT_SALT_LEN   22
+/* Must be at least WSSHD_BCRYPT_SALT_LEN characters; indexed modulo its own
+ * length below so a mismatch can't read out of bounds. */
+#define WSSHD_DUMMY_SALT_ALPHABET "ABCDEFGHIJKLMNOPQRSTUV"
+
+#define WSSHD_MAX_FAKE_HASHES 8
+/* Oversized vs. real /etc/shadow lines so ordinary entries aren't truncated. */
+#define WSSHD_SHADOW_LINE_SZ 512
+/* Scratch buffer for draining an over-length line's remainder. */
+#define WSSHD_SHADOW_DUMP_SZ 256
+/* No lock needed: wolfsshd forks a fresh process per connection, so each
+ * process's copy is written once by AuthInit() before any auth attempt. */
+static char cachedFakeHashes[WSSHD_MAX_FAKE_HASHES][WSSHD_FAKE_HASH_SZ] = {{0}};
+static int numCachedFakeHashes = 0;
+
+#ifdef WOLFSSHD_UNIT_TEST
+void GetFakeHashFromTemplate(const char* tmpl, char* out, word32 outSz)
+#else
+static void GetFakeHashFromTemplate(const char* tmpl, char* out, word32 outSz)
+#endif
+{
+    word32 i;
+    word32 dollarCount = 0;
+    word32 lastDollarIdx = 0;
+
+    if (tmpl == NULL || out == NULL || outSz < 3) return;
+
+    /* Output will always be considered a "locked" account by prefixing '!' */
+    out[0] = '!';
+
+    /* If it doesn't look like a modular crypt format, leave just "!" so
+     * CheckPasswordHashUnix's storedSz > 1 check is false and it falls
+     * through to the fixed-cost fakeHashSHA512 salt instead of reusing
+     * a bare "*" that fails crypt() immediately and skips that cost. */
+    if (tmpl[0] != '$') {
+        out[1] = '\0';
+        return;
+    }
+
+    if (XSTRNCMP(tmpl, "$2", 2) == 0) {
+        /* bcrypt: copy only prefix+salt, excluding the digest. Legacy
+         * "$2$NN$" has no variant letter, so its prefix is 1 byte shorter
+         * than "$2a$NN$" etc. */
+        word32 prefixLen = (tmpl[2] == '$') ?
+                WSSHD_BCRYPT_PREFIX_LEN - 1 : WSSHD_BCRYPT_PREFIX_LEN;
+        word32 saltEnd = prefixLen + WSSHD_BCRYPT_SALT_LEN;
+        word32 copyLen = (saltEnd < outSz - 1) ? saltEnd : (outSz - 2);
+        word32 tmplLen = (word32)XSTRLEN(tmpl);
+
+        if (copyLen > tmplLen) {
+            copyLen = tmplLen;
+        }
+
+        XMEMCPY(out + 1, tmpl, copyLen);
+        out[1 + copyLen] = '\0';
+        for (i = prefixLen; i < copyLen; i++) {
+            /* Overwrite with a dummy alphanumeric salt */
+            out[i + 1] = WSSHD_DUMMY_SALT_ALPHABET[
+                    (i - prefixLen) % (sizeof(WSSHD_DUMMY_SALT_ALPHABET) - 1)];
+        }
+    }
+    else {
+        word32 prevDollarIdx = 0;
+        /* Others (MD5, SHA-256, SHA-512, yescrypt, etc.): salt ends at the
+         * last '$' before the digest. yescrypt's non-standard encoding may
+         * yield dollarCount < 3, producing '!*', which causes
+         * CheckPasswordHashUnix to fall back to the fixed-cost SHA-512 salt. */
+        for (i = 0; tmpl[i] != '\0'; i++) {
+            if (tmpl[i] == '$') {
+                dollarCount++;
+                prevDollarIdx = lastDollarIdx;
+                lastDollarIdx = i;
+            }
+        }
+
+        /* e.g., $6$rounds=5000$salt$hash -> prevDollarIdx is before 'salt' */
+        if (dollarCount >= 3 && prevDollarIdx + 2 < outSz) {
+            XMEMCPY(out + 1, tmpl, prevDollarIdx + 1);
+            out[prevDollarIdx + 2] = '\0';
+            XSTRNCAT(out, "wolfSSHFakeSalt$", outSz - XSTRLEN(out) - 1);
+        }
+        else {
+            XSTRNCPY(out + 1, "*", outSz - 1);
+        }
+    }
+}
+
+/* Parses a "user:hash:..." shadow line and adds its fake-hash template to
+ * cachedFakeHashes, deduplicated and capped at WSSHD_MAX_FAKE_HASHES.
+ * Mutates 'line' in place. Exposed unconditionally so unit tests can drive
+ * it with synthetic lines. */
+#ifdef WOLFSSHD_UNIT_TEST
+void AddShadowLineToFakeHashCache(char* line)
+#else
+static void AddShadowLineToFakeHashCache(char* line)
+#endif
+{
+    char tmpl[WSSHD_FAKE_HASH_SZ];
+    char* colon1;
+    char* colon2;
+    int duplicate;
+    int i;
+
+    if (numCachedFakeHashes >= WSSHD_MAX_FAKE_HASHES) {
+        return;
+    }
+
+    colon1 = WSTRCHR(line, ':');
+    if (colon1 != NULL) {
+        colon2 = WSTRCHR(colon1 + 1, ':');
+        if (colon2 != NULL) {
+            *colon2 = '\0';
+            GetFakeHashFromTemplate(colon1 + 1, tmpl, sizeof(tmpl));
+
+            if (tmpl[0] != '\0' && tmpl[1] != '\0' && tmpl[1] != '*') {
+                duplicate = 0;
+                for (i = 0; i < numCachedFakeHashes; i++) {
+                    if (XSTRNCMP(cachedFakeHashes[i], tmpl, sizeof(tmpl)) == 0) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    XSTRNCPY(cachedFakeHashes[numCachedFakeHashes], tmpl,
+                        sizeof(cachedFakeHashes[0]));
+                    cachedFakeHashes[numCachedFakeHashes][
+                        sizeof(cachedFakeHashes[0]) - 1] = '\0';
+                    numCachedFakeHashes++;
+                }
+            }
+        }
+    }
+}
+
+/* Reads an already-open shadow file line by line into the fake-hash cache.
+ * Exposed unconditionally so unit tests can drive it with a synthetic
+ * stream instead of a real /etc/shadow. */
+#ifdef WOLFSSHD_UNIT_TEST
+void ScanShadowFile(WFILE* f)
+#else
+static void ScanShadowFile(WFILE* f)
+#endif
+{
+    char line[WSSHD_SHADOW_LINE_SZ];
+
+    while (WFGETS(line, sizeof(line), f) != NULL &&
+            numCachedFakeHashes < WSSHD_MAX_FAKE_HASHES) {
+        /* If the line was truncated (no newline found), consume the remainder */
+        if (WSTRCHR(line, '\n') == NULL) {
+            char dump[WSSHD_SHADOW_DUMP_SZ];
+            while (WFGETS(dump, sizeof(dump), f) != NULL) {
+                if (WSTRCHR(dump, '\n') != NULL) break;
+            }
+            WS_FORCEZERO(dump, sizeof(dump));
+        }
+
+        AddShadowLineToFakeHashCache(line);
+        WS_FORCEZERO(line, sizeof(line));
+    }
+}
+
+#ifndef WOLFSSH_USE_PAM
+/* Shadow aging fields count days since the epoch. */
+#define WSSHD_SECS_PER_DAY (24L * 60L * 60L)
+
+/* Return 1 when the shadow aging fields make the account unusable for login.
+ * A negative today means the system clock is unavailable, which denies only
+ * the accounts that actually have aging configured. */
+#ifdef WOLFSSHD_UNIT_TEST
+int IsShadowExpired(const struct spwd* sp, long today)
+#else
+static int IsShadowExpired(const struct spwd* sp, long today)
+#endif
+{
+    int expired = 0;
+
+    if (sp != NULL) {
+        /* Account expiration date, effective on the date itself. */
+        if (sp->sp_expire >= 0 &&
+                (today < 0 || today >= (long)sp->sp_expire)) {
+            expired = 1;
+        }
+        /* Password change forced at next login. */
+        if (expired == 0 && sp->sp_lstchg == 0) {
+            expired = 1;
+        }
+        /* Password aged out. Subtraction avoids overflowing the sum. */
+        if (expired == 0 && sp->sp_lstchg > 0 && sp->sp_max >= 0 &&
+                (today < 0 || today - (long)sp->sp_lstchg >=
+                    (long)sp->sp_max)) {
+            expired = 1;
+        }
+    }
+
+    return expired;
+}
+#endif /* !WOLFSSH_USE_PAM */
+
+#ifdef WOLFSSHD_UNIT_TEST
+/* Test-only hook to seed cachedFakeHash without a real shadow file entry. */
+void wolfSSHD_SetCachedFakeHashForTest(const char* tmpl)
+{
+    if (tmpl == NULL) {
+        cachedFakeHashes[0][0] = '\0';
+        numCachedFakeHashes = 0;
+    }
+    else {
+        XSTRNCPY(cachedFakeHashes[0], tmpl, sizeof(cachedFakeHashes[0]));
+        cachedFakeHashes[0][sizeof(cachedFakeHashes[0]) - 1] = '\0';
+        numCachedFakeHashes = 1;
+    }
+}
+
+/* Test-only accessor so tests can verify wolfSSHD_AuthInit() actually
+ * populated cachedFakeHash from a real shadow entry. */
+void wolfSSHD_GetCachedFakeHashForTest(char* out, word32 outSz)
+{
+    if (out == NULL || outSz == 0) return;
+    if (numCachedFakeHashes > 0) {
+        XSTRNCPY(out, cachedFakeHashes[0], outSz);
+        out[outSz - 1] = '\0';
+    }
+    else {
+        out[0] = '\0';
+    }
+}
+
+/* Test-only accessor for the number of cached fake hashes, so tests can
+ * verify AddShadowLineToFakeHashCache()'s dedup and cap behavior. */
+int wolfSSHD_GetCachedFakeHashCountForTest(void)
+{
+    return numCachedFakeHashes;
+}
+#endif /* WOLFSSHD_UNIT_TEST */
+#endif /* HAVE_SHADOW */
+
+void wolfSSHD_AuthInit(void)
+{
+#ifdef HAVE_SHADOW
+    char tmpl[WSSHD_FAKE_HASH_SZ];
+    struct spwd* rootShadow;
+
+#ifndef WOLFSSHD_UNIT_TEST
+    WFILE* f = NULL;
+#endif
+
+#ifndef WOLFSSHD_UNIT_TEST
+    /* /etc/shadow is commonly root:shadow 0640; don't reject group-readable. */
+    if (wolfSSHD_OpenSecureFile(WSSHD_SHADOW_FILE, 0 /* ownerUid: root */,
+            0 /* rejectReadable */, 0 /* relaxPerms */, NULL, &f)
+            == WS_SUCCESS && f != NULL) {
+        ScanShadowFile(f);
+        WFCLOSE(NULL, f);
+    }
+#endif
+
+    if (numCachedFakeHashes == 0) {
+        rootShadow = getspnam("root");
+        if (rootShadow != NULL && rootShadow->sp_pwdp != NULL) {
+            GetFakeHashFromTemplate(rootShadow->sp_pwdp, tmpl, sizeof(tmpl));
+            if (tmpl[0] != '\0' && tmpl[1] != '\0' && tmpl[1] != '*') {
+                XSTRNCPY(cachedFakeHashes[0], tmpl, sizeof(cachedFakeHashes[0]));
+                cachedFakeHashes[0][sizeof(cachedFakeHashes[0]) - 1] = '\0';
+                numCachedFakeHashes = 1;
+            }
+        }
+    }
+
+    if (numCachedFakeHashes == 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Error getting root password info");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Possibly permissions level error?"
+            " i.e SSHD not ran as sudo");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Timing side-channel mitigation degraded: using a"
+            " fixed-cost fake hash instead of matching real crypt() cost");
+    }
+#endif
 }
 
 #ifndef _WIN32
@@ -303,17 +715,35 @@ static int ExtractSalt(char* hash, char** salt, int saltSz)
 #endif
 
 #if defined(WOLFSSH_HAVE_LIBCRYPT) || defined(WOLFSSH_HAVE_LIBLOGIN)
-static int CheckPasswordHashUnix(const char* input, char* stored)
+#ifdef WOLFSSHD_UNIT_TEST
+int CheckPasswordHashUnix(const char* input, const char* stored)
+#else
+static int CheckPasswordHashUnix(const char* input, const char* stored)
+#endif
 {
+    /* Fake salts for locked/empty accounts so crypt() is always invoked.
+     * fakeHashSHA512 uses rounds=5000 (glibc default); real cost is matched
+     * via the cached hash from wolfSSHD_AuthInit() on the normal path.
+     * These constants are only used in degraded mode (empty cache). */
+    static const char fakeHashSHA512[] =
+        "$6$rounds=5000$wolfSSHdFakeSalt$";
+    static const char fakeHashMD5[] = "$1$wolfSSHd$UkYLseEmSSXHYyxsWDQC80";
+    static const char fakeHashDES[] = "wowolfSSHdUkYLs";
+    /* Fallback salts tried in order when a locked-account salt is rejected
+     * by crypt() (e.g. libc lacks that algorithm). */
+    static const char* const fakeHashFallbacks[] =
+        { fakeHashMD5, fakeHashDES };
     int ret = WSSHD_AUTH_SUCCESS;
-    char* hashedInput;
+    int locked = 0;
+    char* hashedInput = NULL;
     word32 hashedInputSz = 0, storedSz = 0;
 
     if (input == NULL || stored == NULL) {
         ret = WS_BAD_ARGUMENT;
     }
 
-    /* empty password case */
+    /* Fast return for genuine empty passwords. The dummy caller
+     * never passes an empty stored hash, avoiding a timing oracle. */
     if (ret == WSSHD_AUTH_SUCCESS && stored[0] == 0 && WSTRLEN(input) == 0) {
         wolfSSH_Log(WS_LOG_INFO,
                     "[SSHD] User logged in with empty password");
@@ -321,41 +751,91 @@ static int CheckPasswordHashUnix(const char* input, char* stored)
     }
 
     if (ret == WSSHD_AUTH_SUCCESS) {
-        hashedInput = crypt(input, stored);
+        const char* salt = stored;
+
+        storedSz = (word32)WSTRLEN(stored);
+        locked = (storedSz == 0 || stored[0] == '*' || stored[0] == '!');
+
+        if (locked) {
+            /* Try to reuse the salt from the locked hash, but only if it's
+             * a real modular crypt salt; otherwise crypt() fails on it
+             * immediately and skips the cost this mitigation relies on. */
+            if (storedSz > 1 && stored[0] == '!' && stored[1] == '$') {
+                salt = stored + 1;
+            }
+#ifdef HAVE_SHADOW
+            /* Prefer the cached system hash (populated by AuthInit from
+             * shadow file) so the work factor matches the real system. */
+            else if (numCachedFakeHashes > 0 &&
+                     cachedFakeHashes[0][0] == '!' &&
+                     cachedFakeHashes[0][1] == '$') {
+                salt = cachedFakeHashes[0] + 1;
+            }
+#endif
+            else {
+                salt = fakeHashSHA512;
+            }
+        }
+
+        hashedInput = crypt(input, salt);
+        /* glibc signals an unsupported salt with a "*"-prefixed sentinel,
+         * not NULL; check both so the fallback engages on every libc. */
+        if (locked) {
+            word32 fbIdx;
+            for (fbIdx = 0;
+                    fbIdx < sizeof(fakeHashFallbacks) / sizeof(fakeHashFallbacks[0])
+                        && (hashedInput == NULL || hashedInput[0] == '*');
+                    fbIdx++) {
+                salt = fakeHashFallbacks[fbIdx];
+                hashedInput = crypt(input, salt);
+            }
+        }
+
         if (hashedInput == NULL) {
             ret = WS_FATAL_ERROR;
         }
+        else if (locked) {
+            ret = WSSHD_AUTH_FAILURE;
+        }
         else {
             hashedInputSz = (word32)WSTRLEN(hashedInput);
-            storedSz = (word32)WSTRLEN(stored);
 
-            if (storedSz == 0 || stored[0] == '*' ||
-                    hashedInputSz == 0 || hashedInput[0] == '*' ||
+            if (hashedInputSz == 0 || hashedInput[0] == '*' ||
                     hashedInputSz != storedSz ||
                     ConstantCompare((const byte*)hashedInput,
                         (const byte*)stored, storedSz) != 0) {
                 ret = WSSHD_AUTH_FAILURE;
             }
+            WS_FORCEZERO(hashedInput, hashedInputSz);
         }
     }
-
     return ret;
 }
 #endif /* WOLFSSH_HAVE_LIBCRYPT || WOLFSSH_HAVE_LIBLOGIN */
 
+#ifdef WOLFSSHD_UNIT_TEST
+int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFSSHD_AUTH* authCtx)
+#else
 static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFSSHD_AUTH* authCtx)
+#endif
 {
     int ret = WS_SUCCESS;
     char* pwStr = NULL;
     struct passwd* pwInfo;
 #ifdef HAVE_SHADOW
     struct spwd* shadowInfo;
+    time_t now;
+    int expired = 0;
+    /* getspnam() returns a static buffer; copy immediately before it can
+     * be overwritten by any subsequent call. */
+    char hashBuf[WSSHD_FAKE_HASH_SZ];
 #endif
     /* The hash of the user's password stored on the system. */
-    char* storedHash;
+    const char* storedHash = "*";
     char* storedHashCpy = NULL;
 
-    if (usr == NULL || pw == NULL) {
+    /* Allow zero length passwords, but not NULL pointers. */
+    if (usr == NULL || (pw == NULL && pwSz != 0)) {
         ret = WS_BAD_ARGUMENT;
     }
 
@@ -365,7 +845,9 @@ static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFS
             ret = WS_MEMORY_E;
         }
         else {
-            XMEMCPY(pwStr, pw, pwSz);
+            if (pwSz > 0) {
+                XMEMCPY(pwStr, pw, pwSz);
+            }
             pwStr[pwSz] = 0;
         }
     }
@@ -373,37 +855,59 @@ static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFS
     if (ret == WS_SUCCESS) {
         pwInfo = getpwnam((const char*)usr);
         if (pwInfo == NULL) {
-            /* user name not found on system */
-            ret = WS_FATAL_ERROR;
-            wolfSSH_Log(WS_LOG_ERROR,
+            /* User not found: use dummy hash to equalize timing. */
+            wolfSSH_Log(WS_LOG_INFO,
                     "[SSHD] User name not found on system");
         }
-    }
-
-    if (ret == WS_SUCCESS) {
-    #ifdef HAVE_SHADOW
-        if (pwInfo->pw_passwd[0] == 'x') {
-        #ifdef WOLFSSH_HAVE_LIBCRYPT
-            shadowInfo = getspnam((const char*)usr);
-        #else
-            shadowInfo = getspnam((char*)usr);
-        #endif
-            if (shadowInfo == NULL) {
-                wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] Error getting user password info");
-                wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] Possibly permissions level error?"
-                    " i.e SSHD not ran as sudo");
-                ret = WS_FATAL_ERROR;
+        else {
+#ifdef HAVE_SHADOW
+            if (pwInfo->pw_passwd[0] == 'x') {
+#ifdef WOLFSSH_HAVE_LIBCRYPT
+                shadowInfo = getspnam((const char*)usr);
+#else
+                shadowInfo = getspnam((char*)usr);
+#endif
+                if (shadowInfo == NULL) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error getting user password info");
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Possibly permissions level error?"
+                        " i.e SSHD not ran as sudo");
+                    /* Fail closed: RequestAuthentication's error-branch
+                     * DoFakePasswordCheck() still equalizes timing for this
+                     * case, same as it does for the oversized-hash case. */
+                    ret = WS_FATAL_ERROR;
+                }
+                else if (shadowInfo->sp_pwdp == NULL) {
+                    /* Fail closed: some NSS backends (e.g. NIS/LDAP) can
+                     * return a spwd entry with a NULL sp_pwdp. */
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Shadow entry missing password hash");
+                    ret = WS_FATAL_ERROR;
+                }
+                else if (WSTRLEN(shadowInfo->sp_pwdp) >= WSSHD_FAKE_HASH_SZ) {
+                    /* Fail closed instead of silently truncating the hash. */
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Stored password hash too long for buffer");
+                    ret = WS_FATAL_ERROR;
+                }
+                else {
+                    /* Copy before any subsequent getspnam() call
+                     * overwrites the static buffer. */
+                    XSTRNCPY(hashBuf, shadowInfo->sp_pwdp, sizeof(hashBuf));
+                    hashBuf[sizeof(hashBuf) - 1] = '\0';
+                    storedHash = hashBuf;
+                    now = WTIME(NULL);
+                    expired = IsShadowExpired(shadowInfo,
+                        (now == (time_t)-1) ? -1 :
+                            (long)(now / WSSHD_SECS_PER_DAY));
+                }
             }
-            else {
-                storedHash = shadowInfo->sp_pwdp;
+            else
+#endif
+            {
+                storedHash = pwInfo->pw_passwd;
             }
-        }
-        else
-    #endif
-        {
-            storedHash = pwInfo->pw_passwd;
         }
     }
     if (ret == WS_SUCCESS) {
@@ -417,6 +921,8 @@ static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFS
 
     if (ret == WS_SUCCESS) {
     #if defined(WOLFSSH_HAVE_LIBCRYPT) || defined(WOLFSSH_HAVE_LIBLOGIN)
+        /* Nonexistent users use "*" hash, so CheckPasswordHashUnix fails.
+         * DoCheckUser() filters them earlier; this is defense-in-depth. */
         ret = CheckPasswordHashUnix(pwStr, storedHashCpy);
     #else
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] No compiled in password check");
@@ -424,13 +930,27 @@ static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFS
     #endif
     }
 
+#ifdef HAVE_SHADOW
+    /* Deny after the hash compare so an expired account costs the same as a
+     * live one. */
+    if (expired && ret == WSSHD_AUTH_SUCCESS) {
+        wolfSSH_Log(WS_LOG_INFO,
+                "[SSHD] Password or account expired for user %s", usr);
+        ret = WSSHD_AUTH_FAILURE;
+    }
+#endif
+
     if (pwStr != NULL) {
-        ForceZero(pwStr, pwSz + 1);
+        WS_FORCEZERO(pwStr, pwSz + 1);
         WFREE(pwStr, NULL, DYNTYPE_STRING);
     }
     if (storedHashCpy != NULL) {
+        WS_FORCEZERO(storedHashCpy, (word32)WSTRLEN(storedHashCpy) + 1);
         WFREE(storedHashCpy, NULL, DYNTYPE_STRING);
     }
+#ifdef HAVE_SHADOW
+    WS_FORCEZERO(hashBuf, sizeof(hashBuf));
+#endif
 
     WOLFSSH_UNUSED(authCtx);
     return ret;
@@ -441,20 +961,195 @@ static int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz, WOLFS
 
 
 static const char authKeysDefault[] = ".ssh/authorized_keys";
-static char authKeysPattern[MAX_PATH_SZ] = { 0 };
 
-void SetAuthKeysPattern(const char* pattern)
-{
-    if (pattern != NULL) {
-        WMEMSET(authKeysPattern, 0, sizeof(authKeysPattern));
-        WSTRNCPY(authKeysPattern, pattern, sizeof(authKeysPattern) - 1);
-    }
-}
-
-
-static int ResolveAuthKeysPath(const char* homeDir, char* resolved)
+/* Expand AuthorizedKeysFile tokens (%% literal, %h home dir, %u user name)
+ * from pattern into out. Unrecognized tokens fail closed so a per-user pattern
+ * cannot collapse to one shared path. Returns WS_SUCCESS or a negative error. */
+static int ExpandAuthKeysTokens(const char* pattern, const char* homeDir,
+                                const char* user, char* out, word32 outSz)
 {
     int ret = WS_SUCCESS;
+    word32 outIdx = 0;
+    word32 i = 0;
+    word32 patSz;
+    word32 insSz;
+    const char* ins;
+    char lit[2];
+
+    if (pattern == NULL || out == NULL || outSz == 0) {
+        ret = WS_BAD_ARGUMENT;
+    }
+
+    if (ret == WS_SUCCESS) {
+        patSz = (word32)WSTRLEN(pattern);
+        lit[1] = '\0';
+
+        while (ret == WS_SUCCESS && i < patSz) {
+            ins = NULL;
+
+            if (pattern[i] == '%' && (i + 1) < patSz) {
+                switch (pattern[i + 1]) {
+                    case '%':
+                        lit[0] = '%';
+                        ins = lit;
+                        break;
+                    case 'h':
+                        ins = homeDir;
+                        break;
+                    case 'u':
+                        ins = user;
+                        break;
+                    default:
+                        wolfSSH_Log(WS_LOG_ERROR,
+                            "[SSHD] Unsupported AuthorizedKeysFile token");
+                        ret = WS_FATAL_ERROR;
+                        break;
+                }
+                /* token recognized but its value is unavailable */
+                if (ret == WS_SUCCESS && ins == NULL) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] No value for AuthorizedKeysFile token");
+                    ret = WS_FATAL_ERROR;
+                }
+                i += 2;
+            }
+            else {
+                /* literal character (including a trailing lone '%') */
+                lit[0] = pattern[i];
+                ins = lit;
+                i += 1;
+            }
+
+            if (ret == WS_SUCCESS) {
+                insSz = (word32)WSTRLEN(ins);
+                /* leave room for the terminating null */
+                if (outIdx + insSz >= outSz) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Path for key file larger than max allowed");
+                    ret = WS_FATAL_ERROR;
+                }
+                else {
+                    WMEMCPY(out + outIdx, ins, insSz);
+                    outIdx += insSz;
+                }
+            }
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        out[outIdx] = '\0';
+    }
+
+    return ret;
+}
+
+/* True for a fully qualified path. POSIX roots only at '/'; Windows also roots
+ * at a '\' or a drive letter followed by a separator ("X:\"). A bare "X:" is
+ * drive-relative, not absolute, so it is left to resolve under the home dir. */
+static int IsAbsoluteAuthKeysPath(const char* path)
+{
+    int ret = 0;
+
+    if (path != NULL) {
+        if (path[0] == '/') {
+            ret = 1;
+        }
+#ifdef _WIN32
+        else if (path[0] == '\\') {
+            ret = 1;
+        }
+        else if (((path[0] >= 'A' && path[0] <= 'Z') ||
+                  (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' &&
+                 (path[2] == '\\' || path[2] == '/')) {
+            ret = 1;
+        }
+#endif
+    }
+
+    return ret;
+}
+
+#if defined(WOLFSSH_CERTS) || defined(WOLFSSHD_UNIT_TEST)
+/* True when the AuthorizedKeysFile pattern resolves to a different file for
+ * every account, which is what makes an entry in it an implicit
+ * user-to-credential binding. A relative pattern resolves under the account's
+ * home directory, and an absolute one qualifies only when it carries a %u or
+ * %h token. An absolute pattern with neither (e.g.
+ * "/etc/ssh/authorized_keys_all") is one shared file for every account and
+ * binds a credential to nothing. Caveat: accounts that share a home directory
+ * (or Windows profile path) also share the file a relative pattern resolves
+ * to, so the per-user property holds only when home directories are
+ * distinct. */
+static int IsPerUserAuthKeysPattern(const char* pattern)
+{
+    word32 i;
+    word32 patSz;
+    word32 seg;
+
+    if (pattern == NULL || *pattern == '\0') {
+        /* the built-in ~/.ssh/authorized_keys default */
+        return 1;
+    }
+
+    /* a ".." component can escape the home directory and collapse to one
+     * shared file for every account, so it is never per-user */
+    patSz = (word32)WSTRLEN(pattern);
+    seg = 0;
+    for (i = 0; i <= patSz; i++) {
+        if (i == patSz || pattern[i] == '/' || pattern[i] == '\\') {
+            if (i - seg == 2 && pattern[seg] == '.' &&
+                    pattern[seg + 1] == '.') {
+                return 0;
+            }
+            seg = i + 1;
+        }
+    }
+
+    if (!IsAbsoluteAuthKeysPath(pattern)) {
+        return 1;
+    }
+
+    for (i = 0; (i + 1) < patSz; i++) {
+        if (pattern[i] != '%') {
+            continue;
+        }
+        if (pattern[i + 1] == 'u' || pattern[i + 1] == 'h') {
+            return 1;
+        }
+        /* "%%" is a literal percent, step over both characters */
+        if (pattern[i + 1] == '%') {
+            i++;
+        }
+    }
+
+    return 0;
+}
+#endif /* WOLFSSH_CERTS || WOLFSSHD_UNIT_TEST */
+
+/* Exported predicate answering "does this AuthorizedKeysFile pattern resolve
+ * to a distinct file per account". Compiled for every certificate-capable
+ * build so config-time gates (e.g. the FPKI wolfSSH_TrustedSystemCAKeys
+ * check in SetupCTX) can rely on it; without certificate support it always
+ * returns 0. */
+int wolfSSHD_AuthKeysPatternIsPerUser(const char* pattern)
+{
+#if defined(WOLFSSH_CERTS) || defined(WOLFSSHD_UNIT_TEST)
+    return IsPerUserAuthKeysPattern(pattern);
+#else
+    (void)pattern;
+    return 0;
+#endif
+}
+
+/* Resolve the authorized keys file path for a user. The pattern is passed in
+ * explicitly so concurrent authentications cannot race on it, and its tokens
+ * are expanded so each user resolves to a distinct path. */
+WOLFSSHD_STATIC int ResolveAuthKeysPath(const char* homeDir,
+                               const char* pattern, const char* user,
+                               char* resolved)
+{
+    int ret = WS_SUCCESS;
+    char expanded[MAX_PATH_SZ];
     char* idx;
     int homeDirSz;
     const char* suffix = authKeysDefault;
@@ -464,14 +1159,20 @@ static int ResolveAuthKeysPath(const char* homeDir, char* resolved)
     }
 
     if (ret == WS_SUCCESS) {
-        if (*authKeysPattern != 0) {
-            /* TODO: token substitutions (e.g. %h) */
-            if (*authKeysPattern == '/') {
-                WSTRNCPY(resolved, authKeysPattern, MAX_PATH_SZ);
-                return WS_SUCCESS;
+        if (pattern != NULL && *pattern != 0) {
+            ret = ExpandAuthKeysTokens(pattern, homeDir, user, expanded,
+                                       (word32)sizeof(expanded));
+            if (ret != WS_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Failed to expand AuthorizedKeysFile pattern");
+            }
+            /* expanded is NUL-terminated and shorter than MAX_PATH_SZ */
+            else if (IsAbsoluteAuthKeysPath(expanded)) {
+                WMEMCPY(resolved, expanded, WSTRLEN(expanded) + 1);
+                return ret;
             }
             else {
-                suffix = authKeysPattern;
+                suffix = expanded;
             }
         }
     }
@@ -489,39 +1190,271 @@ static int ResolveAuthKeysPath(const char* homeDir, char* resolved)
             XMEMCPY(idx, homeDir, homeDirSz);
             idx += homeDirSz;
             *(idx++) = '/';
-            /* Intentionally copying the null term from suffix. */
-            XMEMCPY(idx, suffix, WSTRLEN(suffix));
+            /* the bound check above leaves room for suffix and its null term */
+            XMEMCPY(idx, suffix, WSTRLEN(suffix) + 1);
         }
     }
 
     return ret;
 }
 
-static int SearchForPubKey(const char* path, const WS_UserAuthData_PublicKey* pubKeyCtx)
+/* Securely open a trusted file, failing closed on a symlink, bad ownership, or
+ * unsafe permissions, and hand back an open stream ready for reading. This is
+ * the single gate for every security-critical file wolfsshd loads: a user's
+ * authorized_keys, the host private key, the host certificate, and the user
+ * certificate-authority keys.
+ *
+ *   path           - file to open.
+ *   ownerUid       - the file itself must be owned by this user id or by root
+ *                    (0). authorized_keys uses the owning user's id; the
+ *                    daemon's trust anchors use the effective user id. Parent
+ *                    directories are checked for writability but not ownership,
+ *                    so a file may legitimately live under a directory owned by
+ *                    a third party (e.g. a key under a build checkout or a
+ *                    service account's tree).
+ *   rejectReadable - when set, also refuse a file that is group or world
+ *                    readable. Used for secrets such as the host private key.
+ *   relaxPerms     - skip the ownership, mode and directory checks, ignoring
+ *                    ownerUid and rejectReadable. A symlinked leaf, non-regular
+ *                    file or swap during the open is still refused, but a
+ *                    writable ancestor can substitute the file. Host key only,
+ *                    see WOLFSSHD_HOSTKEY_RELAX_PERMS in wolfsshd.c.
+ *   heap           - heap hint for the temporary path buffer.
+ *   out            - set to the open stream on success, WBADFILE otherwise.
+ *
+ * Returns WS_SUCCESS and sets *out on success; a specific reason is logged on
+ * failure. On platforms without POSIX ownership semantics (_WIN32) the checks
+ * are skipped and the file is opened directly, relying on filesystem ACLs. */
+int wolfSSHD_OpenSecureFile(const char* path, WUID_T ownerUid,
+        int rejectReadable, int relaxPerms, void* heap, WFILE** out)
+{
+#ifndef _WIN32
+    int ret = WS_SUCCESS;
+    int fd = -1;
+    int flags;
+    struct stat lst;
+    struct stat st;
+    WFILE* f;
+    char* resolved = NULL;
+    char* slash;
+    word32 i;
+
+    if (path == NULL || out == NULL) {
+        return WS_BAD_ARGUMENT;
+    }
+    *out = WBADFILE;
+
+    /* The leaf must be a real, regular file. lstat() (not stat()) is used so a
+     * symlinked leaf is rejected outright rather than silently followed to an
+     * attacker-chosen target. */
+    if (lstat(path, &lst) != 0 || !S_ISREG(lst.st_mode)) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Refusing to load (missing, not a regular file, or a "
+            "symlink): %s", path);
+        ret = WS_BAD_FILE_E;
+    }
+
+    /* Canonicalize the path with realpath(), resolving any intermediate
+     * symlinks, then open and validate that canonical path so the file opened
+     * and the parent chain validated below are one and the same. */
+    if (ret == WS_SUCCESS) {
+        resolved = (char*)WMALLOC(PATH_MAX, heap, DYNTYPE_BUFFER);
+        if (resolved == NULL) {
+            ret = WS_MEMORY_E;
+        }
+    }
+    if (ret == WS_SUCCESS) {
+        if (realpath(path, resolved) == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to resolve path %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+    }
+
+    /* Open the canonicalized path (not the original) so the directory chain
+     * validated below is exactly the chain open() traverses. realpath() already
+     * resolved every intermediate symlink; O_NOFOLLOW guards the
+     * already-verified non-symlink leaf, and O_NONBLOCK keeps the open from
+     * stalling on a FIFO swapped in after the lstat() and is cleared before the
+     * buffered reads. The original path is used only in log messages. */
+    if (ret == WS_SUCCESS) {
+        fd = open(resolved, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        if (fd < 0) {
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to open %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+    }
+    if (ret == WS_SUCCESS) {
+        if (fstat(fd, &st) != 0) {
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to stat %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+    }
+    /* The ownership and mode checks run on the opened descriptor so there is no
+     * window to swap the file after the check. Comparing st_dev/st_ino against
+     * the earlier lstat() closes the narrow swap window on platforms where
+     * O_NOFOLLOW is unavailable and compiles to 0. */
+    if (ret == WS_SUCCESS) {
+        if (!S_ISREG(st.st_mode)) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Refusing to load (not a regular file): %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+        else if (!relaxPerms && st.st_uid != ownerUid && st.st_uid != 0) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Refusing to load (not owned by the user or root): %s",
+                path);
+            ret = WS_BAD_FILE_E;
+        }
+        else if (!relaxPerms && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Refusing to load (group or world writable): %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+        else if (!relaxPerms && rejectReadable &&
+                 (st.st_mode & (S_IRGRP | S_IROTH)) != 0) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Refusing to load (group or world readable): %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+        else if (st.st_dev != lst.st_dev || st.st_ino != lst.st_ino) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Refusing to load (file changed during open): %s",
+                path);
+            ret = WS_BAD_FILE_E;
+        }
+    }
+
+    /* Validate every parent directory of the canonicalized path up to the
+     * filesystem root: none may be group or world writable (unless sticky),
+     * which is what would let another user rename the file and swap it. Ancestor
+     * ownership is not enforced; the leaf owner check above is what stops a file
+     * owned by a third party from being loaded. Since realpath() resolved all
+     * intermediate symlinks, this is the same chain open() traversed. The walk
+     * trims components from 'resolved' in place, which is fine now that the file
+     * is already open. Skipped under relaxPerms. */
+    while (ret == WS_SUCCESS && !relaxPerms) {
+        /* trim the last component to move up one directory */
+        slash = NULL;
+        for (i = 0; resolved[i] != '\0'; i++) {
+            if (resolved[i] == '/') {
+                slash = &resolved[i];
+            }
+        }
+        if (slash == NULL) {
+            break; /* no further parent (realpath always returns an absolute
+                    * path, so this is not expected) */
+        }
+        if (slash == resolved) {
+            resolved[1] = '\0'; /* parent is the root directory "/" */
+        }
+        else {
+            *slash = '\0';
+        }
+
+        if (stat(resolved, &st) != 0) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Unable to stat directory %s", resolved);
+            ret = WS_BAD_FILE_E;
+        }
+        else if (!S_ISDIR(st.st_mode)) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] %s is not a directory", resolved);
+            ret = WS_BAD_FILE_E;
+        }
+        else if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0 &&
+                 (st.st_mode & S_ISVTX) == 0) {
+            /* A world/group writable directory is unsafe unless it is sticky:
+             * the sticky bit stops a non-owner from renaming or deleting files
+             * they do not own, which is exactly the substitution this guards
+             * against (e.g. /tmp is mode 1777). */
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Directory %s is group or world writable", resolved);
+            ret = WS_BAD_FILE_E;
+        }
+
+        if (ret != WS_SUCCESS || WSTRCMP(resolved, "/") == 0) {
+            break; /* reached the filesystem root */
+        }
+    }
+
+    /* The target is a regular file, so restore blocking semantics for the
+     * buffered reads the caller will perform. */
+    if (ret == WS_SUCCESS) {
+        flags = fcntl(fd, F_GETFL);
+        if (flags != -1) {
+            (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+        f = fdopen(fd, "rb");
+        if (f == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Unable to open stream for %s", path);
+            ret = WS_BAD_FILE_E;
+        }
+        else {
+            fd = -1; /* ownership of the descriptor moved to the stream */
+            *out = f;
+        }
+    }
+
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (resolved != NULL) {
+        WFREE(resolved, heap, DYNTYPE_BUFFER);
+    }
+
+    return ret;
+#else
+    WOLFSSH_UNUSED(ownerUid);
+    WOLFSSH_UNUSED(rejectReadable);
+    WOLFSSH_UNUSED(relaxPerms);
+    WOLFSSH_UNUSED(heap);
+
+    if (path == NULL || out == NULL) {
+        return WS_BAD_ARGUMENT;
+    }
+    *out = WBADFILE;
+    if (WFOPEN(NULL, out, path, "rb") != 0) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to open %s", path);
+        return WS_BAD_FILE_E;
+    }
+    return WS_SUCCESS;
+#endif
+}
+
+/* Scan keys file. Fails closed on no match.
+ * strictModes requires uid ownership. isCert flags DER vs wire-format. */
+static int SearchKeysFile(const char* keysFilePath, const byte* key,
+                          word32 keySz, WUID_T uid, int strictModes,
+                          int isCert)
 {
     int ret = WSSHD_AUTH_SUCCESS;
-    char authKeysPath[MAX_PATH_SZ];
-    WFILE *f = XBADFILE;
+    WFILE *f = WBADFILE;
     char* lineBuf = NULL;
     char* current;
     word32 currentSz;
     int foundKey = 0;
     int rc = 0;
 
-    WMEMSET(authKeysPath, 0, sizeof(authKeysPath));
-    rc = ResolveAuthKeysPath(path, authKeysPath);
-    if (rc != WS_SUCCESS) {
-        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Failed to resolve authorized keys"
-            " file path.");
-        ret = rc;
+    if (keysFilePath == NULL || key == NULL || keySz == 0) {
+        return WS_BAD_ARGUMENT;
     }
 
-    if (ret == WSSHD_AUTH_SUCCESS) {
-        if (WFOPEN(NULL, &f, authKeysPath, "rb") != 0) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to open %s",
-                authKeysPath);
-            ret = WS_BAD_FILE_E;
+    /* StrictModes opens through the secure gate: a regular file, no symlink,
+     * owned by the user or root, no group/world writable path component.
+     * Otherwise fall back to a plain open. */
+    if (strictModes) {
+        if (wolfSSHD_OpenSecureFile(keysFilePath, uid,
+                0 /* rejectReadable */, 0 /* relaxPerms */, NULL, &f)
+                != WS_SUCCESS) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Keys file failed StrictModes check: %s", keysFilePath);
+            ret = WSSHD_AUTH_FAILURE;
         }
+    }
+    else if (WFOPEN(NULL, &f, keysFilePath, "rb") != 0) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to open %s", keysFilePath);
+        ret = WS_BAD_FILE_E;
     }
     if (ret == WSSHD_AUTH_SUCCESS) {
         lineBuf = (char*)WMALLOC(MAX_LINE_SZ, NULL, DYNTYPE_BUFFER);
@@ -547,8 +1480,7 @@ static int SearchForPubKey(const char* path, const WS_UserAuthData_PublicKey* pu
             continue; /* commented out line */
         }
 
-        rc = CheckAuthKeysLine(current, currentSz, pubKeyCtx->publicKey,
-            pubKeyCtx->publicKeySz);
+        rc = CheckAuthKeysLine(current, currentSz, key, keySz, isCert);
         if (rc == WSSHD_AUTH_SUCCESS) {
             foundKey = 1;
             break;
@@ -563,8 +1495,118 @@ static int SearchForPubKey(const char* path, const WS_UserAuthData_PublicKey* pu
         WFCLOSE(NULL, f);
     }
 
+    if (lineBuf != NULL) {
+        WFREE(lineBuf, NULL, DYNTYPE_BUFFER);
+    }
+
     if (ret == WSSHD_AUTH_SUCCESS && !foundKey) {
         ret = WSSHD_AUTH_FAILURE;
+    }
+
+    return ret;
+}
+
+/* Detects host private key format. */
+int wolfSSHD_DetectPrivKeyFormat(byte* data, word32 dataSz, void* heap,
+        byte** keyDer, byte** privBuf, word32* privBufSz)
+{
+    int keyFormat = WOLFSSH_FORMAT_ASN1;
+    byte* der;
+    int derSz;
+
+    if (keyDer != NULL) {
+        *keyDer = NULL;
+    }
+    if (privBuf != NULL) {
+        *privBuf = NULL;
+    }
+    if (privBufSz != NULL) {
+        *privBufSz = 0;
+    }
+
+    if (data == NULL || dataSz == 0 || keyDer == NULL || privBuf == NULL ||
+            privBufSz == NULL) {
+        return WS_BAD_ARGUMENT;
+    }
+
+    der = (byte*)WMALLOC(dataSz, heap, DYNTYPE_SSHD);
+    if (der == NULL) {
+        return WS_MEMORY_E;
+    }
+
+    derSz = wc_KeyPemToDer(data, (int)dataSz, der, (int)dataSz, NULL);
+    if (derSz <= 0) {
+        WS_FORCEZERO(der, dataSz);
+        WFREE(der, heap, DYNTYPE_SSHD);
+
+        *privBuf = data;
+        *privBufSz = dataSz;
+
+        /* Strict prefix match for OpenSSH magic (35 bytes) */
+        if (*privBufSz >= 35 &&
+                WMEMCMP(*privBuf, "-----BEGIN OPENSSH PRIVATE KEY-----", 35) == 0) {
+            keyFormat = WOLFSSH_FORMAT_OPENSSH;
+        }
+        else if (*privBufSz >= sizeof("openssh-key-v1") &&
+                 WMEMCMP(*privBuf, "openssh-key-v1",
+                         sizeof("openssh-key-v1")) == 0) {
+            /* sizeof() includes the magic's trailing NUL */
+            keyFormat = WOLFSSH_FORMAT_OPENSSH;
+        }
+        else if (data[0] != 0x30) {
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Failed to convert host private key from PEM.");
+            *privBuf = NULL;
+            *privBufSz = 0;
+            return WS_BAD_FILE_E;
+        }
+    }
+    else {
+        /* PEM-decoded result may still be an OpenSSH binary blob, or
+         * (on a malformed/truncated PEM input) non-DER garbage; check
+         * for both before accepting it as ASN.1, same as the derSz<=0
+         * branch above does. */
+        if ((word32)derSz >= sizeof("openssh-key-v1") &&
+                WMEMCMP(der, "openssh-key-v1",
+                        sizeof("openssh-key-v1")) == 0) {
+            keyFormat = WOLFSSH_FORMAT_OPENSSH;
+        }
+        else if (der[0] != 0x30) {
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Decoded host private key is "
+                "not valid ASN.1 or OpenSSH format.");
+            WS_FORCEZERO(der, dataSz);
+            WFREE(der, heap, DYNTYPE_SSHD);
+            return WS_BAD_FILE_E;
+        }
+
+        *keyDer = der;
+        *privBuf = der;
+        *privBufSz = (word32)derSz;
+    }
+
+    return keyFormat;
+}
+
+WOLFSSHD_STATIC int SearchForPubKey(const char* path,
+                                    const char* authKeysFile, const char* user,
+                                    const WS_UserAuthData_PublicKey* pubKeyCtx,
+                                    WUID_T uid, int strictModes)
+{
+    int ret = WSSHD_AUTH_SUCCESS;
+    char authKeysPath[MAX_PATH_SZ];
+    int rc = 0;
+
+    WMEMSET(authKeysPath, 0, sizeof(authKeysPath));
+    rc = ResolveAuthKeysPath(path, authKeysFile, user, authKeysPath);
+    if (rc != WS_SUCCESS) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Failed to resolve authorized keys"
+            " file path.");
+        ret = rc;
+    }
+
+    if (ret == WSSHD_AUTH_SUCCESS) {
+        ret = SearchKeysFile(authKeysPath, pubKeyCtx->publicKey,
+                pubKeyCtx->publicKeySz, uid, strictModes,
+                pubKeyCtx->isCert);
     }
 
     return ret;
@@ -592,72 +1634,332 @@ static int CheckUserUnix(const char* name) {
     return ret;
 }
 
+#ifdef WOLFSSH_OSSH_CERTS
+/* Return WSSHD_AUTH_SUCCESS when name appears in the certificate's principal
+ * list. A principal-less certificate is rejected, matching OpenSSH sshd
+ * (sshkey_cert_check_authority rejects a user cert with no principals). */
+#ifdef WOLFSSHD_UNIT_TEST
+int OsshCertCheckPrincipal(const WS_UserAuthData_PublicKey* pubKeyCtx,
+        const char* name)
+#else
+static int OsshCertCheckPrincipal(const WS_UserAuthData_PublicKey* pubKeyCtx,
+        const char* name)
+#endif
+{
+    const byte* p = pubKeyCtx->principals;
+    word32 sz = pubKeyCtx->principalsSz;
+    word32 idx = 0;
+    word32 nameSz;
+    word32 entSz;
+
+    /* OpenSSH sshd rejects a principal-less user certificate; the empty-list
+     * "any principal" rule in PROTOCOL.certkeys is wire format, not policy.
+     * Fail closed so such a cert cannot authenticate as an arbitrary user. */
+    if (p == NULL || sz == 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] OpenSSH certificate lacks a principal list");
+        return WSSHD_AUTH_FAILURE;
+    }
+
+    nameSz = (word32)WSTRLEN(name);
+    while (idx + UINT32_SZ <= sz) {
+        entSz = AuthReadU32(p + idx);
+        idx += UINT32_SZ;
+        if (entSz > sz - idx) {
+            break; /* malformed principals region */
+        }
+        if (entSz == nameSz && XMEMCMP(p + idx, name, nameSz) == 0) {
+            return WSSHD_AUTH_SUCCESS;
+        }
+        idx += entSz;
+    }
+
+    wolfSSH_Log(WS_LOG_ERROR,
+        "[SSHD] User %s is not a listed certificate principal", name);
+    return WSSHD_AUTH_FAILURE;
+}
+
+
+/* Return WSSHD_AUTH_SUCCESS when the current time is within the certificate's
+ * validity window. */
+#ifdef WOLFSSHD_UNIT_TEST
+int OsshCertCheckValidity(const WS_UserAuthData_PublicKey* pubKeyCtx)
+#else
+static int OsshCertCheckValidity(const WS_UserAuthData_PublicKey* pubKeyCtx)
+#endif
+{
+    word64 now = (word64)WTIME(NULL);
+
+    if (now < pubKeyCtx->validAfter || now >= pubKeyCtx->validBefore) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] OpenSSH certificate is outside its validity window");
+        return WSSHD_AUTH_FAILURE;
+    }
+
+    return WSSHD_AUTH_SUCCESS;
+}
+
+
+/* Return 1 if the first 'bits' bits of a and b match, over 'len' bytes. */
+#ifdef WOLFSSHD_UNIT_TEST
+int OsshPrefixMatch(const byte* a, const byte* b, int bits, int len)
+#else
+static int OsshPrefixMatch(const byte* a, const byte* b, int bits, int len)
+#endif
+{
+    int fullBytes = bits / 8;
+    int remBits = bits % 8;
+    byte mask;
+
+    if (bits < 0 || bits > len * 8) {
+        return 0;
+    }
+    if (fullBytes > 0 && XMEMCMP(a, b, fullBytes) != 0) {
+        return 0;
+    }
+    if (remBits != 0) {
+        mask = (byte)(0xFFu << (8 - remBits));
+        if ((a[fullBytes] & mask) != (b[fullBytes] & mask)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+/* Return 1 if peerIp is permitted by the comma-separated CIDR list, following
+ * OpenSSH addr_match_cidr_list: any malformed entry, including a negated one,
+ * invalidates the whole list and denies. IPv4/IPv6, POSIX inet_pton. */
+#ifdef WOLFSSHD_UNIT_TEST
+int OsshSourceAddrMatch(const byte* list, word32 listSz,
+        const char* peerIp)
+#else
+static int OsshSourceAddrMatch(const byte* list, word32 listSz,
+        const char* peerIp)
+#endif
+{
+    byte peer[16];
+    byte addr[16];
+    int peerLen = 0;
+    int addrLen = 0;
+    int prefix;
+    int allow = 0;
+    word32 i = 0;
+    word32 entLen;
+    char ent[WOLFSSHD_CIDR_ENTRY_SZ];
+    char* p;
+    char* slash;
+    char* pp;
+    struct in_addr v4;
+    struct in6_addr v6;
+
+    if (inet_pton(AF_INET, peerIp, &v4) == 1) {
+        XMEMCPY(peer, &v4, 4);
+        peerLen = 4;
+    }
+    else if (inet_pton(AF_INET6, peerIp, &v6) == 1) {
+        /* An IPv4 client on a dual-stack listener arrives as ::ffff:a.b.c.d.
+         * Compare it as IPv4 so IPv4 list entries still match. */
+        if (IN6_IS_ADDR_V4MAPPED(&v6)) {
+            XMEMCPY(peer, ((const byte*)&v6) + 12, 4);
+            peerLen = 4;
+        }
+        else {
+            XMEMCPY(peer, &v6, 16);
+            peerLen = 16;
+        }
+    }
+    else {
+        return 0;
+    }
+
+    while (i < listSz) {
+        entLen = 0;
+        while (i < listSz && list[i] != ',') {
+            if (entLen < (word32)sizeof(ent) - 1) {
+                ent[entLen] = (char)list[i];
+            }
+            entLen++; /* count full length, even past the buffer */
+            i++;
+        }
+        if (i < listSz) {
+            i++; /* skip comma */
+        }
+        /* An entry too long to hold cannot be parsed, so the list is not
+         * usable; deny rather than skip it. */
+        if (entLen >= (word32)sizeof(ent)) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Certificate source-address entry too long: denying");
+            return 0;
+        }
+        ent[entLen] = '\0';
+
+        p = ent;
+        if (*p == '\0') {
+            return 0; /* empty entry: malformed list */
+        }
+        /* The cert option is validated with addr_match_cidr_list, which has no
+         * negation, so "!" is an invalid character that voids the list. */
+        if (*p == '!') {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Certificate source-address negation is not valid: "
+                "denying");
+            return 0;
+        }
+
+        slash = WSTRCHR(p, '/');
+        if (slash == NULL) {
+            prefix = -1; /* no prefix: full-length match */
+        }
+        else {
+            *slash = '\0';
+            pp = slash + 1;
+            if (*pp == '\0') {
+                return 0; /* empty prefix: malformed list */
+            }
+            prefix = 0;
+            while (*pp >= '0' && *pp <= '9') {
+                prefix = prefix * 10 + (*pp - '0');
+                if (prefix > 128) {
+                    break; /* oversize; the check below rejects it */
+                }
+                pp++;
+            }
+            if (*pp != '\0') {
+                return 0; /* non-numeric prefix: malformed list */
+            }
+        }
+
+        if (inet_pton(AF_INET, p, &v4) == 1) {
+            XMEMCPY(addr, &v4, 4);
+            addrLen = 4;
+        }
+        else if (inet_pton(AF_INET6, p, &v6) == 1) {
+            XMEMCPY(addr, &v6, 16);
+            addrLen = 16;
+        }
+        else {
+            return 0; /* unparsable address: malformed list */
+        }
+
+        if (prefix < 0) {
+            prefix = addrLen * 8; /* no prefix given: full-length */
+        }
+        else if (prefix > addrLen * 8) {
+            return 0; /* prefix too large for the family: malformed list */
+        }
+
+        /* A different family cannot match, but is not malformed. */
+        if (addrLen != peerLen) {
+            continue;
+        }
+        if (OsshPrefixMatch(peer, addr, prefix, addrLen)) {
+            allow = 1;
+        }
+    }
+
+    return allow;
+}
+
+
+/* Enforce the certificate's source-address restriction (if any) against the
+ * connection peer IP. Returns WSSHD_AUTH_SUCCESS when allowed. */
+static int OsshCertCheckSourceAddress(
+        const WS_UserAuthData_PublicKey* pubKeyCtx, const char* peerIp)
+{
+    if (pubKeyCtx->sourceAddress == NULL || pubKeyCtx->sourceAddressSz == 0) {
+        return WSSHD_AUTH_SUCCESS; /* no restriction */
+    }
+
+    if (peerIp == NULL || peerIp[0] == '\0') {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Cannot enforce certificate source-address: no peer IP");
+        return WSSHD_AUTH_FAILURE;
+    }
+
+    if (OsshSourceAddrMatch(pubKeyCtx->sourceAddress,
+            pubKeyCtx->sourceAddressSz, peerIp)) {
+        return WSSHD_AUTH_SUCCESS;
+    }
+
+    wolfSSH_Log(WS_LOG_ERROR,
+        "[SSHD] Peer %s not permitted by certificate source-address", peerIp);
+    return WSSHD_AUTH_FAILURE;
+}
+#endif /* WOLFSSH_OSSH_CERTS */
+
+
+#if defined(WOLFSSHD_UNIT_TEST) && defined(WOLFSSH_OSSH_CERTS)
+int CheckPublicKeyUnix(const char* name,
+                       const WS_UserAuthData_PublicKey* pubKeyCtx,
+                       const char* usrCaKeysFile,
+                       const char* authorizedKeysFile,
+                       WOLFSSHD_AUTH* authCtx)
+#else
 static int CheckPublicKeyUnix(const char* name,
                               const WS_UserAuthData_PublicKey* pubKeyCtx,
-                              const char* usrCaKeysFile, WOLFSSHD_AUTH* authCtx)
+                              const char* usrCaKeysFile,
+                              const char* authorizedKeysFile,
+                              WOLFSSHD_AUTH* authCtx)
+#endif
 {
     int ret = WSSHD_AUTH_SUCCESS;
     struct passwd* pwInfo;
 
 #ifdef WOLFSSH_OSSH_CERTS
     if (pubKeyCtx->isOsshCert) {
-        int rc;
-        byte* caKey = NULL;
-        word32 caKeySz;
-        const byte* caKeyType = NULL;
-        word32 caKeyTypeSz;
-        byte fingerprint[WC_SHA256_DIGEST_SIZE];
-
-        if (pubKeyCtx->caKey == NULL ||
-            pubKeyCtx->caKeySz != WC_SHA256_DIGEST_SIZE) {
+        /* caKey is the raw signing-CA blob, identical to a decoded
+         * TrustedUserCAKeys line, so it reuses the authorized_keys scanner. */
+        if (pubKeyCtx->caKey == NULL || pubKeyCtx->caKeySz == 0) {
             ret = WS_FATAL_ERROR;
         }
 
-        if (ret == WSSHD_AUTH_SUCCESS) {
-            f = XFOPEN(usrCaKeysFile, "rb");
-            if (f == XBADFILE) {
-                wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to open %s",
-                            usrCaKeysFile);
-                ret = WS_BAD_FILE_E;
-            }
+        if (ret == WSSHD_AUTH_SUCCESS && usrCaKeysFile == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] No TrustedUserCAKeys configured for certificate auth");
+            ret = WSSHD_AUTH_FAILURE;
         }
+
+        /* The requested user must be a real local account. */
         if (ret == WSSHD_AUTH_SUCCESS) {
-            lineBuf = (char*)WMALLOC(MAX_LINE_SZ, NULL, DYNTYPE_BUFFER);
-            if (lineBuf == NULL) {
-                ret = WS_MEMORY_E;
-            }
-        }
-        while (ret == WSSHD_AUTH_SUCCESS &&
-               (current = XFGETS(lineBuf, MAX_LINE_SZ, f)) != NULL) {
-            currentSz = (word32)XSTRLEN(current);
-
-            /* remove leading spaces */
-            while (currentSz > 0 && current[0] == ' ') {
-                currentSz = currentSz - 1;
-                current   = current + 1;
-            }
-
-            if (currentSz <= 1) {
-                continue; /* empty line */
-            }
-
-            if (current[0] == '#') {
-                continue; /* commented out line */
-            }
-
-            rc = wolfSSH_ReadKey_buffer((const byte*)current, currentSz,
-                                        WOLFSSH_FORMAT_SSH, &caKey, &caKeySz,
-                                        &caKeyType, &caKeyTypeSz, NULL);
-            if (rc == WS_SUCCESS) {
-                rc = wc_Hash(WC_HASH_TYPE_SHA256, caKey, caKeySz, fingerprint,
-                             WC_SHA256_DIGEST_SIZE);
-                if (rc == 0 && ConstantCompare(fingerprint, pubKeyCtx->caKey,
-                                       WC_SHA256_DIGEST_SIZE) == 0) {
-                    foundKey = 1;
-                    break;
+            errno = 0;
+            pwInfo = getpwnam((const char*)name);
+            if (pwInfo == NULL) {
+                if (errno != 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error calling getpwnam for user %s.", name);
                 }
+                ret = WS_FATAL_ERROR;
             }
         }
+
+        /* The signing CA must be listed in TrustedUserCAKeys. A daemon trust
+         * anchor, so it is always secure-gated, regardless of StrictModes. */
+        if (ret == WSSHD_AUTH_SUCCESS) {
+            ret = SearchKeysFile(usrCaKeysFile, pubKeyCtx->caKey,
+                    pubKeyCtx->caKeySz, geteuid(), 1 /* strictModes */,
+                    0 /* isCert: caKey is a wire-format key, not a cert */);
+        }
+
+        /* Bind the certificate to the requested user via its principals. */
+        if (ret == WSSHD_AUTH_SUCCESS) {
+            ret = OsshCertCheckPrincipal(pubKeyCtx, name);
+        }
+
+        if (ret == WSSHD_AUTH_SUCCESS) {
+            ret = OsshCertCheckValidity(pubKeyCtx);
+        }
+
+        /* A NULL authCtx leaves the peer IP unknown, so the source-address
+         * check below fails closed if the certificate restricts it. */
+        if (ret == WSSHD_AUTH_SUCCESS) {
+            ret = OsshCertCheckSourceAddress(pubKeyCtx,
+                    (authCtx != NULL) ? authCtx->peerIp : NULL);
+        }
+
+        /* The force-command is stashed in UserAuthResult, after the signature
+         * verifies, so it binds to the credential that authenticated. */
     }
     else
     #endif /* WOLFSSH_OSSH_CERTS */
@@ -673,7 +1975,9 @@ static int CheckPublicKeyUnix(const char* name,
         }
 
         if (ret == WSSHD_AUTH_SUCCESS) {
-            ret = SearchForPubKey(pwInfo->pw_dir, pubKeyCtx);
+            ret = SearchForPubKey(pwInfo->pw_dir, authorizedKeysFile, name,
+                pubKeyCtx, pwInfo->pw_uid,
+                wolfSSHD_ConfigGetStrictModes(authCtx->conf));
         }
     }
 
@@ -685,12 +1989,14 @@ static int CheckPublicKeyUnix(const char* name,
 
 #ifdef _WIN32
 
+/* lower-case header names so mingw cross-builds resolve them on
+ * case-sensitive filesystems */
 #include <ntstatus.h>
-#include <Ntsecapi.h>
-#include <Shlobj.h>
+#include <ntsecapi.h>
+#include <shlobj.h>
 
-#include <UserEnv.h>
-#include <KnownFolders.h>
+#include <userenv.h>
+#include <knownfolders.h>
 
 /* Pulled in from Advapi32.dll */
 extern BOOL WINAPI LogonUserExExW(LPTSTR usr,
@@ -708,46 +2014,56 @@ extern BOOL WINAPI LogonUserExExW(LPTSTR usr,
 
 #define MAX_USERNAME 256
 
-static int _GetHomeDirectory(WOLFSSHD_AUTH* auth, const char* usr, WCHAR* out, int outSz)
+static int _GetProfileDirectory(WOLFSSHD_AUTH* auth, const char* usr,
+    WCHAR* out, int outSz)
+{
+    int ret = WS_SUCCESS;
+    DWORD outSzW = (DWORD)outSz;
+
+    if (GetUserProfileDirectoryW(wolfSSHD_GetAuthToken(auth), out,
+            &outSzW) != TRUE) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Error %lu getting user %s's home path",
+            (unsigned long)GetLastError(), usr);
+        ret = WS_FATAL_ERROR;
+    }
+
+    return ret;
+}
+
+
+/* Home directory of an authenticated user, building the profile when the user
+ * has none yet. The hive is machine wide, so every session takes its own
+ * handle on it. */
+static int _GetHomeDirectory(WOLFSSHD_AUTH* auth, const char* usr, WCHAR* out,
+    int outSz)
 {
     int ret = WS_SUCCESS;
     WCHAR usrW[MAX_USERNAME];
-    wchar_t* homeDir;
-    HRESULT hr;
     size_t wr;
+    PROFILEINFO pInfo = { 0 };
 
     /* convert user name to Windows wchar type */
     mbstowcs_s(&wr, usrW, MAX_USERNAME, usr, MAX_USERNAME-1);
 
-    hr = SHGetKnownFolderPath((REFKNOWNFOLDERID)&FOLDERID_Profile,
-        0, wolfSSHD_GetAuthToken(auth), &homeDir);
-    if (SUCCEEDED(hr)) {
-        wcscpy_s(out, outSz, homeDir);
-        CoTaskMemFree(homeDir);
-    }
-    else {
-        PROFILEINFO pInfo = { 0 };
-
-        /* failed with get known folder path, try with loading the user profile */
+    if (auth->profile == NULL) {
+        pInfo.dwSize = sizeof(pInfo);
         pInfo.dwFlags = PI_NOUI;
         pInfo.lpUserName = usrW;
         if (LoadUserProfileW(wolfSSHD_GetAuthToken(auth), &pInfo) != TRUE) {
             wolfSSH_Log(WS_LOG_ERROR,
-                "[SSHD] Error %d loading user %s", GetLastError(), usr);
+                "[SSHD] Error %lu loading user %s",
+                (unsigned long)GetLastError(), usr);
             ret = WS_FATAL_ERROR;
         }
-
-        /* get home directory env. for user */
-        if (ret == WS_SUCCESS &&
-            ExpandEnvironmentStringsW(L"%USERPROFILE%", out, outSz) == 0) {
-            wolfSSH_Log(WS_LOG_ERROR,
-                "[SSHD] Error getting user %s's home path", usr);
-            ret = WS_FATAL_ERROR;
+        else {
+            /* keep loaded for the session */
+            auth->profile = pInfo.hProfile;
         }
+    }
 
-        /* @TODO is unload of user needed here?
-           UnloadUserProfileW(wolfSSHD_GetAuthToken(conn->auth), pInfo.hProfile);
-         */
+    if (ret == WS_SUCCESS) {
+        ret = _GetProfileDirectory(auth, usr, out, outSz);
     }
 
     return ret;
@@ -766,6 +2082,26 @@ HANDLE wolfSSHD_GetAuthToken(const WOLFSSHD_AUTH* auth)
     if (auth == NULL)
         return NULL;
     return auth->token;
+}
+
+/* Unload the profile and close the token. Safe to call more than once. */
+void wolfSSHD_AuthCloseToken(WOLFSSHD_AUTH* auth)
+{
+    if (auth != NULL && auth->token != NULL &&
+            auth->token != INVALID_HANDLE_VALUE) {
+        if (auth->profile != NULL) {
+            if (UnloadUserProfile(auth->token, auth->profile) != TRUE) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Error %lu unloading user profile",
+                    (unsigned long)GetLastError());
+                RegCloseKey((HKEY)auth->profile);
+            }
+            /* drop it even when the unload fails */
+            auth->profile = NULL;
+        }
+        CloseHandle(auth->token);
+        auth->token = NULL;
+    }
 }
 
 static int CheckPasswordWIN(const char* usr, const byte* pw, word32 pwSz, WOLFSSHD_AUTH* authCtx)
@@ -797,7 +2133,8 @@ static int CheckPasswordWIN(const char* usr, const byte* pw, word32 pwSz, WOLFSS
     }
 
     if (ret == WSSHD_AUTH_SUCCESS) {
-        pwWSz = MultiByteToWideChar(CP_UTF8, 0, pw, pwSz, NULL, 0);
+        pwWSz = MultiByteToWideChar(CP_UTF8, 0, (const char*)pw, pwSz, NULL,
+            0);
         if (pwWSz <= 0) {
             ret = WSSHD_AUTH_FAILURE;
         }
@@ -811,7 +2148,8 @@ static int CheckPasswordWIN(const char* usr, const byte* pw, word32 pwSz, WOLFSS
     }
     
     if (ret == WSSHD_AUTH_SUCCESS) {
-        if (MultiByteToWideChar(CP_UTF8, 0, pw, pwSz, pwW, pwWSz) != pwWSz) {
+        if (MultiByteToWideChar(CP_UTF8, 0, (const char*)pw, pwSz, pwW, pwWSz)
+                != pwWSz) {
             ret = WSSHD_AUTH_FAILURE;
         }
         else {
@@ -820,10 +2158,13 @@ static int CheckPasswordWIN(const char* usr, const byte* pw, word32 pwSz, WOLFSS
     }
 
     if (ret == WSSHD_AUTH_SUCCESS) {
+        /* Close any prior token before acquiring a new one. */
+        wolfSSHD_AuthCloseToken(authCtx);
+
         if (LogonUserExExW(usrW, dmW, pwW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, NULL,
             &authCtx->token, NULL, NULL, NULL, NULL) != TRUE) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Windows failed with error %d when login in as user %s, "
-                "bad username or password", GetLastError(), usr);
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Windows failed with error %lu when login in as user %s, "
+                "bad username or password", (unsigned long)GetLastError(), usr);
             wolfSSH_Log(WS_LOG_INFO, "[SSHD] Check user is allowed to 'Log on as batch job'");
             ret = WSSHD_AUTH_FAILURE;
         }
@@ -834,6 +2175,7 @@ static int CheckPasswordWIN(const char* usr, const byte* pw, word32 pwSz, WOLFSS
     }
 
     if (pwW != NULL) {
+        WS_FORCEZERO(pwW, (word32)((pwWSz * sizeof(WCHAR)) + sizeof(WCHAR)));
         WFREE(pwW, authCtx->heap, DYNTYPE_SSHD);
     }
 
@@ -899,7 +2241,8 @@ static int SetupUserTokenWin(const char* usr,
 
 
         if ((rc = LsaRegisterLogonProcess(&processName, &lsaHandle, &oMode)) != STATUS_SUCCESS) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] LSA Register Logon Process Error %d", LsaNtStatusToWinError(rc));
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] LSA Register Logon Process Error %lu",
+                (unsigned long)LsaNtStatusToWinError(rc));
             ret = WSSHD_AUTH_FAILURE;
         }
     }
@@ -912,7 +2255,8 @@ static int SetupUserTokenWin(const char* usr,
         authName.Length = (USHORT)WSTRLEN(MSV1_0_PACKAGE_NAME);
         authName.MaximumLength = authName.Length + 1;
         if ((rc = LsaLookupAuthenticationPackage(lsaHandle, &authName, &authId)) != STATUS_SUCCESS) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] LSA Lookup Authentication Package Error %d", rc);
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] LSA Lookup Authentication Package Error %lu",
+                (unsigned long)rc);
             ret = WSSHD_AUTH_FAILURE;
         }
     }
@@ -959,17 +2303,23 @@ static int SetupUserTokenWin(const char* usr,
         NTSTATUS     subStatus;
         QUOTA_LIMITS quotas;
         DWORD        profileSz;
-        PKERB_INTERACTIVE_PROFILE profile = NULL;
+        PVOID        profile = NULL;
         LUID logonId = { 0, 0 };
 
+        /* LsaLogonUser only writes SubStatus for an account restriction, so
+         * seed it rather than log an indeterminate value. */
+        subStatus = 0;
         WMEMSET(&originName, 0, sizeof(LSA_STRING));
         originName.Buffer = "wolfsshd";
         originName.Length = (USHORT)WSTRLEN("wolfsshd");
         originName.MaximumLength = originName.Length + 1;
 
+        /* Close any prior token before acquiring a new one. */
+        wolfSSHD_AuthCloseToken(authCtx);
+
         if ((rc = LsaLogonUser(lsaHandle, &originName, Network, authId, authInfo, authInfoSz, NULL, &sourceContext, &profile, &profileSz, &logonId, &authCtx->token, &quotas, &subStatus)) != STATUS_SUCCESS) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Windows failed with status %X, SubStatus %d, when login in as user %s",
-                rc, subStatus, usr);
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Windows failed with status %lX, SubStatus %ld, when login in as user %s",
+                (unsigned long)rc, (long)subStatus, usr);
             ret = WSSHD_AUTH_FAILURE;
         }
 
@@ -993,11 +2343,22 @@ static int SetupUserTokenWin(const char* usr,
 /* Uses Windows LSA for getting an impersination token */
 static int CheckPublicKeyWIN(const char* usr,
     const WS_UserAuthData_PublicKey* pubKeyCtx,
-    const char* usrCaKeysFile, WOLFSSHD_AUTH* authCtx)
+    const char* usrCaKeysFile, const char* authorizedKeysFile,
+    WOLFSSHD_AUTH* authCtx)
 {
     int ret;
 
     wolfSSH_Log(WS_LOG_INFO, "[SSHD] Windows check public key");
+
+#ifdef WOLFSSH_OSSH_CERTS
+    /* Certificate enforcement lives only in CheckPublicKeyUnix, so fail
+     * closed here rather than accept the reconstructed key. */
+    if (pubKeyCtx->isOsshCert) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] OpenSSH certificate auth is not supported on Windows");
+        return WSSHD_AUTH_FAILURE;
+    }
+#endif
 
     ret = SetupUserTokenWin(usr, pubKeyCtx,usrCaKeysFile, authCtx);
 
@@ -1005,7 +2366,7 @@ static int CheckPublicKeyWIN(const char* usr,
     if (ret == WSSHD_AUTH_SUCCESS) {
         WCHAR h[MAX_PATH];
 
-        if (_GetHomeDirectory(authCtx, usr, h, MAX_PATH) == WS_SUCCESS) {
+        if (_GetProfileDirectory(authCtx, usr, h, MAX_PATH) == WS_SUCCESS) {
             CHAR r[MAX_PATH];
             size_t rSz;
 
@@ -1016,7 +2377,8 @@ static int CheckPublicKeyWIN(const char* usr,
             if (ret == WSSHD_AUTH_SUCCESS) {
                 r[rSz-1] = L'\0';
 
-                ret = SearchForPubKey(r, pubKeyCtx);
+                ret = SearchForPubKey(r, authorizedKeysFile, usr, pubKeyCtx, 0,
+                    wolfSSHD_ConfigGetStrictModes(authCtx->conf));
                 if (ret != WSSHD_AUTH_SUCCESS) {
                     wolfSSH_Log(WS_LOG_ERROR,
                         "[SSHD] Failed to find public key for user %s", usr);
@@ -1035,19 +2397,72 @@ static int CheckPublicKeyWIN(const char* usr,
 }
 #endif /* _WIN32*/
 
+/* Check if user is root-equivalent. */
+static int IsRootUser(const char* usr)
+{
+    int isRoot = 0;
+#ifndef _WIN32
+    struct passwd* pwInfo;
+
+    pwInfo = getpwnam(usr);
+    if ((pwInfo != NULL && pwInfo->pw_uid == 0) || XSTRCMP(usr, "root") == 0) {
+        isRoot = 1;
+    }
+#else
+    if (XSTRCMP(usr, "root") == 0) {
+        isRoot = 1;
+    }
+#endif
+    return isRoot;
+}
+
+/* Check if root login denied. */
+WOLFSSHD_STATIC int IsRootLoginDenied(int isRoot, WOLFSSHD_CONFIG* usrConf)
+{
+    return (isRoot == 1 &&
+            wolfSSHD_ConfigGetPermitRoot(usrConf) == WOLFSSHD_PERMIT_ROOT_NO);
+}
+
+/* Check if root password auth blocked. */
+WOLFSSHD_STATIC int IsRootPasswordAuthBlocked(int isRoot,
+        WOLFSSHD_CONFIG* usrConf)
+{
+    return (isRoot == 1 &&
+            (wolfSSHD_ConfigGetPermitRoot(usrConf) ==
+                 WOLFSSHD_PERMIT_ROOT_PROHIBIT_PW ||
+             wolfSSHD_ConfigGetPermitRoot(usrConf) ==
+                 WOLFSSHD_PERMIT_ROOT_FORCED_CMD));
+}
+
+/* Check if ForceCommand missing for root. */
+WOLFSSHD_STATIC int IsRootPubKeyForcedCmdMissing(int isRoot,
+        WOLFSSHD_CONFIG* usrConf)
+{
+    return (isRoot == 1 &&
+            wolfSSHD_ConfigGetPermitRoot(usrConf) ==
+                WOLFSSHD_PERMIT_ROOT_FORCED_CMD &&
+            wolfSSHD_ConfigGetForcedCmd(usrConf) == NULL);
+}
+
 /* return WOLFSSH_USERAUTH_SUCCESS on success */
-static int DoCheckUser(const char* usr, WOLFSSHD_AUTH* auth)
+static int DoCheckUser(const char* usr, WOLFSSHD_AUTH* auth, int isRoot)
 {
     int ret = WOLFSSH_USERAUTH_SUCCESS;
     int rc;
+    WOLFSSHD_CONFIG* usrConf;
 
     wolfSSH_Log(WS_LOG_INFO, "[SSHD] Checking user name %s", usr);
 
-    if (wolfSSHD_ConfigGetPermitRoot(auth->conf) == 0) {
-        if (XSTRCMP(usr, "root") == 0) {
+    if (isRoot == 1) {
+        /* Resolve per-user config so a Match override is honored; a NULL
+         * result is unresolvable, so fail closed and reject. */
+        usrConf = wolfSSHD_AuthGetUserConf(auth, usr, NULL, NULL, NULL, NULL,
+                                           NULL);
+        if (usrConf == NULL || IsRootLoginDenied(isRoot, usrConf)) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Login as root not permitted");
             ret = WOLFSSH_USERAUTH_REJECTED;
         }
+        wolfSSHD_ConfigFree(usrConf);
     }
 
     if (ret == WOLFSSH_USERAUTH_SUCCESS) {
@@ -1070,48 +2485,282 @@ static int DoCheckUser(const char* usr, WOLFSSHD_AUTH* auth)
 }
 
 
-/* @TODO this will take in a pipe or equivalent to talk to a privileged thread
- * rather than having WOLFSSHD_AUTH directly with privilege separation */
+/* NULL-safe comparison of two TrustedUserCAKeys file settings. Returns 1 when
+ * they differ (including the case where exactly one is NULL), 0 when they are
+ * equal. */
+#ifdef WOLFSSHD_UNIT_TEST
+int CAKeysFileDiffers(const char* a, const char* b)
+#else
+static int CAKeysFileDiffers(const char* a, const char* b)
+#endif
+{
+    int ret;
+
+    if (a == NULL || b == NULL) {
+        ret = (a != b) ? 1 : 0;
+    }
+    else {
+        ret = (WSTRCMP(a, b) != 0) ? 1 : 0;
+    }
+
+    return ret;
+}
+
+
+/* Returns 1 when the certificate UPN <user>@<domain> in name[0..nameSz)
+ * authorizes login as 'usr'. allowList is a whitespace/comma list of permitted
+ * realms; NULL/empty matches the local part only, else domain must be listed. */
+#if (defined(WOLFSSL_FPKI) && defined(WOLFSSH_CERTS)) || \
+    defined(WOLFSSHD_UNIT_TEST)
+WOLFSSHD_STATIC int MatchUPNToUser(const char* usr, const char* name,
+                                   int nameSz, const char* allowList)
+{
+    int ret = 0;
+    int idx = 0;
+    int domainSz;
+    int tokSz;
+    const char* domain;
+    const char* p;
+    const char* tok;
+
+    if (usr != NULL && name != NULL && nameSz >= 0) {
+        /* locate the '@' separating the local part from the domain */
+        for (idx = 0; idx < nameSz; idx++) {
+            if (name[idx] == '@') {
+                break;
+            }
+        }
+
+        /* The local part must equal the requested user name: exactly on
+         * Unix, case-insensitively on Windows where account names are
+         * case-insensitive. */
+        if ((int)XSTRLEN(usr) == idx &&
+#ifdef _WIN32
+                WSTRNCASECMP(usr, name, (size_t)idx) == 0
+#else
+                XSTRNCMP(usr, name, idx) == 0
+#endif
+                ) {
+            if (allowList == NULL || *allowList == '\0') {
+                /* no allowlist configured: keep local-part-only matching */
+                ret = 1;
+            }
+            else if (idx < nameSz) {
+                /* an allowlist is set: the UPN domain must be present and
+                 * listed as an exact, case-insensitive match */
+                domain = name + idx + 1;
+                domainSz = nameSz - idx - 1;
+
+                p = allowList;
+                while (*p != '\0' && ret == 0) {
+                    /* skip separators preceding the realm token */
+                    while (*p == ' ' || *p == '\t' || *p == '\r' ||
+                            *p == '\n' || *p == ',') {
+                        p++;
+                    }
+
+                    tok = p;
+                    while (*p != '\0' && *p != ' ' && *p != '\t' &&
+                            *p != '\r' && *p != '\n' && *p != ',') {
+                        p++;
+                    }
+                    tokSz = (int)(p - tok);
+
+                    if (tokSz > 0 && tokSz == domainSz &&
+                            WSTRNCASECMP(tok, domain, (size_t)domainSz) == 0) {
+                        ret = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return ret;
+}
+#endif /* (WOLFSSL_FPKI && WOLFSSH_CERTS) || WOLFSSHD_UNIT_TEST */
+
+
+#ifdef WOLFSSHD_UNIT_TEST
+/* Test-only spy to assert if DoFakePasswordCheck() ran. */
+static int fakePasswordCheckCallCount = 0;
+
+void wolfSSHD_ResetFakePasswordCheckCountForTest(void)
+{
+    fakePasswordCheckCallCount = 0;
+}
+
+int wolfSSHD_GetFakePasswordCheckCountForTest(void)
+{
+    return fakePasswordCheckCallCount;
+}
+#endif
+
+/* Runs a fake crypt() to equalize timing on failure paths that skip the
+ * real password check. No-op under WOLFSSH_USE_PAM (PAM path needs its
+ * own mitigation). */
+#ifdef WOLFSSHD_UNIT_TEST
+void DoFakePasswordCheck(WS_UserAuthData* authData)
+#else
+static void DoFakePasswordCheck(WS_UserAuthData* authData)
+#endif
+{
+#ifdef WOLFSSHD_UNIT_TEST
+    fakePasswordCheckCallCount++;
+#endif
+#if defined(WOLFSSH_HAVE_LIBCRYPT) || defined(WOLFSSH_HAVE_LIBLOGIN)
+    char* fakePwStr = NULL;
+    const byte* fakePw = NULL;
+    word32 fakePwSz = 0;
+    const char* fakeHash = "*";
+
+    if (authData->type == WOLFSSH_USERAUTH_PASSWORD) {
+        fakePw = authData->sf.password.password;
+        fakePwSz = authData->sf.password.passwordSz;
+    }
+
+#ifdef HAVE_SHADOW
+    if (numCachedFakeHashes > 0) {
+        /* Byte-sum selects which cached hash to use. Deterministic but
+         * attacker-predictable; impact is marginal on typical systems
+         * where all accounts share one algorithm. */
+        word32 hashIdx = 0;
+        word32 i;
+        if (authData->username != NULL) {
+            for (i = 0; i < authData->usernameSz; i++) {
+                hashIdx += authData->username[i];
+            }
+        }
+        fakeHash = cachedFakeHashes[hashIdx % numCachedFakeHashes];
+    }
+#endif
+
+    fakePwStr = (char*)WMALLOC(fakePwSz + 1, NULL, DYNTYPE_STRING);
+    if (fakePwStr != NULL) {
+        if (fakePwSz > 0 && fakePw != NULL) {
+            XMEMCPY(fakePwStr, fakePw, fakePwSz);
+        }
+        fakePwStr[fakePwSz] = 0;
+
+        /* Return value ignored: fake check must not influence auth. */
+        CheckPasswordHashUnix(fakePwStr, fakeHash);
+
+        WS_FORCEZERO(fakePwStr, fakePwSz + 1);
+        WFREE(fakePwStr, NULL, DYNTYPE_STRING);
+    }
+    else {
+        CheckPasswordHashUnix("", fakeHash);
+    }
+#else
+    WOLFSSH_UNUSED(authData);
+#endif
+}
+
+
+/*
+ * @TODO this will take a pipe or equivalent to talk to a privileged thread
+ * rather than having WOLFSSHD_AUTH directly with privilege separation.
+ * Note: authData->type of WOLFSSH_USERAUTH_NONE is not valid for wolfsshd.
+ *
+ * Certificate auth limitation: the X.509 CA store is loaded once at startup
+ * from the global TrustedUserCAKeys (see SetupCTX in wolfsshd.c) and wolfSSH
+ * verifies the client cert chain against it before this callback runs. A
+ * per-user "Match ... TrustedUserCAKeys" override is never loaded into that
+ * store, so it cannot be enforced for certificate verification. Rather than
+ * silently accept a cert validated against the wrong (global) CA, the
+ * CA-only branch below fails closed when a Match block sets a CA file that
+ * differs from the global one.
+ *
+ * Note: the comparison is against the *resolved* per-user value. A Match node
+ * snapshots the global config as it stood when the Match line was parsed, so a
+ * user whose own Match never set TrustedUserCAKeys keeps the global value and
+ * is not rejected. A Match parsed before the global directive snapshots no CA
+ * file and still fails closed.
+ */
 static int RequestAuthentication(WS_UserAuthData* authData,
                                  WOLFSSHD_AUTH* authCtx)
 {
     int ret;
     int rc;
+    int isRoot;
+    int needFakeCheck = 0;
     const char* usr;
+    WOLFSSHD_CONFIG* usrConf = NULL;
 
     if (authData == NULL || authCtx == NULL) {
         return WOLFSSH_USERAUTH_FAILURE;
     }
 
+    if (authData->type == WOLFSSH_USERAUTH_NONE) {
+        wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Auth type NONE invalid.");
+        return WOLFSSH_USERAUTH_INVALID_AUTHTYPE;
+    }
+
     usr = (const char*)authData->username;
-    ret = DoCheckUser(usr, authCtx);
+    isRoot = IsRootUser(usr);
+    ret = DoCheckUser(usr, authCtx, isRoot);
+
+    if (ret != WOLFSSH_USERAUTH_SUCCESS) {
+        needFakeCheck = 1;
+    }
+
     /* temporarily elevate permissions */
     if (ret == WOLFSSH_USERAUTH_SUCCESS &&
             wolfSSHD_AuthRaisePermissions(authCtx) != WS_SUCCESS) {
         wolfSSH_Log(WS_LOG_ERROR,
                 "[SSHD] Failure to raise permissions for auth");
         ret = WOLFSSH_USERAUTH_FAILURE;
+        needFakeCheck = 1;
+    }
+
+    /* Resolve per-user config to honor Match blocks. NULL means the group
+     * set couldn't be enumerated; fail closed rather than fall back to the
+     * global node and evaluate auth against the wrong config. */
+    if (ret == WOLFSSH_USERAUTH_SUCCESS) {
+        usrConf = wolfSSHD_AuthGetUserConf(authCtx, usr, NULL, NULL, NULL, NULL,
+                                           NULL);
+        if (usrConf == NULL) {
+            /* bound the untrusted name so it cannot consume the whole
+             * fixed-width log message (control bytes are scrubbed by
+             * wolfSSH_Log itself) */
+            wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Failure to get user configuration for auth "
+                    "(user=%.32s)", usr);
+            ret = WOLFSSH_USERAUTH_FAILURE;
+            needFakeCheck = 1;
+        }
     }
 
     if (ret == WOLFSSH_USERAUTH_SUCCESS &&
         authData->type == WOLFSSH_USERAUTH_PASSWORD) {
-
-        if (wolfSSHD_ConfigGetPwAuth(authCtx->conf) != 1) {
+        if (wolfSSHD_ConfigGetPwAuth(usrConf) != 1) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Password authentication not "
                         "allowed by configuration!");
+            ret = WOLFSSH_USERAUTH_REJECTED;
+        }
+        else if (IsRootPasswordAuthBlocked(isRoot, usrConf)) {
+            /* Blocked by config. */
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Password authentication for "
+                        "root not allowed by configuration!");
             ret = WOLFSSH_USERAUTH_REJECTED;
         }
         /* Check if password is valid for this user. */
         /* first handle empty password cases */
         else if (authData->sf.password.passwordSz == 0 &&
-                 wolfSSHD_ConfigGetPermitEmptyPw(authCtx->conf) != 1) {
+                 wolfSSHD_ConfigGetPermitEmptyPw(usrConf) != 1) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Empty passwords not allowed by "
                         "configuration!");
             ret = WOLFSSH_USERAUTH_FAILURE;
+            /* Set explicitly; the trailing else also fires here, but
+             * this makes the intent clear at the point of rejection. */
+            needFakeCheck = 1;
         }
-        else {
+
+        /* Only run password check when config allows it (avoids leaks). */
+        if (ret == WOLFSSH_USERAUTH_SUCCESS) {
             rc = authCtx->checkPasswordCb(usr, authData->sf.password.password,
                                      authData->sf.password.passwordSz, authCtx);
+
             if (rc == WSSHD_AUTH_SUCCESS) {
                 wolfSSH_Log(WS_LOG_INFO, "[SSHD] Password ok.");
             }
@@ -1129,30 +2778,68 @@ static int RequestAuthentication(WS_UserAuthData* authData,
             else {
                 wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error checking password.");
                 ret = WOLFSSH_USERAUTH_FAILURE;
+                needFakeCheck = 1;
             }
+        }
+        else {
+            needFakeCheck = 1;
         }
     }
 
+    /* Equalize crypt() cost for password auth across every failure path
+     * above that never reached the real checkPasswordCb crypt() call. */
+    if (needFakeCheck && authData->type == WOLFSSH_USERAUTH_PASSWORD) {
+        DoFakePasswordCheck(authData);
+    }
 
-    #ifdef WOLFSSL_FPKI
+
+    if (ret == WOLFSSH_USERAUTH_SUCCESS &&
+        authData->type == WOLFSSH_USERAUTH_PUBLICKEY &&
+        wolfSSHD_ConfigGetPubKeyAuth(usrConf) != 1) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Public key authentication not "
+                    "allowed by configuration!");
+        ret = WOLFSSH_USERAUTH_REJECTED;
+    }
+
+    if (ret == WOLFSSH_USERAUTH_SUCCESS &&
+        authData->type == WOLFSSH_USERAUTH_PUBLICKEY &&
+        IsRootPubKeyForcedCmdMissing(isRoot, usrConf)) {
+        /* Forced command required. */
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Public key login for root requires "
+                    "a forced command by configuration!");
+        ret = WOLFSSH_USERAUTH_REJECTED;
+    }
+
+    #if defined(WOLFSSH_CERTS) && (defined(WOLFSSL_FPKI) || defined(_WIN32))
     if (ret == WOLFSSH_USERAUTH_SUCCESS &&
         authData->type == WOLFSSH_USERAUTH_PUBLICKEY) {
-        /* compare user name to UPN in certificate */
+        /* Bind the certificate to the requested user name via UPN with FPKI
+         * or CN without FPKI. The check always runs, even when a per-user
+         * AuthorizedKeysFile is configured: an exact certificate match
+         * against that file (checked below) proves the cert is authorized
+         * for the account, but it is not a substitute for the identity
+         * check here, so both are required as defense in depth. Note the
+         * strength of any AuthorizedKeysFile binding also rests on the
+         * file's integrity: on Windows, wolfSSHD_OpenSecureFile() performs
+         * no ownership or ACL checks, so that guarantee is only as good as
+         * the NTFS ACLs on the profile directory. */
         if (authData->sf.publicKey.isCert) {
-            DecodedCert* dCert;
         #ifdef WOLFSSH_SMALL_STACK
+            DecodedCert* dCert;
+
             dCert = (DecodedCert*)WMALLOC(sizeof(DecodedCert), NULL,
                 DYNTYPE_CERT);
-        #else
-            DecodedCert sdCert;
-            dCert = &sdCert;
-        #endif
-
             if (dCert == NULL) {
                 wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error creating cert struct");
                 ret = WOLFSSH_USERAUTH_INVALID_PUBLICKEY;
             }
-            else {
+        #else
+            DecodedCert sdCert;
+            DecodedCert* dCert = &sdCert;
+        #endif
+
+            /* NULL only when the small-stack allocation above failed */
+            if (dCert != NULL) {
                 wc_InitDecodedCert(dCert, authData->sf.publicKey.publicKey,
                         authData->sf.publicKey.publicKeySz, NULL);
                 if (wc_ParseCert(dCert, CERT_TYPE, NO_VERIFY, NULL) != 0) {
@@ -1162,34 +2849,54 @@ static int RequestAuthentication(WS_UserAuthData* authData,
                 }
                 else {
                     int usrMatch = 0;
+                #ifdef WOLFSSL_FPKI
                     DNS_entry* current = dCert->altNames;
+                    const char* upnDomains =
+                        wolfSSHD_ConfigGetAuthorizedUPNDomains(usrConf);
 
                     while (current != NULL) {
                         if (current->type == ASN_OTHER_TYPE &&
                                 current->oidSum == UPN_OID) {
-                            /* found UPN oid, check name against user */
-                            int idx;
-
-                            for (idx = 0; idx < current->len; idx++) {
-                                if (current->name[idx] == '@') break;
-                                /* UPN format is <user>@<domain>
-                                 * since currently not doing any checks on
-                                 * domain it is  not treated as an error if only
-                                 * the user name is present without the domain
-                                 */
-                            }
-
-                            if ((int)XSTRLEN(usr) == idx &&
-                                    XSTRNCMP(usr, current->name, idx) == 0) {
+                            /* bind the cert identity to the requested user;
+                             * MatchUPNToUser also enforces the realm allowlist
+                             * when AuthorizedUPNDomains is set. An unset
+                             * allowlist is noticed once at startup from
+                             * SetupCTX(), not here: this path is
+                             * peer-triggered and the log callback writes
+                             * WARN unconditionally. */
+                            if (MatchUPNToUser(usr, current->name, current->len,
+                                    upnDomains)) {
                                 usrMatch = 1;
                             }
                         }
                         current = current->next;
                     }
+                #else
+                    /* Without FPKI compare subject CN with user name. Only
+                     * reachable on Windows, where account names are
+                     * case-insensitive, so match the CN the same way.
+                     *
+                     * This is a name match only. There is no analogue of
+                     * AuthorizedUPNDomains here, so any CA in the trust store
+                     * may assert any CN; the trusted user CA set is the whole
+                     * of the issuer policy. */
+                    if (dCert->subjectCN != NULL && dCert->subjectCNLen > 0 &&
+                            (int)XSTRLEN(usr) == dCert->subjectCNLen &&
+                            WSTRNCASECMP(usr, dCert->subjectCN,
+                                (size_t)dCert->subjectCNLen) == 0) {
+                        /* CN-only binding (no issuer constraint) is a fixed
+                         * build property, noticed once at startup from
+                         * SetupCTX(); a per-attempt WARN here would let a
+                         * peer grow the log with every attempt now that the
+                         * log callback writes WARN without -d */
+                        usrMatch = 1;
+                    }
+                #endif
 
                     if (usrMatch == 0) {
                         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] incorrect user cert "
-                            "sent");
+                            "sent; certificate identity does not match the "
+                            "requested user (user=%.32s)", usr);
                         ret = WOLFSSH_USERAUTH_INVALID_PUBLICKEY;
                     }
                 }
@@ -1207,30 +2914,68 @@ static int RequestAuthentication(WS_UserAuthData* authData,
         /* if this is a certificate and no specific authorized keys file has
             * been set then rely on CA to have verified the cert */
         if (authData->sf.publicKey.isCert &&
-                !wolfSSHD_ConfigGetAuthKeysFileSet(authCtx->conf)) {
-            wolfSSH_Log(WS_LOG_INFO,
-                "[SSHD] Relying on CA for public key check");
-        #ifdef WIN32
-            /* Still need to get users token on Windows */
-            rc = SetupUserTokenWin(usr, &authData->sf.publicKey,
-                wolfSSHD_ConfigGetUserCAKeysFile(authCtx->conf), authCtx);
-            if (rc == WSSHD_AUTH_SUCCESS) {
-                wolfSSH_Log(WS_LOG_INFO, "[SSHD] Got users token ok.");
-                ret = WOLFSSH_USERAUTH_SUCCESS;
+                !wolfSSHD_ConfigGetAuthKeysFileSet(usrConf)) {
+            /* The cert chain was already verified by wolfSSH against the CA
+             * store loaded once from the global TrustedUserCAKeys. A per-user
+             * Match override of TrustedUserCAKeys is not part of that store and
+             * cannot be enforced here, so fail closed instead of accepting a
+             * cert validated against the wrong CA. See the function comment. */
+            if (CAKeysFileDiffers(
+                    wolfSSHD_ConfigGetUserCAKeysFile(authCtx->conf),
+                    wolfSSHD_ConfigGetUserCAKeysFile(usrConf))) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Per-user TrustedUserCAKeys override is not enforced "
+                    "for certificate authentication; rejecting (user=%.32s)",
+                    usr);
+                ret = WOLFSSH_USERAUTH_REJECTED;
             }
             else {
+            #if defined(WOLFSSH_CERTS) && defined(_WIN32)
+                /* Bound to the requested user above by certificate UPN with
+                 * FPKI, or by subject CN otherwise; which of the two is in
+                 * force is fixed by the wolfSSL build, not by configuration.
+                 * Still need to get the users token on Windows. */
+                wolfSSH_Log(WS_LOG_INFO,
+                    "[SSHD] Relying on CA for public key check");
+                rc = SetupUserTokenWin(usr, &authData->sf.publicKey,
+                    wolfSSHD_ConfigGetUserCAKeysFile(usrConf), authCtx);
+                if (rc == WSSHD_AUTH_SUCCESS) {
+                    wolfSSH_Log(WS_LOG_INFO, "[SSHD] Got users token ok.");
+                    ret = WOLFSSH_USERAUTH_SUCCESS;
+                }
+                else {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error getting users token.");
+                    ret = WOLFSSH_USERAUTH_FAILURE;
+                }
+            #elif defined(WOLFSSH_CERTS) && defined(WOLFSSL_FPKI)
+                /* The UPN-vs-username check above already bound the certificate
+                 * to the requested user, so the CA-verified chain is
+                 * sufficient. */
+                wolfSSH_Log(WS_LOG_INFO,
+                    "[SSHD] Relying on CA for public key check");
+                ret = WOLFSSH_USERAUTH_SUCCESS;
+            #else
+                /* No binding ran above: either the certificate UPN/principal
+                 * cannot be read without FPKI, or this build has no
+                 * certificate support at all. Fail closed: require
+                 * AuthorizedKeysFile (per-user key/cert mapping) or a wolfSSL
+                 * build with FPKI. */
                 wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] Error getting users token.");
-                ret = WOLFSSH_USERAUTH_FAILURE;
+                    "[SSHD] Certificate authentication cannot bind the requested "
+                    "user without FPKI or AuthorizedKeysFile; rejecting "
+                    "(user=%.32s)", usr);
+                ret = WOLFSSH_USERAUTH_REJECTED;
+            #endif
             }
-        #else
-            ret = WOLFSSH_USERAUTH_SUCCESS;
-        #endif
         }
         else {
-            /* if not a certificate then parse through authorized key file */
+            /* if not a certificate then parse through authorized key file.
+             * Pass this user's resolved AuthorizedKeysFile so a Match-block
+             * override is honored without relying on shared mutable state. */
             rc = authCtx->checkPublicKeyCb(usr, &authData->sf.publicKey,
-                            wolfSSHD_ConfigGetUserCAKeysFile(authCtx->conf),
+                            wolfSSHD_ConfigGetUserCAKeysFile(usrConf),
+                            wolfSSHD_ConfigGetAuthKeysFile(usrConf),
                             authCtx);
             if (rc == WSSHD_AUTH_SUCCESS) {
                 wolfSSH_Log(WS_LOG_INFO, "[SSHD] Public key ok.");
@@ -1249,6 +2994,8 @@ static int RequestAuthentication(WS_UserAuthData* authData,
         }
     }
 
+
+    wolfSSHD_ConfigFree(usrConf);
 
     if (wolfSSHD_AuthReducePermissions(authCtx) != WS_SUCCESS) {
         /* stop everything if not able to reduce permissions level */
@@ -1283,9 +3030,6 @@ int DefaultUserAuth(byte authType, WS_UserAuthData* authData, void* ctx)
     }
 
     if (authType != WOLFSSH_USERAUTH_PASSWORD &&
-#ifdef WOLFSSH_ALLOW_USERAUTH_NONE
-        authType != WOLFSSH_USERAUTH_NONE &&
-#endif
         authType != WOLFSSH_USERAUTH_PUBLICKEY) {
 
         ret = WOLFSSH_USERAUTH_INVALID_AUTHTYPE;
@@ -1300,6 +3044,26 @@ int DefaultUserAuth(byte authType, WS_UserAuthData* authData, void* ctx)
 }
 
 
+/* Builds the bit mask of authentication methods advertised to a peer based on
+ * the resolved per-user configuration. A method is only offered when its
+ * corresponding config option is enabled, so PasswordAuthentication no and
+ * PubkeyAuthentication no remove the method from the advertisement. Returns 0
+ * when both are disabled (no methods advertised). */
+WOLFSSHD_STATIC int wolfSSHD_GetUserAuthTypes(const WOLFSSHD_CONFIG* usrConf)
+{
+    int ret = 0;
+
+    if (wolfSSHD_ConfigGetPwAuth(usrConf) == 1) {
+        ret |= WOLFSSH_USERAUTH_PASSWORD;
+    }
+    if (wolfSSHD_ConfigGetPubKeyAuth(usrConf) == 1) {
+        ret |= WOLFSSH_USERAUTH_PUBLICKEY;
+    }
+
+    return ret;
+}
+
+
 int DefaultUserAuthTypes(WOLFSSH* ssh, void* ctx)
 {
     WOLFSSHD_CONFIG* usrConf;
@@ -1308,7 +3072,7 @@ int DefaultUserAuthTypes(WOLFSSH* ssh, void* ctx)
     int   ret = 0;
 
     if (ssh == NULL || ctx == NULL)
-        return WS_BAD_ARGUMENT;
+        return 0;
     authCtx = (WOLFSSHD_AUTH*)ctx;
 
     /* get configuration for user */
@@ -1316,13 +3080,11 @@ int DefaultUserAuthTypes(WOLFSSH* ssh, void* ctx)
     usrConf = wolfSSHD_AuthGetUserConf(authCtx, usr, NULL, NULL,
             NULL, NULL, NULL);
     if (usrConf == NULL) {
-        ret = WS_BAD_ARGUMENT;
+        ret = 0;
     }
     else {
-        if (wolfSSHD_ConfigGetPwAuth(usrConf) == 1) {
-            ret |= WOLFSSH_USERAUTH_PASSWORD;
-        }
-        ret |= WOLFSSH_USERAUTH_PUBLICKEY;
+        ret = wolfSSHD_GetUserAuthTypes(usrConf);
+        wolfSSHD_ConfigFree(usrConf);
     }
 
     return ret;
@@ -1384,13 +3146,8 @@ static int SetDefaultPublicKeyCheck(WOLFSSHD_AUTH* auth)
     return ret;
 }
 
-#ifndef WOLFSSH_SSHD_USER
-    #define WOLFSSH_SSHD_USER sshd
-#endif
-#define WOLFSSH_USER_GET_STRING(x) #x
-#define WOLFSSH_USER_STRING(x) WOLFSSH_USER_GET_STRING(x)
 
-static int SetDefualtUserID(WOLFSSHD_AUTH* auth)
+static int SetDefaultUserID(WOLFSSHD_AUTH* auth)
 {
 #ifdef _WIN32
     /* TODO: Implement for Windows. */
@@ -1399,7 +3156,22 @@ static int SetDefualtUserID(WOLFSSHD_AUTH* auth)
     struct passwd* pwInfo;
     int ret = WS_SUCCESS;
 
+    if (wolfSSHD_ConfigGetPrivilegeSeparation(auth->conf) ==
+            WOLFSSHD_PRIV_OFF) {
+        auth->gid  = getgid();
+        auth->uid  = getuid();
+        auth->sGid = auth->gid;
+        auth->sUid = auth->uid;
+        return WS_SUCCESS;
+    }
+
     pwInfo = getpwnam(WOLFSSH_USER_STRING(WOLFSSH_SSHD_USER));
+#ifdef WOLFSSHD_UNIT_TEST
+    /* Fallback for unit tests. */
+    if (pwInfo == NULL) {
+        pwInfo = getpwuid(getuid());
+    }
+#endif
     if (pwInfo == NULL) {
         /* user name not found on system */
         wolfSSH_Log(WS_LOG_INFO, "[SSHD] No %s user found to use",
@@ -1429,6 +3201,9 @@ WOLFSSHD_AUTH* wolfSSHD_AuthCreateUser(void* heap, const WOLFSSHD_CONFIG* conf)
     if (auth != NULL) {
         int ret;
 
+        /* Zero first so optional members (e.g. certForcedCmd, peerIp) start in a
+         * known state; the fields below are then set explicitly. */
+        WMEMSET(auth, 0, sizeof(WOLFSSHD_AUTH));
         auth->heap = heap;
         auth->conf = conf;
         auth->attempts = WOLFSSHD_MAX_PASSWORD_ATTEMPTS;
@@ -1459,7 +3234,7 @@ WOLFSSHD_AUTH* wolfSSHD_AuthCreateUser(void* heap, const WOLFSSHD_CONFIG* conf)
         }
 
         if (ret == WS_SUCCESS) {
-            ret = SetDefualtUserID(auth);
+            ret = SetDefaultUserID(auth);
             if (ret != WS_SUCCESS) {
                 wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting default "
                     "user ID.");
@@ -1482,32 +3257,122 @@ WOLFSSHD_AUTH* wolfSSHD_AuthCreateUser(void* heap, const WOLFSSHD_CONFIG* conf)
 int wolfSSHD_AuthFreeUser(WOLFSSHD_AUTH* auth)
 {
     if (auth != NULL) {
+    #ifdef _WIN32
+        wolfSSHD_AuthCloseToken(auth);
+    #endif
+    #ifdef WOLFSSH_OSSH_CERTS
+        if (auth->certForcedCmd != NULL) {
+            WFREE(auth->certForcedCmd, auth->heap, DYNTYPE_STRING);
+            auth->certForcedCmd = NULL;
+        }
+    #endif
         WFREE(auth, auth->heap, DYNTYPE_SSHD);
     }
     return WS_SUCCESS;
 }
 
 
+#ifdef WOLFSSH_OSSH_CERTS
+/* Record the connection peer IP for certificate source-address enforcement. */
+void wolfSSHD_AuthSetPeerIp(WOLFSSHD_AUTH* auth, const char* ip)
+{
+    word32 ipSz;
+
+    if (auth != NULL && ip != NULL) {
+        ipSz = (word32)WSTRLEN(ip);
+        /* An address too long to store could not be matched anyway, so leave
+         * peerIp empty and let the source-address check fail closed. */
+        if (ipSz < sizeof(auth->peerIp)) {
+            WMEMCPY(auth->peerIp, ip, ipSz + 1);
+        }
+        else {
+            auth->peerIp[0] = '\0';
+        }
+    }
+}
+
+
+/* Return the force-command from an authenticated OpenSSH certificate, or NULL
+ * when none was present. */
+const char* wolfSSHD_AuthGetForcedCmd(const WOLFSSHD_AUTH* auth)
+{
+    if (auth != NULL) {
+        return auth->certForcedCmd;
+    }
+    return NULL;
+}
+
+
+/* A configured ForceCommand overrides a certificate's force-command; the
+ * certificate command applies only when the configuration sets none. */
+const char* wolfSSHD_AuthMergeForcedCmd(const char* configCmd,
+        const char* certCmd)
+{
+    return (configCmd != NULL) ? configCmd : certCmd;
+}
+
+
+/* Store a copy of a verified certificate's force-command on the auth context,
+ * replacing any previous value. Called only after the signature verifies. */
+int wolfSSHD_AuthSetCertForcedCmd(WOLFSSHD_AUTH* auth, const byte* cmd,
+        word32 cmdSz)
+{
+    char* copy = NULL;
+
+    if (auth == NULL || cmd == NULL || cmdSz == 0) {
+        return WS_BAD_ARGUMENT;
+    }
+
+    copy = (char*)WMALLOC(cmdSz + 1, auth->heap, DYNTYPE_STRING);
+    if (copy == NULL) {
+        return WS_MEMORY_E;
+    }
+    WMEMCPY(copy, cmd, cmdSz);
+    copy[cmdSz] = '\0';
+
+    if (auth->certForcedCmd != NULL) {
+        WFREE(auth->certForcedCmd, auth->heap, DYNTYPE_STRING);
+    }
+    auth->certForcedCmd = copy;
+
+    return WS_SUCCESS;
+}
+#endif /* WOLFSSH_OSSH_CERTS */
+
+
 /* return WS_SUCCESS on success */
 int wolfSSHD_AuthRaisePermissions(WOLFSSHD_AUTH* auth)
 {
-    int ret = 0;
+    int ret = WS_SUCCESS;
 
-    wolfSSH_Log(WS_LOG_INFO, "[SSHD] Attempting to raise permissions level");
 #ifndef WIN32
-    if (auth) {
+    byte flag = 0;
+
+    if (auth == NULL) {
+        return WS_BAD_ARGUMENT;
+    }
+
+    flag = wolfSSHD_ConfigGetPrivilegeSeparation(auth->conf);
+    if (flag == WOLFSSHD_PRIV_SEPARAT || flag == WOLFSSHD_PRIV_SANDBOX) {
+        wolfSSH_Log(WS_LOG_INFO,
+            "[SSHD] Attempting to raise permissions level");
+#ifdef WOLFSSHD_UNIT_TEST
+        if (wsshd_setegid_cb(auth->sGid) != 0) {
+#else
         if (setegid(auth->sGid) != 0) {
+#endif
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error raising gid");
             ret = WS_FATAL_ERROR;
         }
 
-        if (seteuid(auth->sUid) != 0) {
+#ifdef WOLFSSHD_UNIT_TEST
+        if (ret == WS_SUCCESS && wsshd_seteuid_cb(auth->sUid) != 0) {
+#else
+        if (ret == WS_SUCCESS && seteuid(auth->sUid) != 0) {
+#endif
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error raising uid");
             ret = WS_FATAL_ERROR;
         }
-    }
-    else {
-        ret = WS_BAD_ARGUMENT;
     }
 #endif
 
@@ -1519,13 +3384,21 @@ int wolfSSHD_AuthRaisePermissions(WOLFSSHD_AUTH* auth)
 int wolfSSHD_AuthReducePermissionsUser(WOLFSSHD_AUTH* auth, WUID_T uid,
     WGID_T gid)
 {
-#ifndef WIN32
+#ifndef _WIN32
+#ifdef WOLFSSHD_UNIT_TEST
+    if (wsshd_setregid_cb(gid, gid) != 0) {
+#else
     if (setregid(gid, gid) != 0) {
+#endif
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user gid");
         return WS_FATAL_ERROR;
     }
 
+#ifdef WOLFSSHD_UNIT_TEST
+    if (wsshd_setreuid_cb(uid, uid) != 0) {
+#else
     if (setreuid(uid, uid) != 0) {
+#endif
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user uid");
         return WS_FATAL_ERROR;
     }
@@ -1546,16 +3419,25 @@ int wolfSSHD_AuthReducePermissions(WOLFSSHD_AUTH* auth)
     }
 
     flag = wolfSSHD_ConfigGetPrivilegeSeparation(auth->conf);
-#ifndef WIN32
+    WOLFSSH_UNUSED(flag);
+#ifndef _WIN32
     if (flag == WOLFSSHD_PRIV_SEPARAT || flag == WOLFSSHD_PRIV_SANDBOX) {
         wolfSSH_Log(WS_LOG_INFO, "[SSHD] Lowering permissions level");
 
+#ifdef WOLFSSHD_UNIT_TEST
+        if (wsshd_setegid_cb(auth->gid) != 0) {
+#else
         if (setegid(auth->gid) != 0) {
+#endif
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting sshd gid");
             ret = WS_FATAL_ERROR;
         }
 
+#ifdef WOLFSSHD_UNIT_TEST
+        if (wsshd_seteuid_cb(auth->uid) != 0) {
+#else
         if (seteuid(auth->uid) != 0) {
+#endif
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting sshd uid");
             ret = WS_FATAL_ERROR;
         }
@@ -1564,57 +3446,220 @@ int wolfSSHD_AuthReducePermissions(WOLFSSHD_AUTH* auth)
     return ret;
 }
 
-#ifndef WIN32
+#ifndef _WIN32
 #if defined(__OSX__) || defined( __APPLE__)
     #define WGETGROUPLIST(x,y,z,w) getgrouplist((x),(y),(int*)(z),(w))
 #else
     #define WGETGROUPLIST(x,y,z,w) getgrouplist((x),(y),(z),(w))
 #endif
-#endif /* WIN32 */
+
+#if defined(WOLFSSHD_UNIT_TEST) && !defined(_WIN32)
+/* Adapts getgrouplist(3) to a fixed prototype so unit tests can swap in a
+ * stub, hiding the macOS int/gid_t argument difference behind WGETGROUPLIST. */
+static int wsshd_getgrouplist_default(const char* usr, WGID_T grp,
+        WGID_T* groups, int* ngroups)
+{
+    return WGETGROUPLIST(usr, grp, groups, ngroups);
+}
+int (*wsshd_getgrouplist_cb)(const char*, WGID_T, WGID_T*, int*)
+    = wsshd_getgrouplist_default;
+#endif
+
+/* Initial guess and upper bound for the number of groups a user can be in.
+ * getgrouplist cannot be reliably sized with a NULL probe (macOS returns
+ * success with size 0 and, when the buffer is too small, echoes the input size
+ * rather than the needed count), so the buffer grows from the guess up to the
+ * bound. */
+#ifndef WOLFSSHD_GROUP_LIST_INIT
+#define WOLFSSHD_GROUP_LIST_INIT 32
+#endif
+#ifndef WOLFSSHD_GROUP_LIST_MAX
+#define WOLFSSHD_GROUP_LIST_MAX 65536
+#endif
+
+/* Resolves the user's full gid list into an owned buffer via grow-and-retry
+ * sizing, since a NULL-size probe is unreliable (macOS reports size 0). Sets
+ * *outList (caller frees) and *outCount; returns WS_SUCCESS. */
+static int wolfSSHD_GetUserGroupList(void* heap, const char* usr,
+        WGID_T primaryGid, gid_t** outList, int* outCount)
+{
+    int ret = WS_SUCCESS;
+    int grpListSz = 0;
+    int allocSz;
+    int res;
+    gid_t* grpList = NULL;
+
+    *outList = NULL;
+    *outCount = 0;
+
+#if defined(__QNX__) || defined(__QNXNTO__)
+    /* QNX cannot report the size ahead of time, so allocate the max and fill
+     * once; getgrouplist returns 0 on success there. */
+    allocSz = (int)sysconf(_SC_NGROUPS_MAX);
+    if (allocSz <= 0) {
+        ret = WS_FATAL_ERROR;
+    }
+    if (ret == WS_SUCCESS) {
+        grpList = (gid_t*)WMALLOC(sizeof(gid_t) * allocSz, heap, DYNTYPE_SSHD);
+        if (grpList == NULL) {
+            ret = WS_MEMORY_E;
+        }
+    }
+    if (ret == WS_SUCCESS) {
+        grpListSz = allocSz;
+    #ifdef WOLFSSHD_UNIT_TEST
+        res = wsshd_getgrouplist_cb(usr, primaryGid, grpList, &grpListSz);
+    #else
+        res = WGETGROUPLIST(usr, primaryGid, grpList, &grpListSz);
+    #endif
+        if (res != 0) {
+            ret = WS_FATAL_ERROR;
+        }
+    }
+#else
+    /* Grow the buffer until the lookup fits: a NULL probe is unreliable and a
+     * too-small buffer does not report the needed count on all platforms. On
+     * success grpListSz holds the actual number of groups. */
+    allocSz = WOLFSSHD_GROUP_LIST_INIT;
+    res = -1;
+    while (ret == WS_SUCCESS && res < 0) {
+        grpList = (gid_t*)WMALLOC(sizeof(gid_t) * allocSz, heap, DYNTYPE_SSHD);
+        if (grpList == NULL) {
+            ret = WS_MEMORY_E;
+            break;
+        }
+
+        grpListSz = allocSz;
+    #ifdef WOLFSSHD_UNIT_TEST
+        res = wsshd_getgrouplist_cb(usr, primaryGid, grpList, &grpListSz);
+    #else
+        res = WGETGROUPLIST(usr, primaryGid, grpList, &grpListSz);
+    #endif
+        if (res < 0) {
+            /* buffer too small: discard, grow, and retry up to the cap */
+            WFREE(grpList, heap, DYNTYPE_SSHD);
+            grpList = NULL;
+            if (allocSz >= WOLFSSHD_GROUP_LIST_MAX) {
+                ret = WS_FATAL_ERROR;
+                break;
+            }
+            allocSz *= 2;
+            if (allocSz > WOLFSSHD_GROUP_LIST_MAX) {
+                allocSz = WOLFSSHD_GROUP_LIST_MAX;
+            }
+        }
+    }
+#endif
+
+    if (ret == WS_SUCCESS) {
+        *outList = grpList;
+        *outCount = grpListSz;
+    }
+    else if (grpList != NULL) {
+        WFREE(grpList, heap, DYNTYPE_SSHD);
+    }
+
+    return ret;
+}
+
+/* frees a group name array previously built by wolfSSHD_GetUserGroupNames */
+WOLFSSHD_STATIC void wolfSSHD_FreeUserGroupNames(void* heap, char** names,
+        word32 count)
+{
+    word32 i;
+
+    if (names != NULL) {
+        for (i = 0; i < count; i++) {
+            WFREE(names[i], heap, DYNTYPE_SSHD);
+        }
+        WFREE(names, heap, DYNTYPE_SSHD);
+    }
+}
+
+/* Builds the owned list of group names the user belongs to (primary plus
+ * supplementary) for Match Group evaluation; freed with
+ * wolfSSHD_FreeUserGroupNames. Returns WS_SUCCESS, *outNames NULL on failure. */
+WOLFSSHD_STATIC int wolfSSHD_GetUserGroupNames(void* heap, const char* usr,
+        WGID_T primaryGid, char*** outNames, word32* outCount)
+{
+    int ret;
+    int grpListSz = 0;
+    int i;
+    gid_t* grpList = NULL;
+    char** names = NULL;
+    struct group* g;
+    word32 count = 0;
+
+    *outNames = NULL;
+    *outCount = 0;
+
+    ret = wolfSSHD_GetUserGroupList(heap, usr, primaryGid, &grpList,
+            &grpListSz);
+
+    if (ret == WS_SUCCESS) {
+        names = (char**)WMALLOC(sizeof(char*) * grpListSz, heap, DYNTYPE_SSHD);
+        if (names == NULL) {
+            ret = WS_MEMORY_E;
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        for (i = 0; i < grpListSz; i++) {
+            /* Skip gids that do not resolve to a name rather than failing the
+             * login, matching OpenSSH. Copy immediately, since getgrgid reuses
+             * a static buffer the next call overwrites. */
+            g = getgrgid(grpList[i]);
+            if (g == NULL || g->gr_name == NULL) {
+                continue;
+            }
+            names[count] = WSTRDUP(g->gr_name, heap, DYNTYPE_SSHD);
+            if (names[count] == NULL) {
+                ret = WS_MEMORY_E;
+                break;
+            }
+            count++;
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        *outNames = names;
+        *outCount = count;
+    }
+    else {
+        wolfSSHD_FreeUserGroupNames(heap, names, count);
+    }
+
+    if (grpList != NULL) {
+        WFREE(grpList, heap, DYNTYPE_SSHD);
+    }
+
+    return ret;
+}
+#endif /* _WIN32 */
 
 /* sets the extended groups the user is in, returns WS_SUCCESS on success */
 int wolfSSHD_AuthSetGroups(const WOLFSSHD_AUTH* auth, const char* usr,
         WGID_T gid)
 {
     int ret = WS_SUCCESS;
-#ifndef WIN32
+#ifndef _WIN32
     int grpListSz = 0;
     gid_t* grpList = NULL;
 
-#if defined(__QNX__) || defined(__QNXNTO__)
-    /* QNX does not support getting the exact group list size ahead of time,
-       only the max group list size */
-    grpListSz = sysconf( _SC_NGROUPS_MAX );
+    /* resolve the full group list with portable grow-and-retry sizing, then
+     * apply it; a NULL-size probe is unreliable and would skip the drop. */
+    ret = wolfSSHD_GetUserGroupList(auth->heap, usr, gid, &grpList, &grpListSz);
+    if (ret == WS_SUCCESS) {
+#ifdef WOLFSSHD_UNIT_TEST
+        if (wsshd_setgroups_cb(grpListSz, grpList) == -1) {
 #else
-    /* should return -1 if grpListSz is smaller than actual groups */
-    if (WGETGROUPLIST(usr, gid, NULL, &grpListSz) == -1)
+        if (setgroups(grpListSz, grpList) == -1) {
 #endif
-    {
-        grpList = (gid_t*)WMALLOC(sizeof(gid_t) * grpListSz, auth->heap,
-            DYNTYPE_SSHD);
-        if (grpList == NULL) {
-            ret = WS_MEMORY_E;
+            ret = WS_FATAL_ERROR;
         }
-        else {
-            int res;
-
-            res = WGETGROUPLIST(usr, gid, grpList, &grpListSz);
-        #if defined(__QNX__) || defined(__QNXNTO__)
-            if (res != 0) {
-                ret = WS_FATAL_ERROR;
-            }
-        #else
-            if (res != grpListSz) {
-                ret = WS_FATAL_ERROR;
-            }
-        #endif
-
-            if (ret == WS_SUCCESS &&
-                    setgroups(grpListSz, grpList) == -1) {
-                ret = WS_FATAL_ERROR;
-            }
-            WFREE(grpList, auth->heap, DYNTYPE_SSHD);
-        }
+    }
+    if (grpList != NULL) {
+        WFREE(grpList, auth->heap, DYNTYPE_SSHD);
     }
 #else
     WOLFSSH_UNUSED(auth);
@@ -1645,32 +3690,38 @@ WOLFSSHD_CONFIG* wolfSSHD_AuthGetUserConf(const WOLFSSHD_AUTH* auth,
         const char* adr)
 {
     WOLFSSHD_CONFIG* ret = NULL;
+    char** grpNames = NULL;
+    word32 grpCount = 0;
 
     if (auth != NULL) {
-        char* gName = NULL;
-
         if (usr != NULL) {
-#ifdef WIN32
-            //LogonUserEx()
+#ifdef _WIN32
+            /* LogonUserEx(): group lookup is not implemented on Windows, so
+             * Match Group directives do not apply here */
 #else
             struct passwd* p_passwd;
-            struct group* g = NULL;
 
             p_passwd = getpwnam((const char *)usr);
             if (p_passwd == NULL) {
                 return NULL;
             }
 
-            g = getgrgid(p_passwd->pw_gid);
-            if (g == NULL) {
+            /* Resolve the full group set (primary and supplementary) so a
+             * Match Group directive matches on any of the user's groups.
+             * Fail closed if the groups cannot be enumerated. */
+            if (wolfSSHD_GetUserGroupNames(auth->heap, usr, p_passwd->pw_gid,
+                    &grpNames, &grpCount) != WS_SUCCESS) {
                 return NULL;
             }
-            gName = g->gr_name;
 #endif
         }
 
-        ret = wolfSSHD_GetUserConf(auth->conf, usr, gName, host, localAdr,
-            localPort, RDomain, adr);
+        ret = wolfSSHD_GetUserConf(auth->conf, usr, (const char**)grpNames,
+            grpCount, host, localAdr, localPort, RDomain, adr);
+
+#ifndef _WIN32
+        wolfSSHD_FreeUserGroupNames(auth->heap, grpNames, grpCount);
+#endif
     }
     return ret;
 }

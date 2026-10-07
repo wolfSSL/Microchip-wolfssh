@@ -123,13 +123,17 @@ enum WS_ErrorCodes {
     WS_KEY_CHECK_VAL_E      = -1091, /* OpenSSH key check value fail */
     WS_KEY_FORMAT_E         = -1092, /* OpenSSH key format fail */
     WS_SFTP_NOT_FILE_E      = -1093, /* Not a regular file */
-    WS_MSGID_NOT_ALLOWED_E  = -1094, /* Message not allowed before userauth */
+    WS_MSGID_NOT_ALLOWED_E  = -1094, /* Message ID not allowed at this point */
     WS_ED25519_E            = -1095, /* Ed25519 failure */
     WS_AUTH_PENDING         = -1096, /* User authentication still pending */
     WS_KDF_E                = -1097, /* KDF error*/
     WS_DISCONNECT           = -1098, /* peer sent disconnect */
+    WS_MLDSA_E              = -1099, /* MLDSA failure */
+    WS_ED448_E              = -1100, /* Ed448 failure */
+    WS_CERT_KEY_USAGE_E     = -1101, /* Cert (ext)KeyUsage not for SSH */
 
-    WS_LAST_E               = WS_DISCONNECT  /* Update this to indicate last error */
+    WS_LAST_E               = WS_CERT_KEY_USAGE_E /* Update to indicate
+                                                   * last error */
 };
 
 

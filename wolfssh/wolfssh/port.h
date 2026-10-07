@@ -103,7 +103,7 @@ extern "C" {
     #include "storage/nu_storage.h"
 
     #define WFILE int
-    WOLFSSH_API int wfopen(WFILE**, const char*, const char*);
+    WOLFSSH_API int wfopen(WFILE** f, const char* filename, const char* mode);
 
     #define WFOPEN(fs,f,fn,m)   wfopen((f),(fn),(m))
     #define WFCLOSE(fs,f)       NU_Close(*(f))
@@ -115,6 +115,7 @@ extern "C" {
     #define WREWIND(fs,s)       NU_Seek(*(s), 0, PSEEK_SET)
     #define WSEEK_END           PSEEK_END
     #define WBADFILE            NULL
+    #define WFSEEK_SUCCESS(r)   ((int)(r) >= 0)
 
     #define WS_DELIM '\\'
     #define WOLFSSH_O_RDWR   PO_RDWR
@@ -150,7 +151,7 @@ extern "C" {
 
         /* Set attribute value */
         atr = atr & 0xF0; /* clear first byte */
-        if (mode == 0x124) {
+        if (mode == 0444) {
             atr |= ARDONLY;   /* set read only value */
         }
         else {
@@ -182,7 +183,7 @@ extern "C" {
         #define MQX_MFS_DEVICE  "a:"
     #endif
 
-    WOLFSSH_API int wfopen(WFILE**, const char*, const char*);
+    WOLFSSH_API int wfopen(WFILE** f, const char* filename, const char* mode);
 
     #define WFOPEN(fs,f,fn,m)   wfopen((f),(fn),(m))
     #define WFCLOSE(fs,f)       fclose((f))
@@ -223,7 +224,7 @@ extern "C" {
         }
 
         /* set file attributes */
-        if (mode == 0x124) {
+        if (mode == 0444) {
             /* set read only value */
             attribute |= MFS_ATTR_READ_ONLY;
             err = ioctl(mfs_ptr, IO_IOCTL_SET_FILE_ATTR, (uint32_t*)&attr);
@@ -358,6 +359,13 @@ extern "C" {
 #elif defined(WOLFSSH_ZEPHYR)
 
     #include <zephyr/fs/fs.h>
+    #include <zephyr/version.h>
+    /* struct timeval. Include it directly rather than relying on it arriving
+     * transitively through wolfSSL's Zephyr POSIX includes. */
+    #if defined(CONFIG_POSIX_API) || \
+        ZEPHYR_VERSION_CODE >= ZEPHYR_VERSION(4, 1, 0)
+        #include <zephyr/posix/sys/time.h>
+    #endif
     #include <stdlib.h>
     #include <stdio.h>
 
@@ -384,6 +392,7 @@ extern "C" {
     #define WFGETS(b,s,f)       NULL /* Not ported yet */
     #undef  WFPUTS
     #define WFPUTS(b,s)         EOF /* Not ported yet */
+    #define WOLFSSH_NO_UTIMES
     #define WUTIMES(a,b)        (0) /* Not ported yet */
     #define WCHDIR(fs,b)        z_fs_chdir((b))
 
@@ -418,10 +427,10 @@ extern "C" {
     #define WFGETS(b,s,f)       SYS_FS_FileStringGet((f), (b), (s))
     #undef  WFPUTS
     #define WFPUTS(b,f)         SYS_FS_FileStringPut((f), (b))
+    #define WOLFSSH_NO_UTIMES
     #define WUTIMES(a,b)        (0) /* Not ported yet */
-    #define WSETTIME(fs,f,a,m) (0)
-    #define WFSETTIME(fs,fd,a,m) (0)
     #define WCHDIR(fs,b)        SYS_FS_DirectryChange((b))
+    #define WFSEEK_SUCCESS(r)   ((int)(r) >= 0)
 
 #else
     #include <stdlib.h>
@@ -429,7 +438,7 @@ extern "C" {
         #include <stdio.h>
     #endif
     #define WFILE FILE
-    WOLFSSH_API int wfopen(WFILE**, const char*, const char*);
+    WOLFSSH_API int wfopen(WFILE** f, const char* filename, const char* mode);
 
     #define WFFLUSH             fflush
 
@@ -440,24 +449,111 @@ extern "C" {
     #define WFSEEK(fs,s,o,w)    fseek((s),(o),(w))
     #define WFTELL(fs,s)        ftell((s))
     #define WFSTAT(fs,fd,b)     fstat((fd),(b))
-    #define WREWIND(fs,s)       rewind((s))
+    #define WREWIND(fs,s)       do { fseek((s),0,SEEK_SET); \
+                                     clearerr((s)); } while (0)
     #define WSEEK_END           SEEK_END
     #define WBADFILE            NULL
-    #define WSETTIME(fs,f,a,m) (0)
-    #define WFSETTIME(fs,fd,a,m) (0)
     #ifdef WOLFSSL_VXWORKS
+        #define WOLFSSH_NO_UTIMES
         #define WUTIMES(f,t)      (WS_SUCCESS)
     #elif defined(USE_WINDOWS_API)
         #include <sys/utime.h>
     #else
         #define WUTIMES(f,t)      utimes((f),(t))
+        /* Bind timestamp updates to the open descriptor with futimens()
+         * (POSIX.1-2008) when the build detected it, immune to a symlink
+         * swapped in over the path. The SCP code passes a timeval pair
+         * (matching WUTIMES), so convert it to the timespec pair futimens()
+         * expects. Falls back to the path-based WUTIMES when futimens() is not
+         * present. */
+        #ifdef HAVE_FUTIMENS
+            #include <sys/stat.h>
+            #include <sys/time.h>
+            #include <time.h>
+            static inline int wFutimes(int fd, const struct timeval t[2])
+            {
+                struct timespec ts[2];
+                ts[0].tv_sec  = t[0].tv_sec;
+                ts[0].tv_nsec = (long)t[0].tv_usec * 1000;
+                ts[1].tv_sec  = t[1].tv_sec;
+                ts[1].tv_nsec = (long)t[1].tv_usec * 1000;
+                return futimens(fd, ts);
+            }
+            #define WFUTIMES(fd,t)    wFutimes((fd),(t))
+        #endif
+        /* Path-based fallback for builds without futimens(): utimensat() with
+         * AT_SYMLINK_NOFOLLOW so a swapped symlink is not followed. Converts
+         * the timeval pair (matching WUTIMES) to the timespec utimensat wants. */
+        #ifdef HAVE_UTIMENSAT
+            #include <fcntl.h>
+            #include <sys/stat.h>
+            #include <sys/time.h>
+            #include <time.h>
+            static inline int wUtimesNoFollow(const char* f,
+                    const struct timeval t[2])
+            {
+                struct timespec ts[2];
+                ts[0].tv_sec  = t[0].tv_sec;
+                ts[0].tv_nsec = (long)t[0].tv_usec * 1000;
+                ts[1].tv_sec  = t[1].tv_sec;
+                ts[1].tv_nsec = (long)t[1].tv_usec * 1000;
+                return utimensat(AT_FDCWD, f, ts, AT_SYMLINK_NOFOLLOW);
+            }
+            #define WUTIMES_NOFOLLOW(f,t)    wUtimesNoFollow((f),(t))
+        #endif
+    #endif
+
+    /* Set a file's access and modification times from seconds since the
+     * epoch. Ports with no way to set them leave these undefined. */
+    #if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_NO_UTIMES)
+        #include <sys/time.h>
+        static inline int wSetTime(const char* f, unsigned int atime,
+                unsigned int mtime)
+        {
+            struct timeval t[2];
+
+            t[0].tv_sec  = (time_t)atime;
+            t[0].tv_usec = 0;
+            t[1].tv_sec  = (time_t)mtime;
+            t[1].tv_usec = 0;
+        #ifdef WUTIMES_NOFOLLOW
+            return WUTIMES_NOFOLLOW(f, t);
+        #else
+            return WUTIMES(f, t);
+        #endif
+        }
+        #define WSETTIME(fs,f,a,m)  wSetTime((f),(a),(m))
+
+        #ifdef WFUTIMES
+            static inline int wFSetTime(int fd, unsigned int atime,
+                    unsigned int mtime)
+            {
+                struct timeval t[2];
+
+                t[0].tv_sec  = (time_t)atime;
+                t[0].tv_usec = 0;
+                t[1].tv_sec  = (time_t)mtime;
+                t[1].tv_usec = 0;
+                return WFUTIMES(fd, t);
+            }
+            #define WFSETTIME(fs,fd,a,m)  wFSetTime((fd),(a),(m))
+        #endif
     #endif
 
     #ifndef USE_WINDOWS_API
         #define WCHMOD(fs,f,m)   chmod((f),(m))
         #define WFCHMOD(fs,fd,m) fchmod((fd),(m))
     #else
-        #define WCHMOD(fs,f,m)   _chmod((f),(m))
+        #if (defined(WOLFSSH_SFTP) || defined(WOLFSSH_SCP)) && \
+            !defined(_WIN32_WCE)
+            /* _chmod() wants a Windows path, but SFTP names arrive with a
+             * leading root. WS_ChmodA() trims it as the other wrappers do. */
+            WOLFSSH_LOCAL int WS_ChmodA(const char* fileName, int mode,
+                    void* heap);
+            #define WCHMOD(fs,f,m)   WS_ChmodA((f),(m),NULL)
+        #else
+            #define WCHMOD(fs,f,m)   _chmod((f),(m))
+        #endif
         #define WFCHMOD(fs,fd,m)   _fchmod((fd),(m))
     #endif
 
@@ -470,11 +566,15 @@ extern "C" {
                     unsigned long desiredAccess, unsigned long shareMode,
                     unsigned long creationDisposition, unsigned long flags,
                     void* heap);
-            WOLFSSH_LOCAL void* WS_FindFirstFileA(const char* fileName,
+            WOLFSSH_API void* WS_FindFirstFileA(const char* fileName,
                     char* realFileName, size_t realFileNameSz, int* isDir,
                     void* heap);
-            WOLFSSH_LOCAL int WS_FindNextFileA(void* findHandle,
+            WOLFSSH_API int WS_FindNextFileA(void* findHandle,
                     char* realFileName, size_t realFileNameSz);
+            /* lastError is set on every return, 0 on success */
+            WOLFSSH_LOCAL int WS_FindNextFileA_ex(void* findHandle,
+                    char* realFileName, size_t realFileNameSz,
+                    unsigned long* lastError);
             WOLFSSH_LOCAL int WS_GetFileAttributesExA(const char* fileName,
                     void* fileInfo, void* heap);
             WOLFSSH_LOCAL int WS_RemoveDirectoryA(const char* dirName,
@@ -523,18 +623,25 @@ extern "C" {
     #define WSTRNCMP(s1,s2,n) strncmp((s1),(s2),(n))
     #define WSTRSPN(s1,s2)    strspn((s1),(s2))
     #define WSTRCSPN(s1,s2)   strcspn((s1),(s2))
-    #define WSTRSEP(s,d)      strsep((s),(d))
     #define WSTRCAT(s1,s2)    strcat((s1),(s2))
     #define WSTRCPY(s1,s2)    strcpy((s1),(s2))
 
     /* for these string functions use internal versions */
-    WOLFSSH_API char* wstrnstr(const char*, const char*, unsigned int);
-    WOLFSSH_API char* wstrncat(char*, const char*, size_t);
-    WOLFSSH_API char* wstrdup(const char*, void*, int);
+    WOLFSSH_API char* wstrnstr(const char* s1, const char* s2, unsigned int n);
+    WOLFSSH_API char* wstrncat(char* s1, const char* s2, size_t n);
+    WOLFSSH_API char* wstrdup(const char* s1, void* heap, int type);
     #define WSTRNSTR(s1,s2,n) wstrnstr((s1),(s2),(n))
     #define WSTRNCAT(s1,s2,n) wstrncat((s1),(s2),(n))
     #define WSTRDUP(s,h,t)    wstrdup((s),(h),(t))
     #define WSTRCHR(s,c) strchr((s),(c))
+
+    #ifndef USE_WINDOWS_API
+        #define WSTRSEP(s,d)      strsep((s),(d))
+    #else
+        /* strsep() is a BSD extension not provided by MSVCRT/MinGW */
+        WOLFSSH_API char* wstrsep(char** s1, const char* delim);
+        #define WSTRSEP(s,d)      wstrsep((s),(d))
+    #endif
 
     #ifdef USE_WINDOWS_API
         #define WSTRNCPY(s1,s2,n) strncpy_s((s1),(n),(s2),(n))
@@ -584,6 +691,14 @@ extern "C" {
     #endif
 #endif /* WSTRING_USER */
 
+/* Measures a formatted string's length; _snprintf_s rejects the NULL/0 probe
+ * form that WSNPRINTF maps to on Windows. Defined outside WSTRING_USER so
+ * custom string ports need not supply it, and left overridable. */
+#if defined(USE_WINDOWS_API) && !defined(WSCPRINTF)
+    #include <stdio.h>
+    #define WSCPRINTF(f,...) _scprintf((f),##__VA_ARGS__)
+#endif
+
 /* get local time for debug print out */
 #if defined(USE_WINDOWS_API) || defined(__MINGW32__)
     #define WTIME time
@@ -612,6 +727,8 @@ extern "C" {
     #define WOLFSSH_NO_TIMESTAMP /* no strftime() */
 #elif defined(WOLFSSH_ZEPHYR)
     #define WTIME time
+    /* Zephyr's minimal libc provides gmtime_r but not localtime_r,
+     * so timestamps are reported in UTC on this platform. */
     #define WLOCALTIME(c,r) (gmtime_r((c),(r))!=NULL)
 #elif defined(WOLFSSL_NUCLEUS)
     #define WTIME time
@@ -643,6 +760,23 @@ extern "C" {
             #define SIZEOF_OFF_T 4
         #endif
     #endif
+
+    /* Assemble the two words of a split file offset into one value */
+    static inline int wResolveOffset(const unsigned int* shortOffset,
+            word64 maxOffset, word64* offset)
+    {
+        word64 combined;
+
+        if (shortOffset == NULL || offset == NULL)
+            return -1;
+
+        combined = ((word64)shortOffset[1] << 32) | (word64)shortOffset[0];
+        if (combined > maxOffset)
+            return -1;
+
+        *offset = combined;
+        return 0;
+    }
 
 #if defined(WOLFSSH_USER_FILESYSTEM)
     /* User-defined I/O support, this should be at the top of the ports list
@@ -1117,7 +1251,7 @@ extern "C" {
                 fseek(fd, ofst, 0);
             }
 
-            return fwrite(buf, sz, 1, fd);
+            return fwrite(buf, sizeof(unsigned char), sz, fd);
         }
         #define WPWRITE(fs,fd,b,s,o) wPwrite((fd),(b),(s),(o))
     #endif
@@ -1133,7 +1267,7 @@ extern "C" {
             fseek(fd, ofst, 0);
         }
 
-        return fread(buf, 1, sz, fd);
+        return fread(buf, sizeof(unsigned char), sz, fd);
     }
     #define WPREAD(fs,fd,b,s,o)  wPread((fd),(b),(s),(o))
 #endif
@@ -1270,7 +1404,7 @@ extern "C" {
 
         /* Set attribute value */
         atr = atr & 0xF0; /* clear first byte */
-        if (mode == 0x124) {
+        if (mode == 0444) {
             atr |= AM_RDO;   /* set read only value */
         }
         else {
@@ -1313,10 +1447,13 @@ extern "C" {
     #define WGETCWD(fs,r,rSz)    _getcwd((r),(rSz))
     #define WOPEN(fs,f,m,p)      _open((f),(m),(p))
     #define WCLOSE(fs,fd)        _close((fd))
+    #define WFDOPEN(fs,f,fd,m)   ((*(f) = _fdopen((fd),(m))) == NULL)
 
     #define WFD int
-    int wPwrite(WFD, unsigned char*, unsigned int, const unsigned int*);
-    int wPread(WFD, unsigned char*, unsigned int, const unsigned int*);
+    int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
+    int wPread(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
     #define WPWRITE(fs,fd,b,s,o) wPwrite((fd),(b),(s),(o))
     #define WPREAD(fs,fd,b,s,o)  wPread((fd),(b),(s),(o))
     #define WS_DELIM          '\\'
@@ -1349,6 +1486,7 @@ extern "C" {
     #define WMKDIR(fs,p,m)    fs_mkdir((p))
     #define WRMDIR(fs,d)      fs_unlink((d))
     #define WSTAT(fs,p,b)     wssh_z_fstat((p),(b))
+    #define WLSTAT(fs,p,b)    wssh_z_fstat((p),(b))
     #define WREMOVE(fs,d)     fs_unlink((d))
     #define WRENAME(fs,o,n)   fs_rename((o),(n))
     #define WS_DELIM          '/'
@@ -1372,8 +1510,10 @@ extern "C" {
     #define WOPEN(fs,p,f,m)   wssh_z_open((p),(f))
     int wssh_z_close(WFD fd);
     #define WCLOSE(fs,fd)     wssh_z_close((fd))
-    int wPwrite(WFD, unsigned char*, unsigned int, const unsigned int*);
-    int wPread(WFD, unsigned char*, unsigned int, const unsigned int*);
+    int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
+    int wPread(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
     #define WPWRITE(fs,fd,b,s,o) wPwrite((fd),(b),(s),(o))
     #define WPREAD(fs,fd,b,s,o)  wPread((fd),(b),(s),(o))
 
@@ -1387,6 +1527,7 @@ extern "C" {
     #define WMKDIR(fs,p,m)    SYS_FS_DirectoryMake((p))
     #define WRMDIR(fs,d)      SYS_FS_FileDirectoryRemove((d))
     #define WSTAT(fs,p,b)     wStat((p), (b))
+    #define WLSTAT(fs,p,b)    wStat((p), (b))
     #define WREMOVE(fs,d)     SYS_FS_FileDirectoryRemove((d))
     #define WRENAME(fs,o,n)   SYS_FS_FileDirectoryRenameMove((o),(n))
     #define WS_DELIM          '/'
@@ -1440,9 +1581,16 @@ extern "C" {
 
     /* Our "file descriptor" wrapper */
 
+    /* SYS_FS_FileSeek takes an int32_t offset */
+    #ifndef WOLFSSH_MAX_FILE_OFFSET
+        #define WOLFSSH_MAX_FILE_OFFSET W64LIT(0x7FFFFFFF)
+    #endif
+
     #define WFD SYS_FS_HANDLE
-    int wPwrite(WFD, unsigned char*, unsigned int, const unsigned int*);
-    int wPread(WFD, unsigned char*, unsigned int, const unsigned int*);
+    int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
+    int wPread(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
     #define WPWRITE(fs,fd,b,s,o) wPwrite((fd),(b),(s),(o))
     #define WPREAD(fs,fd,b,s,o)  wPread((fd),(b),(s),(o))
 
@@ -1477,10 +1625,22 @@ extern "C" {
 
     #define WOPEN(fs,f,m,p) open((f),(m),(p))
     #define WCLOSE(fs,fd) close((fd))
-    int wPwrite(WFD, unsigned char*, unsigned int, const unsigned int*);
-    int wPread(WFD, unsigned char*, unsigned int, const unsigned int*);
+    #define WFDOPEN(fs,f,fd,m) ((*(f) = fdopen((fd),(m))) == NULL)
+    int wPwrite(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
+    int wPread(WFD fd, unsigned char* buf, unsigned int sz,
+            const unsigned int* shortOffset);
     #define WPWRITE(fs,fd,b,s,o) wPwrite((fd),(b),(s),(o))
     #define WPREAD(fs,fd,b,s,o)  wPread((fd),(b),(s),(o))
+    /* Positionless write, for O_APPEND handles: pwrite() only honors
+     * O_APPEND on Linux, write() does everywhere. */
+    #define WWRITE(fs,fd,b,s)    (int)write((fd),(b),(s))
+
+
+    #define WTRUNCATE(fs,f,sz)   truncate((f),(off_t)(sz))
+    #define WFTRUNCATE(fs,fd,sz) ftruncate((fd),(off_t)(sz))
+    #define WCHOWN(fs,f,u,g)     chown((f),(uid_t)(u),(gid_t)(g))
+    #define WFCHOWN(fs,fd,u,g)   fchown((fd),(uid_t)(u),(gid_t)(g))
 
 #ifndef NO_WOLFSSH_DIR
     #include <dirent.h> /* used for opendir, readdir, and closedir */
@@ -1488,12 +1648,101 @@ extern "C" {
 
     /* returns 0 on success */
     #define WOPENDIR(fs,h,c,d)  ((*(c) = opendir((d))) == NULL)
+    #define WFDOPENDIR(fs,d,fd) ((*(d) = fdopendir((fd))) == NULL)
     #define WCLOSEDIR(fs,d)  closedir(*(d))
     #define WREADDIR(fs,d)   readdir(*(d))
     #define WREWINDDIR(fs,d) rewinddir(*(d))
 #endif /* NO_WOLFSSH_DIR */
 #endif
+
+/* Largest file offset the seek call of the port can take. A port seeking with
+ * a type narrower than off_t defines its own value ahead of this default. */
+#ifndef WOLFSSH_MAX_FILE_OFFSET
+    #if SIZEOF_OFF_T == 8
+        #define WOLFSSH_MAX_FILE_OFFSET W64LIT(0x7FFFFFFFFFFFFFFF)
+    #else
+        #define WOLFSSH_MAX_FILE_OFFSET W64LIT(0x7FFFFFFF)
+    #endif
+#endif
+
 #endif /* WOLFSSH_SFTP or WOLFSSH_SCP */
+
+/* SFTP path confinement must reject symbolic links because wolfSSH_RealPath
+ * only normalizes the path string and does not resolve them.  Define
+ * WOLFSSH_HAVE_SYMLINK on the filesystems that can actually store a link -
+ * POSIX (checked with lstat) and Windows (reparse points) - so the check is
+ * compiled out on FAT-based and similar link-less embedded filesystems, and on
+ * user-supplied filesystems that own their own policy.  Define
+ * WOLFSSH_NO_SYMLINK_CHECK to force it off. */
+#if !defined(WOLFSSH_NO_SYMLINK_CHECK) && \
+    (defined(USE_WINDOWS_API) || \
+     (!defined(WOLFSSL_NUCLEUS) && !defined(FREESCALE_MQX) && \
+      !defined(WOLFSSH_FATFS) && !defined(WOLFSSH_ZEPHYR) && \
+      !defined(MICROCHIP_MPLAB_HARMONY) && !defined(WOLFSSH_USER_FILESYSTEM) && \
+      !defined(USE_OSE_API) && !defined(NO_FILESYSTEM)))
+    #define WOLFSSH_HAVE_SYMLINK
+#endif
+
+/* No-follow open flags, defined for every filesystem that can store a symlink
+ * (POSIX and Windows) so the SFTP, SCP, and SSHD code share one definition. */
+#ifdef WOLFSSH_HAVE_SYMLINK
+    #ifndef USE_WINDOWS_API
+        #include <fcntl.h> /* supplies O_NOFOLLOW/O_DIRECTORY on POSIX */
+    #endif
+    /* Open flag refusing to follow a final-component symlink, so the open is
+     * atomic against a swapped link.  0 where unavailable (Windows, link-less
+     * filesystems), where the caller falls back to a wIsSymlink check. */
+    #ifdef O_NOFOLLOW
+        #define WOLFSSH_O_NOFOLLOW O_NOFOLLOW
+    #else
+        #define WOLFSSH_O_NOFOLLOW 0
+    #endif
+    /* Require the opened path to be a directory; pairs with O_NOFOLLOW so a
+     * symlinked directory leaf is refused atomically.  0 where unavailable. */
+    #ifdef O_DIRECTORY
+        #define WOLFSSH_O_DIRECTORY O_DIRECTORY
+    #else
+        #define WOLFSSH_O_DIRECTORY 0
+    #endif
+#endif /* WOLFSSH_HAVE_SYMLINK */
+
+/* Catch-all so callers can use WOLFSSH_O_NOFOLLOW unconditionally; resolves to
+ * 0 when symlinks are not a concern (no-symlink filesystems, opt-out builds). */
+#ifndef WOLFSSH_O_NOFOLLOW
+    #define WOLFSSH_O_NOFOLLOW 0
+#endif
+
+/* Catch-all so callers can test a seek result unconditionally.  Ports whose
+ * seek returns the new file position rather than a 0/-1 status define their
+ * own WFSEEK_SUCCESS() in the port block above; see Nucleus and MPLAB
+ * Harmony.  Any definition must evaluate its argument exactly once, as
+ * callers pass the WFSEEK() call in directly. */
+#ifndef WFSEEK_SUCCESS
+    #define WFSEEK_SUCCESS(r)   ((r) == 0)
+#endif
+
+/* wIsSymlink lives in the always-compiled port.c, but its filesystem
+ * dependencies (WSTAT_T/WLSTAT/S_ISLNK on POSIX, WS_GetFileAttributesExA on
+ * Windows) and its only callers exist solely in the SFTP and SCP code, so
+ * gate it on those features in addition to the platform capability.  Shared by
+ * the SFTP path-confinement guard and the SCP send guards. */
+#if defined(WOLFSSH_HAVE_SYMLINK) && \
+    (defined(WOLFSSH_SFTP) || defined(WOLFSSH_SCP))
+    WOLFSSH_LOCAL int wIsSymlink(const char* path);
+
+    /* Open a file for reading without following a final-component symlink.
+     * Returns 0 on success, non-zero on failure, matching the wfopen
+     * convention.  Shared, un-followed read-open used by the SCP send guards. */
+    WOLFSSH_LOCAL int wFopenNoFollow(void* fs, WFILE** f, const char* path);
+    /* Open a directory without following a final-component symlink; returns 0
+     * on success, non-zero on failure, matching WOPENDIR.  Not provided for
+     * Windows, which opens directories via WS_FindFirstFileA, nor when the
+     * directory macros are compiled out (NO_WOLFSSH_DIR). */
+    #if !defined(USE_WINDOWS_API) && !defined(NO_WOLFSSH_DIR)
+        WOLFSSH_LOCAL int wOpendirNoFollow(void* fs, WDIR* dir,
+                const char* path);
+    #endif
+#endif
 
 #ifndef WS_MAYBE_UNUSED
     #if (defined(__GNUC__) && (__GNUC__ >= 4)) || defined(__clang__) || \
@@ -1541,6 +1790,7 @@ extern "C" {
 #if !defined(NO_TERMIOS) && defined(WOLFSSH_TERM)
     #if !defined(USE_WINDOWS_API) && !defined(MICROCHIP_PIC32)
         #include <termios.h>
+        #include <unistd.h>
         #define WOLFSSH_TERMIOS struct termios
     #elif defined(USE_WINDOWS_API)
         #define WOLFSSH_TERMIOS DWORD

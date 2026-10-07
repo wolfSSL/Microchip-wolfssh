@@ -1,0 +1,610 @@
+#!/bin/sh
+
+# Bulk data through a local direct-tcpip forward.
+#
+#   [nc client] --plain--> :$entry_port [portfwd]
+#                                  |
+#                                 SSH
+#                                  |
+#                          [echoserver] --plain--> :$target_port [nc server]
+#
+# scripts/fwd.test moves a few hundred bytes, so nothing in the suite
+# exercises a forward past its first window. Phase 1 pushes a payload several
+# windows long and compares the bytes that come out. Phase 2 ends a transfer
+# one window plus a short tail in, the point where the tail is still sitting
+# in portfwd's buffer waiting on window credit when the local socket reports
+# end-of-input. Phase 3 echoes the payload back while the client keeps sending
+# but stops reading for a while. Phase 4 ends a forward while the echoserver
+# still holds bytes for its target, then checks that the next forward's target
+# gets only its own bytes.
+#
+# The listening nc takes its stdin from a long sleep on purpose. Reading
+# end-of-input on stdin makes nc close the connection, which truncates the
+# transfer at whatever point the close lands and looks exactly like a
+# forwarding stall.
+
+no_pid=-1
+hold_pid=$no_pid
+nc_server_pid=$no_pid
+server_pid=$no_pid
+portfwd_pid=$no_pid
+nc_client_pid=$no_pid
+tail_hold_pid=$no_pid
+tail_nc_server_pid=$no_pid
+tail_server_pid=$no_pid
+tail_portfwd_pid=$no_pid
+tail_nc_client_pid=$no_pid
+echo_target_pid=$no_pid
+echo_server_pid=$no_pid
+echo_ssh_hold_pid=$no_pid
+echo_ssh_pid=$no_pid
+echo_client_pid=$no_pid
+reuse_target_pid=$no_pid
+reuse_client_pid=$no_pid
+work_dir="`pwd`/wolfssh_fwd_bulk$$"
+ready_file="$work_dir/ready"
+fwd_ready_file="$work_dir/fwd_ready"
+payload="$work_dir/payload"
+hold_fifo="$work_dir/hold"
+received="$work_dir/received"
+server_log="$work_dir/server.log"
+portfwd_log="$work_dir/portfwd.log"
+tail_payload="$work_dir/tail_payload"
+tail_received="$work_dir/tail_received"
+tail_server_log="$work_dir/tail_server.log"
+tail_portfwd_log="$work_dir/tail_portfwd.log"
+echo_payload="$work_dir/echo_payload"
+echo_received="$work_dir/echo_received"
+echo_target_ready="$work_dir/echo_target_ready"
+echo_ready_file="$work_dir/echo_ready"
+echo_ssh_fifo="$work_dir/echo_ssh_hold"
+echo_askpass="$work_dir/echo_askpass"
+echo_server_log="$work_dir/echo_server.log"
+echo_ssh_log="$work_dir/echo_ssh.log"
+reuse_target_ready="$work_dir/reuse_target_ready"
+reuse_stalled="$work_dir/reuse_stalled"
+reuse_closed="$work_dir/reuse_closed"
+reuse_expected="$work_dir/reuse_expected"
+reuse_received="$work_dir/reuse_received"
+# Several times the 128K default window, so the transfer cannot finish
+# without the window being credited back at least once. The size the
+# receiver is held to is read back from the file dd made.
+payload_blocks=2000
+payload_size=0
+entry_port=0
+target_port=0
+port=0
+counter=0
+# Phase 2. One default window plus a tail short enough to be read in a single
+# pass, so the tail is what portfwd is holding when end-of-input arrives.
+# Whether the credit for the window beats the tail is a race, won here about
+# half the time and never on some hosts, so the transfer is repeated. A build
+# that overrides DEFAULT_WINDOW_SZ just moves bytes and proves nothing.
+tail_window_size=131072
+tail_size=2000
+tail_attempts=6
+tail_payload_size=0
+tail_entry_port=0
+tail_target_port=0
+tail_got=0
+# Seconds to wait for the payload. Generous: the point is that a stalled
+# forward fails this test instead of hanging make check.
+transfer_limit=90
+# Consecutive seconds with no new bytes before calling it stalled.
+stall_limit=15
+# Phase 3. Well past the point a deadlocked forward stops (under 9 MB on the
+# hosts measured), with a stall long enough to fill the socket buffers both
+# ways. The phase's own stall limit has to outlast that pause.
+echo_payload_blocks=32000
+echo_payload_size=0
+echo_pause_after=1000000
+echo_pause_secs=10
+echo_stall_limit=20
+echo_entry_port=0
+echo_target_port=0
+# Phase 4. The second connection's payload, and seconds to wait for it.
+reuse_message="second connection"
+reuse_limit=30
+reuse_entry_port=0
+reuse_target_port=0
+
+[ ! -x "`command -v nc`" ] && echo "nc doesn't exist, skipping" && exit 77
+[ ! -x ./examples/echoserver/echoserver ] \
+    && echo "echoserver doesn't exist, skipping" && exit 77
+./examples/echoserver/echoserver '-?' 2>&1 | grep -q "^echoserver " \
+    || { echo "echoserver doesn't run, skipping"; exit 77; }
+[ ! -x ./examples/portfwd/portfwd ] \
+    && echo "portfwd doesn't exist, skipping" && exit 77
+./examples/portfwd/portfwd '-?' 2>&1 | grep -q "does not exist" \
+    && { echo "forwarding not compiled in, skipping"; exit 77; }
+
+WOLFSSH_OPTIONS=`./apps/wolfssh-options` || {
+    echo "fail: could not run ./apps/wolfssh-options"
+    exit 1
+}
+echo "$WOLFSSH_OPTIONS" | grep -qx "TEST_BLOCK" \
+    && { echo "portfwd does not support non-blocking mode, skipping test"
+         exit 77; }
+
+do_cleanup() {
+    for pid in $nc_client_pid $portfwd_pid $server_pid $nc_server_pid \
+            $hold_pid $tail_nc_client_pid $tail_portfwd_pid \
+            $tail_server_pid $tail_nc_server_pid $tail_hold_pid \
+            $echo_client_pid $echo_ssh_pid $echo_ssh_hold_pid \
+            $echo_server_pid $echo_target_pid $reuse_client_pid \
+            $reuse_target_pid
+    do
+        if [ "$pid" != "$no_pid" ]
+        then
+            kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+    done
+    rm -rf "$work_dir"
+}
+
+# The failure here is usually just a byte count; the logs name the cause.
+do_dump_logs() {
+    for log in "$server_log" "$portfwd_log" "$tail_server_log" \
+            "$tail_portfwd_log" "$echo_server_log" "$echo_ssh_log"
+    do
+        [ -f "$log" ] || continue
+        echo "--- `basename "$log"` ---"
+        cat "$log" 2>/dev/null
+    done
+}
+
+do_fail() {
+    echo "$1"
+    do_dump_logs
+    do_cleanup
+    exit 1
+}
+
+do_trap() {
+    echo "got trap"
+    do_cleanup
+    exit 1
+}
+
+trap do_trap INT TERM
+
+do_reap_tail() {
+    for pid in $tail_nc_client_pid $tail_portfwd_pid $tail_server_pid \
+            $tail_nc_server_pid $tail_hold_pid
+    do
+        if [ "$pid" != "$no_pid" ]
+        then
+            kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+    done
+    tail_nc_client_pid=$no_pid
+    tail_portfwd_pid=$no_pid
+    tail_server_pid=$no_pid
+    tail_nc_server_pid=$no_pid
+    tail_hold_pid=$no_pid
+}
+
+# One window-plus-tail transfer through a forward of its own, leaving the
+# bytes that arrived in tail_got. Each attempt takes its own ports: the
+# previous one's are in TIME_WAIT.
+do_tail_attempt() {
+    tail_entry_port=`expr 16000 + $1 \* 1000 + \( $$ % 1000 \)`
+    tail_target_port=`expr 22000 + $1 \* 1000 + \( $$ % 1000 \)`
+    tail_fifo="$work_dir/tail_hold.$1"
+    tail_ready_file="$work_dir/tail_ready.$1"
+    tail_fwd_ready_file="$work_dir/tail_fwd_ready.$1"
+    tail_got=0
+    rm -f "$tail_received"
+
+    mkfifo "$tail_fifo" || do_fail "couldn't make the fifo"
+    sleep 300 > "$tail_fifo" 2>/dev/null &
+    tail_hold_pid=$!
+    nc -l $tail_target_port < "$tail_fifo" > "$tail_received" 2>/dev/null &
+    tail_nc_server_pid=$!
+
+    sleep 0.2
+    kill -0 "$tail_nc_server_pid" 2>/dev/null \
+        || do_fail "couldn't listen on port $tail_target_port, is it in use?"
+
+    ./examples/echoserver/echoserver -1 -f -R "$tail_ready_file" \
+        > "$tail_server_log" 2>&1 &
+    tail_server_pid=$!
+
+    counter=0
+    while [ ! -s "$tail_ready_file" ] && [ "$counter" -lt 20 ]; do
+        sleep 0.1
+        counter=`expr $counter + 1`
+    done
+    [ -s "$tail_ready_file" ] \
+        || do_fail "no ready file, echoserver didn't start"
+
+    ./examples/portfwd/portfwd -u jill -P upthehill \
+        -p `cat "$tail_ready_file"` \
+        -f $tail_entry_port -t $tail_target_port -R "$tail_fwd_ready_file" \
+        > "$tail_portfwd_log" 2>&1 &
+    tail_portfwd_pid=$!
+
+    counter=0
+    while [ ! -s "$tail_fwd_ready_file" ] && [ "$counter" -lt 20 ]; do
+        sleep 0.1
+        counter=`expr $counter + 1`
+    done
+    [ -s "$tail_fwd_ready_file" ] \
+        || do_fail "no ready file, portfwd didn't start"
+
+    nc 127.0.0.1 $tail_entry_port < "$tail_payload" > /dev/null 2>&1 &
+    tail_nc_client_pid=$!
+
+    # A dropped tail leaves the count one tail short of the payload, so stop
+    # as soon as it stops moving instead of waiting the whole limit out.
+    counter=0
+    last=-1
+    while [ "$tail_got" -lt "$tail_payload_size" ] && [ "$counter" -lt 24 ]
+    do
+        sleep 0.5
+        counter=`expr $counter + 1`
+        tail_got=`wc -c < "$tail_received" 2>/dev/null | tr -d ' '`
+        [ -z "$tail_got" ] && tail_got=0
+        [ "$tail_got" = "$last" ] && [ "$counter" -gt 4 ] && break
+        last=$tail_got
+    done
+
+    do_reap_tail
+}
+
+mkdir -p "$work_dir" || { echo "couldn't make the work directory"; exit 1; }
+
+# portfwd and nc bind what they are told, so the plaintext ports have to be
+# picked here. Stamped with the pid so concurrent runs of the suite do not
+# collide, kept below the ephemeral range so an outgoing connection cannot
+# take one first, and clear of the ports fwd.test.expect hardcodes.
+entry_port=`expr 14000 + \( $$ % 1000 \)`
+target_port=`expr 15000 + \( $$ % 1000 \)`
+
+dd if=/dev/urandom of="$payload" bs=1000 count=$payload_blocks 2>/dev/null \
+    || { echo "couldn't make the payload"; do_cleanup; exit 1; }
+payload_size=`wc -c < "$payload" | tr -d ' '`
+[ "$payload_size" -gt 0 ] \
+    || { echo "couldn't make the payload"; do_cleanup; exit 1; }
+
+# nc closes the connection when it reads end-of-input on stdin, which
+# truncates the transfer. Hold stdin open with a sleep on the far side of a
+# fifo, so both ends have a pid this script can reap.
+mkfifo "$hold_fifo" || { echo "couldn't make the fifo"; do_cleanup; exit 1; }
+sleep 300 > "$hold_fifo" 2>/dev/null &
+hold_pid=$!
+nc -l $target_port < "$hold_fifo" > "$received" 2>/dev/null &
+nc_server_pid=$!
+
+# A port already in use makes nc exit at once, and the echoserver's connect
+# would then be refused. Catch that here, or it reports as a stall.
+sleep 0.2
+if ! kill -0 "$nc_server_pid" 2>/dev/null
+then
+    nc_server_pid=$no_pid
+    echo "couldn't listen on port $target_port, is it in use?"
+    do_cleanup
+    exit 1
+fi
+
+./examples/echoserver/echoserver -1 -f -R "$ready_file" \
+    > "$server_log" 2>&1 &
+server_pid=$!
+
+counter=0
+while [ ! -s "$ready_file" ] && [ "$counter" -lt 20 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+[ -s "$ready_file" ] || do_fail "no ready file, echoserver didn't start"
+port=`cat "$ready_file"`
+
+./examples/portfwd/portfwd -u jill -P upthehill -p "$port" \
+    -f $entry_port -t $target_port -R "$fwd_ready_file" \
+    > "$portfwd_log" 2>&1 &
+portfwd_pid=$!
+
+counter=0
+while [ ! -s "$fwd_ready_file" ] && [ "$counter" -lt 20 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+[ -s "$fwd_ready_file" ] || do_fail "no ready file, portfwd didn't start"
+
+nc 127.0.0.1 $entry_port < "$payload" > /dev/null 2>&1 &
+nc_client_pid=$!
+
+counter=0
+got=0
+last=0
+stalled=0
+while [ "$got" -lt "$payload_size" ] && [ "$counter" -lt "$transfer_limit" ]
+do
+    sleep 1
+    counter=`expr $counter + 1`
+    got=`wc -c < "$received" 2>/dev/null | tr -d ' '`
+    [ -z "$got" ] && got=0
+    # Give up early once the byte count stops moving, so a stalled forward
+    # reports in seconds instead of burning the whole limit.
+    if [ "$got" -eq "$last" ]
+    then
+        stalled=`expr $stalled + 1`
+        [ "$stalled" -ge "$stall_limit" ] && break
+    else
+        stalled=0
+        last=$got
+    fi
+done
+
+[ "$got" -eq "$payload_size" ] \
+    || do_fail "forward stalled: sent $payload_size bytes, received $got"
+
+cmp -s "$payload" "$received" \
+    || do_fail "forwarded data does not match what was sent"
+
+echo "moved $payload_size bytes through a local forward"
+
+# --- Phase 2: end the transfer one window in --------------------------------
+dd if=/dev/urandom of="$tail_payload" bs=4096 count=32 2>/dev/null \
+    && dd if=/dev/urandom bs=$tail_size count=1 2>/dev/null \
+        >> "$tail_payload" \
+    || { echo "couldn't make the payload"; do_cleanup; exit 1; }
+tail_payload_size=`wc -c < "$tail_payload" | tr -d ' '`
+[ "$tail_payload_size" -eq `expr $tail_window_size + $tail_size` ] \
+    || { echo "couldn't make the payload"; do_cleanup; exit 1; }
+
+attempt=0
+while [ "$attempt" -lt "$tail_attempts" ]
+do
+    do_tail_attempt $attempt
+    [ "$tail_got" -eq "$tail_payload_size" ] \
+        || do_fail "dropped the tail: sent $tail_payload_size, got $tail_got"
+    cmp -s "$tail_payload" "$tail_received" \
+        || do_fail "the tail transfer does not match what was sent"
+    attempt=`expr $attempt + 1`
+done
+
+echo "ended $tail_attempts transfers on a window boundary"
+
+# --- Phase 3: echo both ways while the client stops reading -----------------
+# Both clients have to keep sending while they stop reading. portfwd and nc
+# stop both ways once their output blocks, so this uses OpenSSH and python.
+if [ ! -x "`command -v python3`" ] || [ ! -x "`command -v ssh`" ]
+then
+    echo "skipping phases 3 and 4: they need python3 and ssh"
+    do_cleanup
+    exit 0
+fi
+
+echo_entry_port=`expr 28000 + \( $$ % 1000 \)`
+echo_target_port=`expr 29000 + \( $$ % 1000 \)`
+reuse_entry_port=`expr 30000 + \( $$ % 1000 \)`
+reuse_target_port=`expr 31000 + \( $$ % 1000 \)`
+
+dd if=/dev/urandom of="$echo_payload" bs=1000 count=$echo_payload_blocks \
+    2>/dev/null || do_fail "couldn't make the payload"
+echo_payload_size=`wc -c < "$echo_payload" | tr -d ' '`
+
+# Reads the next chunk only once the last one has gone back, so it stops
+# reading when it cannot write. Once the whole payload is back it ends its
+# side, and exits when the echoserver has closed the forward.
+python3 -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)
+open(sys.argv[2], "w").write("up")
+c = s.accept()[0]
+left = int(sys.argv[3])
+while left > 0:
+    d = c.recv(min(65536, left))
+    if not d:
+        break
+    c.sendall(d)
+    left -= len(d)
+c.shutdown(socket.SHUT_WR)
+while c.recv(65536):
+    pass
+' $echo_target_port "$echo_target_ready" $echo_payload_size 2>/dev/null &
+echo_target_pid=$!
+
+counter=0
+while [ ! -s "$echo_target_ready" ] && [ "$counter" -lt 30 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+[ -s "$echo_target_ready" ] \
+    || do_fail "couldn't listen on port $echo_target_port, is it in use?"
+
+./examples/echoserver/echoserver -1 -f -R "$echo_ready_file" \
+    > "$echo_server_log" 2>&1 &
+echo_server_pid=$!
+
+counter=0
+while [ ! -s "$echo_ready_file" ] && [ "$counter" -lt 20 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+[ -s "$echo_ready_file" ] || do_fail "no ready file, echoserver didn't start"
+
+# The echoserver only serves a forward alongside a session. Hold the
+# session's stdin open: its end-of-input would end the session and take the
+# forward with it. Log in with a password: a user key needs an algorithm the
+# build may leave out.
+printf '#!/bin/sh\necho upthehill\n' > "$echo_askpass" \
+    && chmod 700 "$echo_askpass" \
+    || do_fail "couldn't stage the password helper"
+mkfifo "$echo_ssh_fifo" || do_fail "couldn't make the fifo"
+sleep 300 > "$echo_ssh_fifo" 2>/dev/null &
+echo_ssh_hold_pid=$!
+SSH_ASKPASS="$echo_askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+ssh -v -T -F /dev/null -o PreferredAuthentications=password \
+    -o NumberOfPasswordPrompts=1 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ExitOnForwardFailure=yes -p `cat "$echo_ready_file"` \
+    -L $echo_entry_port:127.0.0.1:$echo_target_port \
+    -L $reuse_entry_port:127.0.0.1:$reuse_target_port jill@127.0.0.1 \
+    < "$echo_ssh_fifo" > /dev/null 2> "$echo_ssh_log" &
+echo_ssh_pid=$!
+
+# Connecting to check would take the target's one connection, so wait for
+# ssh to say the listener is up instead.
+counter=0
+while ! grep -q "Local forwarding listening on" "$echo_ssh_log" 2>/dev/null \
+        && [ "$counter" -lt 50 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+grep -q "Local forwarding listening on" "$echo_ssh_log" \
+    || do_fail "ssh didn't set up the forward"
+
+python3 -c '
+import socket, sys, threading, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+def send():
+    with open(sys.argv[2], "rb") as f:
+        while True:
+            b = f.read(65536)
+            if not b:
+                return
+            s.sendall(b)
+threading.Thread(target=send, daemon=True).start()
+got, paused = 0, False
+with open(sys.argv[3], "wb") as out:
+    while True:
+        if not paused and got >= int(sys.argv[4]):
+            time.sleep(float(sys.argv[5]))
+            paused = True
+        d = s.recv(65536)
+        if not d:
+            break
+        out.write(d)
+        out.flush()
+        got += len(d)
+' $echo_entry_port "$echo_payload" "$echo_received" $echo_pause_after \
+    $echo_pause_secs 2>/dev/null &
+echo_client_pid=$!
+
+counter=0
+got=0
+last=0
+stalled=0
+while [ "$got" -lt "$echo_payload_size" ] \
+        && [ "$counter" -lt "$transfer_limit" ]
+do
+    sleep 1
+    counter=`expr $counter + 1`
+    got=`wc -c < "$echo_received" 2>/dev/null | tr -d ' '`
+    [ -z "$got" ] && got=0
+    if [ "$got" -eq "$last" ]
+    then
+        stalled=`expr $stalled + 1`
+        [ "$stalled" -ge "$echo_stall_limit" ] && break
+    else
+        stalled=0
+        last=$got
+    fi
+done
+
+[ "$got" -eq "$echo_payload_size" ] \
+    || do_fail "two-way forward stalled: sent $echo_payload_size, echoed $got"
+cmp -s "$echo_payload" "$echo_received" \
+    || do_fail "the echoed data does not match what was sent"
+
+echo "echoed $echo_payload_size bytes both ways while the reader stalled"
+
+# --- Phase 4: a new forward starts empty ------------------------------------
+# The echoserver serves one forward at a time, so wait for Phase 3's target
+# to see its forward closed.
+counter=0
+while kill -0 $echo_target_pid 2>/dev/null && [ "$counter" -lt 100 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+kill -0 $echo_target_pid 2>/dev/null \
+    && do_fail "the echoserver didn't close the first forward"
+
+# Never reads the first connection, and closes its side once the client has
+# stalled. Records what the second connection brings.
+python3 -c '
+import os, socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(2)
+open(sys.argv[2], "w").write("up")
+a = s.accept()[0]
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.1)
+a.shutdown(socket.SHUT_WR)
+time.sleep(0.5)
+while a.recv(65536):
+    pass
+open(sys.argv[4], "w").write("closed")
+b = s.accept()[0]
+b.settimeout(5)
+got = b""
+try:
+    while len(got) < int(sys.argv[6]):
+        d = b.recv(65536)
+        if not d:
+            break
+        got += d
+except socket.timeout:
+    pass
+open(sys.argv[5], "wb").write(got)
+' $reuse_target_port "$reuse_target_ready" "$reuse_stalled" "$reuse_closed" \
+    "$reuse_received" `printf '%s' "$reuse_message" | wc -c` 2>/dev/null &
+reuse_target_pid=$!
+
+counter=0
+while [ ! -s "$reuse_target_ready" ] && [ "$counter" -lt 30 ]; do
+    sleep 0.1
+    counter=`expr $counter + 1`
+done
+[ -s "$reuse_target_ready" ] \
+    || do_fail "couldn't listen on port $reuse_target_port, is it in use?"
+
+# Sends until a second passes with nothing taken, then opens the second
+# connection once the first is closed.
+python3 -c '
+import os, socket, sys, time
+a = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+a.setblocking(False)
+chunk = b"A" * 65536
+deadline = time.time() + 20
+idle = time.time()
+while time.time() - idle < 1 and time.time() < deadline:
+    try:
+        if a.send(chunk) > 0:
+            idle = time.time()
+    except BlockingIOError:
+        time.sleep(0.05)
+open(sys.argv[2], "w").write("stalled")
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.1)
+b = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+b.sendall(sys.argv[4].encode())
+time.sleep(60)
+' $reuse_entry_port "$reuse_stalled" "$reuse_closed" "$reuse_message" \
+    2>/dev/null &
+reuse_client_pid=$!
+
+counter=0
+while [ ! -f "$reuse_received" ] && [ "$counter" -lt "$reuse_limit" ]; do
+    sleep 1
+    counter=`expr $counter + 1`
+done
+[ -f "$reuse_received" ] \
+    || do_fail "the second forward never reached its target"
+printf '%s' "$reuse_message" > "$reuse_expected"
+cmp -s "$reuse_expected" "$reuse_received" \
+    || do_fail "the second forward's target got `wc -c < "$reuse_received" \
+        | tr -d ' '` bytes, expected only \"$reuse_message\""
+
+echo "a new forward carried only its own bytes"
+do_cleanup
+exit 0

@@ -92,8 +92,8 @@ static void ShowUsage(void)
     printf(" -x            exit after successful connection without doing\n"
            "               read/write\n");
 #ifdef WOLFSSH_TEST_BLOCK
-    printf("-N            non-blocking sockets required when compiled with "
-                          "WOLFSSH_TEST_BLOCK\n");
+    printf(" -N            non-blocking sockets, required when compiled with\n"
+           "               WOLFSSH_TEST_BLOCK\n");
 #else
     printf(" -N            use non-blocking sockets\n");
 #endif
@@ -135,7 +135,6 @@ static int NonBlockSSH_connect(WOLFSSH* ssh)
     int ret;
     int error;
     SOCKET_T sockfd;
-    int select_ret = 0;
 
     ret = wolfSSH_connect(ssh);
     error = wolfSSH_get_error(ssh);
@@ -149,23 +148,13 @@ static int NonBlockSSH_connect(WOLFSSH* ssh)
         else if (error == WS_WANT_WRITE)
             printf("... client would write block\n");
 
-        select_ret = tcp_select(sockfd, 1);
+        /* tcp_select only throttles the loop, always retry. On want write
+         * there may be pending data to send, and on want read a test case
+         * may have forced the want read with no more data coming in. */
+        (void)tcp_select(sockfd, 1);
 
-        /* Continue in want write cases even if did not select on socket
-         * because there could be pending data to be written. Added continue
-         * on want write for test cases where a forced want read was introduced
-         * and the socket will not be receiving more data. */
-        if (error == WS_WANT_WRITE || error == WS_WANT_READ ||
-            select_ret == WS_SELECT_RECV_READY ||
-            select_ret == WS_SELECT_ERROR_READY)
-        {
-            ret = wolfSSH_connect(ssh);
-            error = wolfSSH_get_error(ssh);
-        }
-        else if (select_ret == WS_SELECT_TIMEOUT)
-            error = WS_WANT_READ;
-        else
-            error = WS_FATAL_ERROR;
+        ret = wolfSSH_connect(ssh);
+        error = wolfSSH_get_error(ssh);
     }
 
     return ret;
@@ -354,6 +343,7 @@ static THREAD_RET readInput(void* in)
     int  bufSz = sizeof(buf);
     thread_args* args = (thread_args*)in;
     int ret = 0;
+    int err = 0;
     word32 sz = 0;
 #ifdef USE_WINDOWS_API
     HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
@@ -372,18 +362,28 @@ static THREAD_RET readInput(void* in)
     #endif
         if (ret <= 0) {
             fprintf(stderr, "Error reading stdin\n");
-            return THREAD_RET_SUCCESS;
+            break;
         }
-        /* lock SSH structure access */
-        wc_LockMutex(&args->lock);
-        ret = wolfSSH_stream_send(args->ssh, buf, sz);
-        wc_UnLockMutex(&args->lock);
-        if (ret <= 0) {
-            if (ret == WS_REKEYING) {
-                continue;
+        do {
+            /* lock SSH structure access */
+            wc_LockMutex(&args->lock);
+            ret = wolfSSH_stream_send(args->ssh, buf, sz);
+            err = (ret == WS_FATAL_ERROR) ?
+                wolfSSH_get_error(args->ssh) : ret;
+            wc_UnLockMutex(&args->lock);
+            if (err == WS_REKEYING) {
+                /* give readPeer() the lock to finish the rekey, then
+                 * send this buffer again */
+            #ifdef USE_WINDOWS_API
+                Sleep(1);
+            #else
+                usleep(1000);
+            #endif
             }
+        } while (err == WS_REKEYING);
+        if (ret <= 0) {
             fprintf(stderr, "Couldn't send data\n");
-            return THREAD_RET_SUCCESS;
+            break;
         }
     }
 #if !defined(WOLFSSH_NO_ECC) && defined(FP_ECC) && defined(HAVE_THREAD_LS)
@@ -392,11 +392,16 @@ static THREAD_RET readInput(void* in)
     return THREAD_RET_SUCCESS;
 }
 
-#if defined(WOLFSSH_AGENT)
-static inline void ato32(const byte* c, word32* u32)
+#ifdef WOLFSSH_AGENT
+/* Statuses that say the relay still owes a reply rather than failing. */
+static int AgentRelayHeld(int code, int* wantsWrite)
 {
-    *u32 = (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3];
+    *wantsWrite = (code == WS_WANT_WRITE);
+    return code == WS_WANT_WRITE || code == WS_WINDOW_FULL
+        || code == WS_REKEYING;
 }
+
+
 #endif
 
 static THREAD_RET readPeer(void* in)
@@ -406,17 +411,19 @@ static THREAD_RET readPeer(void* in)
     thread_args* args = (thread_args*)in;
     int ret = 0;
     int fd = (int)wolfSSH_get_fd(args->ssh);
-    word32 bytes;
+    int  bytes;
 #ifdef USE_WINDOWS_API
     HANDLE stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
 #endif
     fd_set readSet;
+    fd_set writeSet;
     fd_set errSet;
-
-    FD_ZERO(&readSet);
-    FD_ZERO(&errSet);
-    FD_SET(fd, &readSet);
-    FD_SET(fd, &errSet);
+#ifdef WOLFSSH_AGENT
+    struct timeval timeout;
+    word32 agentChannel = 0;
+    int agentOwed = 0;
+    int agentWantsWrite = 0;
+#endif
 
 #ifdef USE_WINDOWS_API
     if (args->rawMode == 0) {
@@ -450,8 +457,54 @@ static THREAD_RET readPeer(void* in)
         (void)windowMonitor(args);
     #endif
 
-        bytes = select(fd + 1, &readSet, NULL, &errSet, NULL);
+        /* select() clears the sets, re-arm them every pass. */
+        FD_ZERO(&readSet);
+        FD_ZERO(&writeSet);
+        FD_ZERO(&errSet);
+        FD_SET(fd, &readSet);
+        FD_SET(fd, &errSet);
+
+#ifdef WOLFSSH_AGENT
+        /* Only a reply the transport is holding waits on a writable socket.
+         * One held by the peer's window or a rekey waits on the timeout. */
+        if (agentWantsWrite)
+            FD_SET(fd, &writeSet);
+
+        /* Time out so an owed reply is retried on a silent peer. Without one
+         * the wait stays event driven. */
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        bytes = select(fd + 1, &readSet, &writeSet, &errSet,
+                agentOwed ? &timeout : NULL);
+#else
+        bytes = select(fd + 1, &readSet, &writeSet, &errSet, NULL);
+#endif
+        if (bytes < 0) {
+        #ifdef USE_WINDOWS_API
+            if (WSAGetLastError() == WSAEINTR)
+                continue;
+            fprintf(stderr, "select on peer socket failed, error %d\n",
+                    WSAGetLastError());
+        #else
+            if (errno == EINTR)
+                continue;
+            perror("select on peer socket failed ");
+        #endif
+            break;
+        }
         wc_LockMutex(&args->lock);
+#ifdef WOLFSSH_AGENT
+        /* Retry the owed reply on any wake */
+        if (agentOwed) {
+            int relayRet = wolfSSH_AGENT_RelayChannel(args->ssh, agentChannel);
+
+            agentOwed = AgentRelayHeld(relayRet, &agentWantsWrite);
+            if (relayRet < 0 && !agentOwed) {
+                wc_UnLockMutex(&args->lock);
+                break;
+            }
+        }
+#endif
         while (bytes > 0 && (FD_ISSET(fd, &readSet) || FD_ISSET(fd, &errSet))) {
             /* there is something to read off the wire */
             WMEMSET(buf, 0, bufSz);
@@ -481,34 +534,31 @@ static THREAD_RET readPeer(void* in)
                     }
                     #ifdef WOLFSSH_AGENT
                     else if (ret == WS_CHAN_RXD) {
-                        byte agentBuf[512];
-                        int rxd, txd;
                         word32 channel = 0;
 
-                        wolfSSH_GetLastRxId(args->ssh, &channel);
-                        rxd = wolfSSH_ChannelIdRead(args->ssh, channel,
-                                agentBuf, sizeof(agentBuf));
-                        if (rxd > 4) {
-                            word32 msgSz = 0;
-
-                            ato32(agentBuf, &msgSz);
-                            if (msgSz > (word32)rxd - 4) {
-                                rxd += wolfSSH_ChannelIdRead(args->ssh, channel,
-                                        agentBuf + rxd,
-                                        sizeof(agentBuf) - rxd);
-                            }
-
-                            txd = rxd;
-                            rxd = sizeof(agentBuf);
-                            ret = wolfSSH_AGENT_Relay(args->ssh,
-                                    agentBuf, (word32*)&txd,
-                                    agentBuf, (word32*)&rxd);
-                            if (ret == WS_SUCCESS) {
-                                ret = wolfSSH_ChannelIdSend(args->ssh, channel,
-                                        agentBuf, rxd);
-                            }
+                        if (wolfSSH_GetLastRxId(args->ssh, &channel)
+                                == WS_SUCCESS) {
+                            ret = wolfSSH_AGENT_RelayChannel(args->ssh,
+                                    channel);
+                            agentChannel = channel;
+                            agentOwed = AgentRelayHeld(ret, &agentWantsWrite);
                         }
-                        WMEMSET(agentBuf, 0, sizeof(agentBuf));
+                        else {
+                            ret = WS_FATAL_ERROR;
+                            agentOwed = 0;
+                        }
+                        if (ret < 0 && !agentOwed) {
+                            /* Leave the read loop; the channel is no
+                             * longer safe to send on. */
+                            break;
+                        }
+                        /* Back to select(), which is where the owed reply
+                         * is retried. A held status is not an error, so
+                         * keep the outer loop alive. */
+                        if (agentOwed) {
+                            ret = WS_SUCCESS;
+                            bytes = 0;
+                        }
                         continue;
                     }
                     #endif /* WOLFSSH_AGENT */
@@ -532,7 +582,7 @@ static THREAD_RET readPeer(void* in)
                 buf[bufSz - 1] = '\0';
 
             #ifdef USE_WINDOWS_API
-                if (WriteFile(stdoutHandle, buf, bufSz, &writtn, NULL) == FALSE) {
+                if (WriteFile(stdoutHandle, buf, (DWORD)ret, &writtn, NULL) == FALSE) {
                     err_sys("Failed to write to stdout handle");
                 }
             #else
@@ -867,6 +917,10 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
         err_sys("You must specify a password for the TPM key");
     }
 #endif
+#ifdef WOLFSSH_NO_RSA
+    userEcc = 1;
+#endif
+
     ret = ClientSetPrivateKey(privKeyName, userEcc, NULL, tpmKeyAuth);
     if (ret != 0) {
         err_sys("Error setting private key");
@@ -972,7 +1026,10 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
                 printf("\t%d: %s\n", idx, current);
             }
         } while (current != NULL);
-        printf("Set Key: %s\n\n", wolfSSH_GetAlgoListKey(ssh));
+        printf("Set Key: %s\n", wolfSSH_GetAlgoListKey(ssh));
+        /* Separate table from the host key list; both must gate alike. */
+        printf("Set Key Accepted: %s\n\n",
+                wolfSSH_GetAlgoListKeyAccepted(ssh));
 
         idx = 0;
         printf("Cipher:\n");
@@ -1152,7 +1209,7 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
             if (ret <= 0) {
                 ret = wolfSSH_get_error(ssh);
                 if (ret != WS_WANT_READ && ret != WS_WANT_WRITE &&
-                        ret != WS_CHAN_RXD) {
+                        ret != WS_CHAN_RXD && ret != WS_EOF) {
                     ClientFreeBuffers(pubKeyName, privKeyName, NULL);
                     wolfSSH_free(ssh);
                     wolfSSH_CTX_free(ctx);
@@ -1161,18 +1218,22 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
             }
         } while (ret == WS_WANT_READ || ret == WS_WANT_WRITE);
 
-        rxBuf[ret] = '\0';
-        printf("Server said: %s\n", rxBuf);
+        if (ret > 0 && ret < (int)sizeof(rxBuf)) {
+            rxBuf[ret] = '\0';
+            printf("Server said: %s\n", rxBuf);
+        }
 
 #if defined(WOLFSSL_PTHREADS) && defined(WOLFSSL_TEST_GLOBAL_REQ)
         sleep(10);
 #endif
     }
     ret = wolfSSH_shutdown(ssh);
-    /* do not continue on with shutdown process if peer already disconnected */
+    /* do not continue on with shutdown process if peer already disconnected.
+     * A peer EOF is not a disconnect: the channel is still open and its close
+     * is still owed, so the drain below is exactly what is wanted. */
     if (ret != WS_SOCKET_ERROR_E && wolfSSH_get_error(ssh) != WS_SOCKET_ERROR_E
             && wolfSSH_get_error(ssh) != WS_CHANNEL_CLOSED) {
-        if (ret != WS_SUCCESS) {
+        if (ret != WS_SUCCESS && ret != WS_WANT_WRITE) {
             ClientFreeBuffers(pubKeyName, privKeyName, NULL);
             wolfSSH_free(ssh);
             wolfSSH_CTX_free(ctx);
@@ -1180,7 +1241,7 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
         }
         ret = wolfSSH_worker(ssh, NULL);
         if (ret != WS_SUCCESS && ret != WS_SOCKET_ERROR_E &&
-            ret != WS_CHANNEL_CLOSED) {
+            ret != WS_CHANNEL_CLOSED && ret != WS_EOF) {
             ClientFreeBuffers(pubKeyName, privKeyName, NULL);
             wolfSSH_free(ssh);
             wolfSSH_CTX_free(ctx);
@@ -1197,7 +1258,7 @@ THREAD_RETURN WOLFSSH_THREAD client_test(void* args)
     wolfSSH_free(ssh);
     wolfSSH_CTX_free(ctx);
     if (ret != WS_SUCCESS && ret != WS_SOCKET_ERROR_E &&
-            ret != WS_CHANNEL_CLOSED) {
+            ret != WS_CHANNEL_CLOSED && ret != WS_EOF) {
         err_sys("Closing client stream failed");
     }
 

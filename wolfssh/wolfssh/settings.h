@@ -43,41 +43,17 @@ extern "C" {
     #define USE_WOLFSSH_MEMORY  /* default memory handlers */
 #endif /* WMALLOC_USER */
 
-/* SFTP requires storehandle when fatfs is in use */
-#ifdef WOLFSSH_FATFS
-    #define WOLFSSH_STOREHANDLE
-#endif
-
 #if defined (_WIN32)
     #define USE_WINDOWS_API
     #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#ifdef WOLFSSL_NUCLEUS
-    #ifndef WOLFSSH_STOREHANDLE
-    #define WOLFSSH_STOREHANDLE
-    #endif
-#endif
-
-#ifdef MICROCHIP_MPLAB_HARMONY
-    #ifndef WOLFSSH_STOREHANDLE
-    #define WOLFSSH_STOREHANDLE
-    #endif
-#endif  
-
 #ifdef FREESCALE_MQX
     #define NO_STDIO_FILESYSTEM
-    #ifndef WOLFSSH_STOREHANDLE
-        #define WOLFSSH_STOREHANDLE
-    #endif
 
     #ifdef WOLFSSH_SCP
         #error wolfSSH SCP not ported to MQX yet
     #endif
-#endif
-
-#if defined(WOLFSSH_SCP) && defined(NO_WOLFSSH_SERVER)
-    #error only SCP server side supported
 #endif
 
 /* Detect if ECC needs RNG */
@@ -95,6 +71,14 @@ extern "C" {
 
 #if defined(WOLFSSH_KEYBOARD_INTERACTIVE) && !defined(WOLFSSH_MAX_PROMPTS)
     #define WOLFSSH_MAX_PROMPTS 64
+#endif
+
+/* Maximum length of one prompt string. Bounds the request payload, which is
+ * sized by summing the prompt lengths.
+ */
+
+#if defined(WOLFSSH_KEYBOARD_INTERACTIVE) && !defined(WOLFSSH_MAX_PROMPT_SZ)
+    #define WOLFSSH_MAX_PROMPT_SZ 1024
 #endif
 
 #ifdef __cplusplus

@@ -13,6 +13,19 @@
     #include <config.h>
 #endif
 
+#ifdef _WIN32
+    /* ConPTY (HPCON, CreatePseudoConsole) requires a Windows 10 1809 (RS5)
+     * API target; mingw-w64 gates the declarations on NTDDI_VERSION */
+    #if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
+        #undef  _WIN32_WINNT
+        #define _WIN32_WINNT 0x0A00
+    #endif
+    #if !defined(NTDDI_VERSION) || NTDDI_VERSION < 0x0A000006
+        #undef  NTDDI_VERSION
+        #define NTDDI_VERSION 0x0A000006 /* NTDDI_WIN10_RS5 */
+    #endif
+#endif
+
 #ifdef WOLFSSL_USER_SETTINGS
     #include <wolfssl/wolfcrypt/settings.h>
 #else
@@ -28,6 +41,45 @@
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/logging.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
+#ifdef WOLFSSH_CERTS
+    #include <wolfssl/ssl.h>
+#endif
+
+#ifdef WOLFSSH_WINDOWS_CERT_STORE
+    #include <windows.h>
+    #include <wincrypt.h>
+    #include <ncrypt.h>
+    #include <stdlib.h>
+    #include <errno.h>
+    #include <wolfssl/wolfcrypt/asn.h>
+    #ifndef CERT_SYSTEM_STORE_LOCATION_MASK
+        #define CERT_SYSTEM_STORE_LOCATION_MASK 0x00FF0000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_CURRENT_USER
+        #define CERT_SYSTEM_STORE_CURRENT_USER 0x00010000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_LOCAL_MACHINE
+        #define CERT_SYSTEM_STORE_LOCAL_MACHINE 0x00020000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_USERS
+        #define CERT_SYSTEM_STORE_USERS 0x00060000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_CURRENT_SERVICE
+        #define CERT_SYSTEM_STORE_CURRENT_SERVICE 0x00040000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_SERVICES
+        #define CERT_SYSTEM_STORE_SERVICES 0x00050000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_CURRENT_USER_GROUP_POLICY
+        #define CERT_SYSTEM_STORE_CURRENT_USER_GROUP_POLICY 0x00070000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_LOCAL_MACHINE_GROUP_POLICY
+        #define CERT_SYSTEM_STORE_LOCAL_MACHINE_GROUP_POLICY 0x00080000
+    #endif
+    #ifndef CERT_SYSTEM_STORE_LOCAL_MACHINE_ENTERPRISE
+        #define CERT_SYSTEM_STORE_LOCAL_MACHINE_ENTERPRISE 0x00090000
+    #endif
+#endif /* WOLFSSH_WINDOWS_CERT_STORE */
 
 #define WOLFSSH_TEST_SERVER
 #include <wolfssh/test.h>
@@ -46,6 +98,11 @@
 
 #ifndef WOLFSSHD_TIMEOUT
     #define WOLFSSHD_TIMEOUT 1
+#endif
+
+/* The umask the daemon holds, and so the one every session inherits. */
+#ifndef WOLFSSHD_DEFAULT_UMASK
+    #define WOLFSSHD_DEFAULT_UMASK 022
 #endif
 
 #ifdef EXAMPLE_BUFFER_SZ
@@ -108,6 +165,12 @@ typedef struct WOLFSSHD_CONNECTION {
     int            listenFd;
     char           ip[INET6_ADDRSTRLEN];
     byte           isThreaded;
+#ifdef _WIN32
+    /* set when the login grace time expires before authentication completes;
+     * POSIX uses the file-scope loginGraceTimedOut flag instead */
+    volatile byte  timeOut;
+    PTP_TIMER      loginTimer; /* threadpool timer enforcing login grace time */
+#endif
 } WOLFSSHD_CONNECTION;
 
 #ifdef __unix__
@@ -180,8 +243,8 @@ static void ShowUsage(void)
     printf("wolfSSHd %s linked with wolfSSL %s\n", LIBWOLFSSH_VERSION_STRING,
         LIBWOLFSSL_VERSION_STRING);
     printf(" -?             display this help and exit\n");
-    printf(" -f <file name> Configuration file to use, default is "
-                            "/etc/ssh/sshd_config\n");
+    printf(" -f <file name> Configuration file to use, default is:\n"
+           "                /etc/ssh/sshd_config\n");
     printf(" -p <int>       Port number to listen on\n");
     printf(" -d             Turn on debug mode\n");
     printf(" -D             Run in foreground (do not detach)\n");
@@ -194,8 +257,6 @@ static void ShowUsage(void)
 static void interruptCatch(int in)
 {
     (void)in;
-    if (logFile)
-        fprintf(logFile, "Closing down wolfSSHD\n");
     quit = 1;
 }
 
@@ -206,18 +267,90 @@ static void interruptCatch(int in)
     #define WGETPID getpid
 #endif
 
+/* Syslog-style suppression of consecutively repeated lines, so no single
+ * repeating message can grow the log without bound (some library notices
+ * fire once per received packet, which a peer controls). A repeat is counted
+ * instead of written and the count is emitted when a different message
+ * arrives, when a connection ends, or at shutdown. The state is per process:
+ * each forked connection child (POSIX) suppresses its own stream; on Windows
+ * the connection threads share it under logRepeatLock. */
+static char lastLogMsg[256];
+static unsigned long logRepeats = 0;
+#ifdef _WIN32
+static SRWLOCK logRepeatLock = SRWLOCK_INIT;
+#endif
+
+/* Emit any pending "last message repeated N times" count. Called when a
+ * connection ends and at daemon shutdown so a trailing repeat streak is not
+ * lost when the process exits without a further distinct message. */
+static void wolfSSHDLoggingFlush(void)
+{
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&logRepeatLock);
+#endif
+    if (logRepeats > 0 && logFile != NULL) {
+        fprintf(logFile, "[PID %lu]: last message repeated %lu times\n",
+            (unsigned long)WGETPID(), logRepeats);
+        fflush(logFile);
+    }
+    logRepeats = 0;
+    lastLogMsg[0] = '\0';
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&logRepeatLock);
+#endif
+}
+
 /* redirect logging to a specific file and add the PID value */
 static void wolfSSHDLoggingCb(enum wolfSSH_LogLevel lvl, const char *const str)
 {
-    /* always log errors and optionally log other info/debug level messages */
-    if (lvl == WS_LOG_ERROR) {
-        fprintf(logFile, "[PID %d]: %s\n", WGETPID(), str);
+    /* Always log errors and warnings, and optionally log other info/debug
+     * level messages. Warnings carry the security relevant notices, e.g. that
+     * a certificate was bound to an account by subject CN alone, so they must
+     * not depend on -d. */
+    if (logFile == NULL) {
+        return;
     }
-    else if (debugMode) {
-        fprintf(logFile, "[PID %d]: %s\n", WGETPID(), str);
+    if (lvl == WS_LOG_ERROR || lvl == WS_LOG_WARN || debugMode) {
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&logRepeatLock);
+#endif
+        /* The comparison is capped at the buffer size, so lines identical
+         * through the cap count as repeats. */
+        if (lastLogMsg[0] != '\0' &&
+                WSTRNCMP(str, lastLogMsg, sizeof(lastLogMsg) - 1) == 0) {
+            logRepeats++;
+        }
+        else {
+            if (logRepeats > 0) {
+                fprintf(logFile,
+                    "[PID %lu]: last message repeated %lu times\n",
+                    (unsigned long)WGETPID(), logRepeats);
+                logRepeats = 0;
+            }
+            WSNPRINTF(lastLogMsg, sizeof(lastLogMsg), "%s", str);
+            fprintf(logFile, "[PID %lu]: %s\n", (unsigned long)WGETPID(), str);
+            /* flush so each line is visible immediately, e.g. to a consumer
+             * reading the log file while the daemon is still running */
+            fflush(logFile);
+        }
+#ifdef _WIN32
+        ReleaseSRWLockExclusive(&logRepeatLock);
+#endif
     }
 }
 
+
+/* QNX fixes the host key's owner and modes in the system image, so
+ * WOLFSSH_NO_HOSTKEY_PERMS hands that policy to the platform. Host key only, and
+ * only ownership, modes and directories. Kept outside the NO_FILESYSTEM guard
+ * below because SetupCTX() tests it and -Wundef is on. wolfssh-options.c repeats
+ * this guard so the tests can skip the negative cases; keep the two in step. */
+#if defined(WOLFSSH_NO_HOSTKEY_PERMS) && \
+    (defined(__QNX__) || defined(__QNXNTO__))
+    #define WOLFSSHD_HOSTKEY_RELAX_PERMS 1
+#else
+    #define WOLFSSHD_HOSTKEY_RELAX_PERMS 0
+#endif
 
 #ifndef NO_FILESYSTEM
 static void freeBufferFromFile(byte* buf, void* heap)
@@ -228,21 +361,62 @@ static void freeBufferFromFile(byte* buf, void* heap)
 }
 
 
+/* Load class for getBufferFromFile(). NORMAL files (e.g. the banner) are opened
+ * directly. TRUST and SECRET files are trust anchors loaded through the secure
+ * gate (no symlink, owned by root or the daemon, no group/world writable path
+ * component); SECRET additionally rejects a group/world readable file, used for
+ * the host private key. */
+enum {
+    WOLFSSHD_LOAD_NORMAL = 0,
+    WOLFSSHD_LOAD_TRUST  = 1,
+    WOLFSSHD_LOAD_SECRET = 2
+};
+
 /* set bufSz to size wanted if too small and buf is null */
-static byte* getBufferFromFile(const char* fileName, word32* bufSz, void* heap)
+static byte* getBufferFromFile(const char* fileName, word32* bufSz, void* heap,
+        int loadClass)
 {
     FILE* file;
     byte* buf = NULL;
     long fileSz;
     word32 readSz;
+    int relaxPerms = 0;
 
     WOLFSSH_UNUSED(heap);
 
     if (fileName == NULL) return NULL;
 
-    if (WFOPEN(NULL, &file, fileName, "rb") != 0)
+#if WOLFSSHD_HOSTKEY_RELAX_PERMS
+    if (loadClass == WOLFSSHD_LOAD_SECRET) {
+        relaxPerms = 1;
+    }
+#endif
+
+    if (loadClass == WOLFSSHD_LOAD_NORMAL) {
+        if (WFOPEN(NULL, &file, fileName, "rb") != 0)
+            return NULL;
+    }
+    else {
+        /* Trust anchors always go through the secure gate, regardless of
+         * StrictModes. The owner is the daemon's effective user (or root), and
+         * the host private key (SECRET) is also refused if group/world
+         * readable, unless WOLFSSHD_HOSTKEY_RELAX_PERMS. */
+        if (wolfSSHD_OpenSecureFile(fileName,
+#ifndef _WIN32
+                geteuid(),
+#else
+                0,
+#endif
+                loadClass == WOLFSSHD_LOAD_SECRET /* rejectReadable */,
+                relaxPerms, heap, &file) != WS_SUCCESS) {
+            return NULL;
+        }
+    }
+
+    if (!WFSEEK_SUCCESS(WFSEEK(NULL, file, 0, WSEEK_END))) {
+        WFCLOSE(NULL, file);
         return NULL;
-    WFSEEK(NULL, file, 0, WSEEK_END);
+    }
     fileSz = WFTELL(NULL, file);
     if (fileSz < 0) {
         WFCLOSE(NULL, file);
@@ -258,6 +432,10 @@ static byte* getBufferFromFile(const char* fileName, word32* bufSz, void* heap)
             WFREE(buf, heap, DYNTYPE_SSHD);
             return NULL;
         }
+        /* NUL terminate so callers that treat the buffer as a C string (e.g.
+         * the banner via wolfSSH_CTX_SetBanner/WSTRLEN) do not read past the
+         * allocation. The extra byte was already accounted for above. */
+        buf[readSz] = '\0';
         if (bufSz)
             *bufSz = readSz;
     }
@@ -289,6 +467,489 @@ static void CleanupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
     (void)conf;
 }
 
+/* Answers a shell, exec or subsystem request as it arrives: a session this
+ * build cannot serve is refused with CHANNEL_FAILURE, rather than accepted
+ * and then dropped once the session is up. Returns 0 to accept and 1 to
+ * refuse. The command is NULL when the request carried none that fit. */
+static int SessionRequestCb(WOLFSSH_CHANNEL* channel, void* vCtx)
+{
+    WOLFSSHD_CONNECTION* conn = (WOLFSSHD_CONNECTION*)vCtx;
+    const char* cmd;
+    const char* reason = NULL;
+    int rej = 1;
+
+    if (conn == NULL || channel == NULL) {
+        return 1;
+    }
+
+    cmd = wolfSSH_ChannelGetSessionCommand(channel);
+    switch (wolfSSH_ChannelGetSessionType(channel)) {
+        case WOLFSSH_SESSION_SHELL:
+        #ifdef WOLFSSH_SHELL
+            rej = 0;
+        #else
+            reason = "shell support is disabled";
+        #endif
+            break;
+
+        case WOLFSSH_SESSION_EXEC:
+            if (cmd == NULL) {
+                reason = "exec request carried no command";
+                break;
+            }
+        #ifdef WOLFSSH_SCP
+            /* Shared with the SCP divert in wolfSSH_accept(), so the two
+             * cannot disagree about what starts a transfer. */
+            if (wolfSSH_ChannelCommandIsScp(channel) == 1) {
+                rej = 0;
+                break;
+            }
+        #endif
+        #ifdef WOLFSSH_SHELL
+            rej = 0;
+        #else
+            reason = "exec support is disabled";
+        #endif
+            break;
+
+        case WOLFSSH_SESSION_SUBSYSTEM:
+            if (cmd == NULL) {
+                reason = "subsystem request carried no name";
+            }
+        #ifdef WOLFSSH_SFTP
+            /* Matched whole, length and bytes, as the sftp divert asks:
+             * sftp with an embedded NUL is another subsystem. */
+            else if (wolfSSH_ChannelGetSessionCommandSz(channel)
+                        == (word32)WSTRLEN("sftp")
+                    && WSTRCMP(cmd, "sftp") == 0) {
+                rej = 0;
+            }
+        #endif
+            else {
+                reason = "unknown or unsupported subsystem";
+            }
+            break;
+
+        case WOLFSSH_SESSION_UNKNOWN:
+        case WOLFSSH_SESSION_TERMINAL:
+        default:
+            reason = "unsupported session type";
+            break;
+    }
+
+    /* One program start per channel, as RFC 4254 section 6.5 allows. This
+     * request's grant is recorded once the callback returns, so a flag
+     * already set is an earlier request's. */
+    if (!rej && wolfSSH_ChannelGetSessionGranted(channel) == 1) {
+        rej = 1;
+        reason = "a session is already running on the channel";
+    }
+
+    if (rej) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Refusing session request from %s: %s [%s]",
+            conn->ip, reason, cmd != NULL ? cmd : "");
+    }
+
+    return rej;
+}
+
+
+#if defined(WOLFSSH_CERTS) && defined(WOLFSSH_WINDOWS_CERT_STORE)
+/* Returns 1 only for the store hives that need elevation to write: the three
+ * LOCAL_MACHINE locations. Every other hive (per-user, per-service,
+ * HKEY_USERS and per-user group policy) can be written without elevation by
+ * the account it belongs to, so trust anchors or host keys placed there can
+ * be replaced by anything running as that account. Shared by the user CA
+ * store and host key store checks so the two cannot diverge. */
+static int IsElevationProtectedHive(word32 dwFlags)
+{
+    return dwFlags == (word32)CERT_SYSTEM_STORE_LOCAL_MACHINE ||
+           dwFlags == (word32)CERT_SYSTEM_STORE_LOCAL_MACHINE_GROUP_POLICY ||
+           dwFlags == (word32)CERT_SYSTEM_STORE_LOCAL_MACHINE_ENTERPRISE;
+}
+
+/* Result of CertIsCA(). Kept distinct so the caller can tell a certificate
+ * that is genuinely not a CA from one that could not be examined at all. */
+enum {
+    CERT_CA_NO      = 0,   /* parsed, basicConstraints CA is not TRUE */
+    CERT_CA_YES     = 1,   /* parsed, basicConstraints CA:TRUE */
+    CERT_CA_UNKNOWN = -1   /* could not parse or could not allocate */
+};
+
+/* Returns CERT_CA_YES when der holds an X.509 certificate with
+ * basicConstraints CA:TRUE, CERT_CA_NO when it parses but is not a CA, and
+ * CERT_CA_UNKNOWN when it could not be examined. */
+static int CertIsCA(const byte* der, word32 derSz, void* heap)
+{
+    DecodedCert* dCert;
+    int isCA = CERT_CA_UNKNOWN;
+#ifndef WOLFSSH_SMALL_STACK
+    DecodedCert sdCert;
+#endif
+
+#ifdef WOLFSSH_SMALL_STACK
+    dCert = (DecodedCert*)WMALLOC(sizeof(DecodedCert), heap, DYNTYPE_CERT);
+    if (dCert == NULL) {
+        return CERT_CA_UNKNOWN;
+    }
+#else
+    dCert = &sdCert;
+#endif
+
+    wc_InitDecodedCert(dCert, der, derSz, heap);
+    if (wc_ParseCert(dCert, CERT_TYPE, NO_VERIFY, NULL) == 0) {
+        isCA = (dCert->isCA != 0) ? CERT_CA_YES : CERT_CA_NO;
+    }
+    wc_FreeDecodedCert(dCert);
+#ifdef WOLFSSH_SMALL_STACK
+    WFREE(dCert, heap, DYNTYPE_CERT);
+#endif
+
+    return isCA;
+}
+
+/* Returns 1 when name refers to a Windows store populated by the OS or the
+ * Microsoft Trusted Root Program rather than the administrator. Store names
+ * resolve to registry keys, which are case-insensitive, and may carry a
+ * '<SID>\' or '<Service>\' prefix, so every backslash-separated component is
+ * compared case-insensitively rather than only the final one. Trailing
+ * whitespace is ignored and an empty component fails closed: the registry
+ * tolerates a redundant trailing backslash, so "Root\" resolves to the same
+ * key as "Root" and must be refused the same way. */
+static int IsWinPublicTrustStoreName(const char* name)
+{
+    /* Includes every store Windows itself populates (Trusted Root Program,
+     * Windows Update, Group Policy). Revisit for new OS-managed stores when
+     * supporting a new Windows release. */
+    static const char* const deny[] = {
+        "Root", "AuthRoot", "CA", "Disallowed", "TrustedPublisher", "trust",
+        "SmartCardRoot", "ClientAuthIssuer", "TrustedPeople", "TrustedDevices",
+        "FlightRoot", "TestSignRoot"
+    };
+    const char* comp;
+    const char* sep;
+    word32 nameLen;
+    word32 len;
+    word32 i;
+
+    if (name == NULL) {
+        /* fail closed */
+        return 1;
+    }
+
+    nameLen = (word32)WSTRLEN(name);
+    while (nameLen > 0 && (name[nameLen - 1] == ' ' ||
+            name[nameLen - 1] == '\t')) {
+        nameLen--;
+    }
+    if (nameLen == 0) {
+        /* fail closed on an empty or all-whitespace name */
+        return 1;
+    }
+
+    comp = name;
+    for (;;) {
+        sep = WSTRCHR(comp, '\\');
+        if (sep != NULL && (word32)(sep - name) >= nameLen) {
+            /* the separator sits in the trimmed-off tail; treat it as
+             * absent so len below is always bounded by nameLen and cannot
+             * underflow */
+            sep = NULL;
+        }
+        if (sep != NULL) {
+            len = (word32)(sep - comp);
+        }
+        else {
+            len = nameLen - (word32)(comp - name);
+        }
+        if (len == 0) {
+            /* an empty component ("Root\", "\Root", "a\\b") changes nothing
+             * about the key the registry resolves; fail closed */
+            return 1;
+        }
+        for (i = 0; i < (word32)(sizeof(deny) / sizeof(*deny)); i++) {
+            if (len == (word32)WSTRLEN(deny[i]) &&
+                    WSTRNCASECMP(comp, deny[i], len) == 0) {
+                return 1;
+            }
+        }
+        if (sep == NULL) {
+            break;
+        }
+        comp = sep + 1;
+    }
+
+    return 0;
+}
+
+/* Add every CA certificate in the configured Windows store (winUserPvPara
+ * name, winUserDwFlags location) as a trusted root CA. Returns WS_SUCCESS on
+ * success. */
+static int LoadUserCACertsFromStore(const WOLFSSHD_CONFIG* conf,
+        WOLFSSH_CTX* ctx, void* heap)
+{
+    int    ret = WS_SUCCESS;
+    char*  storeNameStr;
+    char*  dwFlagsStr;
+    char*  providerStr;
+    word32 dwFlags = 0;
+    wchar_t* wStoreName = NULL;
+    int    wStoreNameLen;
+    HCERTSTORE     hStore = NULL;
+    PCCERT_CONTEXT pCertContext = NULL;
+    word32 loaded = 0;
+    word32 skipped = 0;
+    word32 rejected = 0;
+    word32 notX509 = 0;
+    int    isCA;
+    DWORD  enumErr;
+
+    storeNameStr = wolfSSHD_ConfigGetWinUserPvPara(conf);
+    dwFlagsStr   = wolfSSHD_ConfigGetWinUserDwFlags(conf);
+    providerStr  = wolfSSHD_ConfigGetWinUserStores(conf);
+
+    /* Every certificate in this store becomes a trust anchor for client
+     * authentication, so the administrator must name it. There is no default:
+     * guessing one silently would pick a store the administrator never
+     * reviewed. Name a store created for this purpose, e.g. 'SSH_UserCA'.
+     * The Windows 'Root', 'AuthRoot' and 'CA' stores must not be used: they
+     * are populated by the Microsoft Trusted Root Program, so pointing at one
+     * makes every public commercial CA an SSH login authority. */
+    /* wolfSSH_Log truncates at WOLFSSH_DEFAULT_LOG_WIDTH (120), so every
+     * multi-sentence diagnostic here is split into several calls with the
+     * actionable text in its own line. */
+    if (storeNameStr == NULL) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_TrustedUserCAStore is enabled but no store name "
+            "is configured.");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Set wolfSSH_WinUserPvPara to a store holding nothing but "
+            "the client CA certs to trust, e.g. 'SSH_UserCA'.");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Do not use the public 'Root', 'AuthRoot' or 'CA' stores.");
+        return WS_BAD_ARGUMENT;
+    }
+
+    if (IsWinPublicTrustStoreName(storeNameStr)) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_WinUserPvPara='%.64s' names a Windows system "
+            "trust store.", storeNameStr);
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Every CA it holds would become an SSH login authority. "
+            "Use a store created for this purpose instead.");
+        return WS_BAD_ARGUMENT;
+    }
+
+    /* Only the system-store provider is supported here. NULL means the option
+     * was not given, which is that same provider. Fail rather than silently
+     * load trust anchors from a different provider than the one configured. */
+    if (providerStr != NULL &&
+            WSTRCMP(providerStr, "CERT_STORE_PROV_SYSTEM") != 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_WinUserStores='%.48s' is not supported; only "
+            "CERT_STORE_PROV_SYSTEM is supported", providerStr);
+        return WS_BAD_ARGUMENT;
+    }
+
+    /* The location is mandatory for the same reason the store name is. The
+     * per-user hive is writable by the account the daemon runs as, without
+     * elevation, so silently defaulting to CURRENT_USER would let anything
+     * running as that account add a trust anchor. */
+    if (dwFlagsStr == NULL) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_TrustedUserCAStore is enabled but no store "
+            "location is configured.");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Set wolfSSH_WinUserDwFlags, normally to LOCAL_MACHINE.");
+        return WS_BAD_ARGUMENT;
+    }
+    if (wolfSSH_CertStoreLocationFromName(dwFlagsStr, &dwFlags)
+            != WS_SUCCESS) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Unrecognized user CA store flags '%s'", dwFlagsStr);
+        return WS_BAD_ARGUMENT;
+    }
+    if (!IsElevationProtectedHive(dwFlags)) {
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] wolfSSH_WinUserDwFlags selects a store hive that its own "
+            "account can write to without elevation.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] LOCAL_MACHINE is the safer location for trust anchors.");
+    }
+
+#ifdef WOLFSSH_NO_FPKI
+    wolfSSH_Log(WS_LOG_WARN,
+        "[SSHD] WARNING: built without FPKI profile checking; peer certs are "
+        "held only to RFC 6187 key usage.");
+    wolfSSH_Log(WS_LOG_WARN,
+        "[SSHD] A cert with no EKU, or one naming clientAuth or "
+        "secureShellClient, whose subject matches is accepted for login.");
+#endif
+
+    /* MB_ERR_INVALID_CHARS, as wolfSSH_ParseCertStoreSpec() uses, so a
+     * non-UTF-8 config value fails here instead of being silently replaced
+     * with U+FFFD and naming a store that does not exist. */
+    wStoreNameLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            storeNameStr, -1, NULL, 0);
+    if (wStoreNameLen == 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Failed to convert user CA store name to wide characters");
+        return WS_BAD_ARGUMENT;
+    }
+    wStoreName = (wchar_t*)WMALLOC(wStoreNameLen * sizeof(wchar_t), heap,
+            DYNTYPE_SSHD);
+    if (wStoreName == NULL) {
+        return WS_MEMORY_E;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, storeNameStr, -1,
+            wStoreName, wStoreNameLen) == 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Failed to convert user CA store name to wide characters");
+        WFREE(wStoreName, heap, DYNTYPE_SSHD);
+        return WS_BAD_ARGUMENT;
+    }
+
+    hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, (HCRYPTPROV_LEGACY)0,
+            dwFlags | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
+            wStoreName);
+    if (hStore == NULL) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Unable to open user CA cert store '%.48s', error %lu",
+            storeNameStr, (unsigned long)GetLastError());
+        WFREE(wStoreName, heap, DYNTYPE_SSHD);
+        return WS_FATAL_ERROR;
+    }
+
+    /* Passing the previous context frees it and advances the enumeration.
+     * NULL means either end of store or failure; only the documented end
+     * codes count as completion, anything else fails the load so a partial
+     * trust anchor set is never reported as complete. */
+    for (;;) {
+        pCertContext = CertEnumCertificatesInStore(hStore, pCertContext);
+        if (pCertContext == NULL) {
+            enumErr = GetLastError();
+            if (enumErr != CRYPT_E_NOT_FOUND &&
+                    enumErr != ERROR_NO_MORE_FILES) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Enumerating user CA cert store '%.48s' failed, "
+                    "error 0x%08lx", storeNameStr, (unsigned long)enumErr);
+                ret = WS_FATAL_ERROR;
+            }
+            break;
+        }
+        if (pCertContext->pbCertEncoded == NULL ||
+                pCertContext->cbCertEncoded == 0) {
+            notX509++;
+            wolfSSH_Log(WS_LOG_WARN,
+                "[SSHD] Skipping an entry in store '%s' with no encoded "
+                "certificate", storeNameStr);
+            continue;
+        }
+        if ((pCertContext->dwCertEncodingType & X509_ASN_ENCODING) == 0) {
+            notX509++;
+            wolfSSH_Log(WS_LOG_WARN,
+                "[SSHD] Skipping an entry in store '%s' that is not X.509 "
+                "DER encoded", storeNameStr);
+            continue;
+        }
+        /* wolfSSL does not enforce basicConstraints CA:TRUE for user-loaded
+         * trust anchors, so an end-entity certificate sitting in the store
+         * would become a login authority. Filter it out here. */
+        isCA = CertIsCA(pCertContext->pbCertEncoded,
+                (word32)pCertContext->cbCertEncoded, heap);
+        if (isCA != CERT_CA_YES) {
+            skipped++;
+            wolfSSH_Log(WS_LOG_WARN,
+                "[SSHD] Skipping a cert in store '%s': %s", storeNameStr,
+                isCA == CERT_CA_NO ? "not a CA (no basicConstraints CA:TRUE)"
+                                   : "could not be parsed");
+            continue;
+        }
+        if (wolfSSH_CTX_AddRootCert_buffer(ctx,
+                (const byte*)pCertContext->pbCertEncoded,
+                (word32)pCertContext->cbCertEncoded,
+                WOLFSSH_FORMAT_ASN1) != WS_SUCCESS) {
+            /* Skip certs wolfSSH cannot use as a trust anchor. */
+            rejected++;
+            wolfSSH_Log(WS_LOG_WARN,
+                "[SSHD] Skipping a CA cert in store '%s' that could not be "
+                "loaded as a root CA", storeNameStr);
+            continue;
+        }
+        loaded++;
+    }
+
+    CertCloseStore(hStore, 0);
+    WFREE(wStoreName, heap, DYNTYPE_SSHD);
+
+    /* Counts and location go on their own lines: wolfSSH_Log formats into
+     * a 120 byte buffer, and one line carrying the %.48s store name plus
+     * the counts would be cut short right where the numbers are. */
+    if (ret != WS_SUCCESS) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] %u CA certificate(s) loaded before the failure; "
+            "refusing to start on a partial trust anchor set", loaded);
+    }
+    else if (loaded == 0) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] No usable CA certificates found in store '%.48s'",
+            storeNameStr);
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] Store entries not loaded: %u not a CA, %u rejected, "
+            "%u not X.509", skipped, rejected, notX509);
+        ret = WS_FATAL_ERROR;
+    }
+    else {
+        wolfSSH_Log(WS_LOG_INFO,
+            "[SSHD] Trusting %u CA certificate(s) from store '%.48s'",
+            loaded, storeNameStr);
+        wolfSSH_Log(WS_LOG_INFO,
+            "[SSHD] Store location 0x%08lx used for client authentication",
+            (unsigned long)dwFlags);
+        if (skipped != 0 || rejected != 0 || notX509 != 0) {
+            wolfSSH_Log(WS_LOG_INFO,
+                "[SSHD] Store entries not loaded: %u not a CA, %u rejected "
+                "as a root CA, %u not X.509", skipped, rejected, notX509);
+        }
+        if (rejected > 0) {
+            wolfSSH_Log(WS_LOG_WARN,
+                "[SSHD] %u CA certificate(s) in store '%.48s' could not be "
+                "loaded; the trust anchor set is incomplete", rejected,
+                storeNameStr);
+        }
+    }
+
+    return ret;
+}
+#endif /* WOLFSSH_CERTS && WOLFSSH_WINDOWS_CERT_STORE */
+
+#if defined(WOLFSSH_CERTS) && (defined(_WIN32) || defined(WOLFSSL_FPKI))
+/* Returns non-zero when any config node configures a certificate trust
+ * anchor. TrustedUserCAKeys may live inside a Match block, so the whole list
+ * must be walked; the two store flags are global-only and live on the head
+ * node. */
+static int AnyNodeHasCertTrustAnchor(const WOLFSSHD_CONFIG* conf)
+{
+    const WOLFSSHD_CONFIG* cur;
+    int found = 0;
+
+    if (wolfSSHD_ConfigGetUserCAStore(conf) ||
+            wolfSSHD_ConfigGetSystemCA(conf)) {
+        found = 1;
+    }
+    cur = conf;
+    while (!found && cur != NULL) {
+        if (wolfSSHD_ConfigGetUserCAKeysFile(cur) != NULL) {
+            found = 1;
+        }
+        cur = wolfSSHD_ConfigGetNext(cur);
+    }
+
+    return found;
+}
+#endif /* WOLFSSH_CERTS && (_WIN32 || WOLFSSL_FPKI) */
+
 /* Initializes and sets up the WOLFSSH_CTX struct based on the configure options
  * return WS_SUCCESS on success
  */
@@ -296,9 +957,9 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
         byte** banner)
 {
     int ret = WS_SUCCESS;
-    DerBuffer* der = NULL;
-    byte* privBuf;
-    word32 privBufSz;
+    byte* keyDer = NULL;
+    byte* privBuf = NULL;
+    word32 privBufSz = 0;
     void* heap = NULL;
 
     if (ctx == NULL) {
@@ -316,13 +977,16 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
     if (ret == WS_SUCCESS) {
         wolfSSH_SetUserAuth(*ctx, DefaultUserAuth);
         wolfSSH_SetUserAuthResult(*ctx, UserAuthResult);
+        wolfSSH_CTX_SetChannelReqShellCb(*ctx, SessionRequestCb);
+        wolfSSH_CTX_SetChannelReqExecCb(*ctx, SessionRequestCb);
+        wolfSSH_CTX_SetChannelReqSubsysCb(*ctx, SessionRequestCb);
     }
 
     /* set banner to display on connection */
     if (ret == WS_SUCCESS) {
 #ifndef NO_FILESYSTEM
         *banner = getBufferFromFile(wolfSSHD_ConfigGetBanner(conf),
-                NULL, heap);
+                NULL, heap, WOLFSSHD_LOAD_NORMAL);
 #endif
         if (*banner) {
             wolfSSH_CTX_SetBanner(*ctx, (char*)*banner);
@@ -331,90 +995,306 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
 
     /* Load in host private key */
     if (ret == WS_SUCCESS) {
+#if defined(WOLFSSH_CERTS) && defined(WOLFSSH_WINDOWS_CERT_STORE)
+        char* hostKeyStore;
+        char* hostKeyStoreSubject;
+        char* hostKeyStoreFlags;
 
-        char* hostKey = wolfSSHD_ConfigGetHostKeyFile(conf);
+        hostKeyStore = wolfSSHD_ConfigGetHostKeyStore(conf);
+        hostKeyStoreSubject = wolfSSHD_ConfigGetHostKeyStoreSubject(conf);
+        hostKeyStoreFlags = wolfSSHD_ConfigGetHostKeyStoreFlags(conf);
 
-        if (hostKey == NULL) {
-            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] No host private key set");
+        if (hostKeyStore != NULL && hostKeyStoreSubject == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] wolfSSH_HostKeyStore set but "
+                "wolfSSH_HostKeyStoreSubject is missing");
             ret = WS_BAD_ARGUMENT;
         }
-        else {
-            byte* data;
-            word32 dataSz = 0;
+        /* The location is mandatory for the same reason wolfSSH_WinUserDwFlags
+         * is: the per-user hive is writable by the daemon's own account
+         * without elevation, so silently defaulting to CURRENT_USER would let
+         * anything running as that account install a host key. */
+        else if (hostKeyStore != NULL && hostKeyStoreFlags == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] wolfSSH_HostKeyStore set but "
+                "wolfSSH_HostKeyStoreFlags is missing.");
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Set the store location explicitly, normally "
+                "LOCAL_MACHINE.");
+            ret = WS_BAD_ARGUMENT;
+        }
+        else if (hostKeyStore == NULL &&
+                (hostKeyStoreSubject != NULL || hostKeyStoreFlags != NULL)) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] wolfSSH_HostKeyStoreSubject/wolfSSH_HostKeyStoreFlags "
+                "set but wolfSSH_HostKeyStore is missing");
+            ret = WS_BAD_ARGUMENT;
+        }
+        /* The store branch below wins over the file path, so a HostKey line
+         * left in place would be silently discarded. StartSSHD() already
+         * rejects the same conflict expressed with -h. */
+        else if (hostKeyStore != NULL &&
+                wolfSSHD_ConfigGetHostKeyFile(conf) != NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] HostKey conflicts with the configured "
+                "wolfSSH_HostKeyStore. Use one or the other.");
+            ret = WS_BAD_ARGUMENT;
+        }
+        /* A store host key carries its own certificate. A HostCertificate
+         * file would land on the same x509v3 slot and leave it advertised
+         * with no signing material behind it. */
+        else if (hostKeyStore != NULL &&
+                wolfSSHD_ConfigGetHostCertFile(conf) != NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] HostCertificate conflicts with the configured "
+                "wolfSSH_HostKeyStore, which supplies its own certificate.");
+            wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Use one or the other.");
+            ret = WS_BAD_ARGUMENT;
+        }
 
-            data = getBufferFromFile(hostKey, &dataSz, heap);
-            if (data == NULL) {
+        if (ret == WS_SUCCESS &&
+                hostKeyStore != NULL && hostKeyStoreSubject != NULL) {
+            /* Use cert store host key */
+            wchar_t* wStoreName = NULL;
+            wchar_t* wSubjectName = NULL;
+            word32 dwFlags = 0;
+            int storeNameLen = 0;
+            int subjectNameLen = 0;
+
+            if (wolfSSH_CertStoreLocationFromName(hostKeyStoreFlags, &dwFlags)
+                        != WS_SUCCESS) {
                 wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] Error reading host key file.");
-                ret = WS_MEMORY_E;
+                    "[SSHD] Unrecognized host key store flags '%s'",
+                    hostKeyStoreFlags);
+                ret = WS_BAD_ARGUMENT;
+            }
+            if (ret == WS_SUCCESS && !IsElevationProtectedHive(dwFlags)) {
+                wolfSSH_Log(WS_LOG_WARN,
+                    "[SSHD] wolfSSH_HostKeyStoreFlags selects a store hive "
+                    "that its own account can write to without elevation.");
+                wolfSSH_Log(WS_LOG_WARN,
+                    "[SSHD] LOCAL_MACHINE is the safer location for the host "
+                    "key.");
+            }
 
+            /* Convert to wide strings. MB_ERR_INVALID_CHARS, as
+             * wolfSSH_ParseCertStoreSpec() uses, so a non-UTF-8 config value
+             * fails here instead of being silently replaced with U+FFFD and
+             * then never matching any certificate CN. */
+            if (ret == WS_SUCCESS) {
+                storeNameLen = MultiByteToWideChar(CP_UTF8,
+                    MB_ERR_INVALID_CHARS, hostKeyStore, -1, NULL, 0);
+                subjectNameLen = MultiByteToWideChar(CP_UTF8,
+                    MB_ERR_INVALID_CHARS, hostKeyStoreSubject, -1, NULL, 0);
+
+                if (storeNameLen == 0 || subjectNameLen == 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Failed to convert cert store strings to wchar");
+                    ret = WS_BAD_ARGUMENT;
+                }
             }
 
             if (ret == WS_SUCCESS) {
-                if (wc_PemToDer(data, dataSz, PRIVATEKEY_TYPE, &der, NULL,
-                                NULL, NULL) != 0) {
-                    wolfSSH_Log(WS_LOG_DEBUG, "[SSHD] Failed to convert host "
-                                "private key from PEM. Assuming key in DER "
-                                "format.");
-                    privBuf = data;
-                    privBufSz = dataSz;
-                }
-                else {
-                    privBuf = der->buffer;
-                    privBufSz = der->length;
-                }
+                wStoreName = (wchar_t*)WMALLOC(
+                    storeNameLen * sizeof(wchar_t), heap, DYNTYPE_SSHD);
+                wSubjectName = (wchar_t*)WMALLOC(
+                    subjectNameLen * sizeof(wchar_t), heap, DYNTYPE_SSHD);
 
-                if (wolfSSH_CTX_UsePrivateKey_buffer(*ctx, privBuf, privBufSz,
-                                                     WOLFSSH_FORMAT_ASN1) < 0) {
+                if (wStoreName == NULL || wSubjectName == NULL) {
                     wolfSSH_Log(WS_LOG_ERROR,
-                        "[SSHD] Failed to use host private key.");
+                      "[SSHD] Memory allocation failed for cert store strings");
+                    ret = WS_MEMORY_E;
+                }
+                else if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                            hostKeyStore, -1, wStoreName, storeNameLen) == 0 ||
+                         MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                            hostKeyStoreSubject, -1, wSubjectName,
+                            subjectNameLen) == 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Failed to convert cert store strings to wchar");
                     ret = WS_BAD_ARGUMENT;
                 }
+                else {
+                    ret = wolfSSH_CTX_UsePrivateKey_fromStore(*ctx, wStoreName,
+                        dwFlags, wSubjectName);
+                    if (ret != WS_SUCCESS) {
+                        wolfSSH_Log(WS_LOG_ERROR,
+                       "[SSHD] Failed to load host key from certificate store");
+                    }
+                }
 
-                freeBufferFromFile(data, heap);
-                wc_FreeDer(&der);
+                if (wStoreName != NULL) {
+                    WFREE(wStoreName, heap, DYNTYPE_SSHD);
+                }
+                if (wSubjectName != NULL) {
+                    WFREE(wSubjectName, heap, DYNTYPE_SSHD);
+                }
+            }
+        }
+        else if (ret == WS_SUCCESS)
+#endif /* WOLFSSH_CERTS && WOLFSSH_WINDOWS_CERT_STORE */
+        {
+            char* hostKey;
+
+            hostKey = wolfSSHD_ConfigGetHostKeyFile(conf);
+            if (hostKey == NULL) {
+                wolfSSH_Log(WS_LOG_ERROR, "[SSHD] No host private key set");
+                ret = WS_BAD_ARGUMENT;
+            }
+            else {
+                byte* data;
+                word32 dataSz = 0;
+
+                /* The host private key is a secret trust anchor: refuse a
+                 * symlink, an unsafe owner or path, or a group/world
+                 * readable/writable file. WOLFSSHD_HOSTKEY_RELAX_PERMS keeps
+                 * only the symlink and regular-file checks. */
+            #if WOLFSSHD_HOSTKEY_RELAX_PERMS
+                wolfSSH_Log(WS_LOG_INFO, "[SSHD] Built with "
+                    "WOLFSSH_NO_HOSTKEY_PERMS, host key ownership and "
+                    "permissions are left to the platform");
+            #endif
+                data = getBufferFromFile(hostKey, &dataSz, heap,
+                    WOLFSSHD_LOAD_SECRET);
+                if (data == NULL) {
+                    /* NULL means the secure gate rejected the file (bad owner,
+                     * symlink, group/world writable/readable; reason already
+                     * logged) or the read failed, so report a file error rather
+                     * than a memory error. */
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error reading host key file.");
+                    ret = WS_BAD_FILE_E;
+
+                }
+
+                if (ret == WS_SUCCESS) {
+                    /* Host keys may be OpenSSH, PEM, or DER; detect the format
+                     * and decode PEM/DER via wc_KeyPemToDer(), which handles
+                     * PKCS#8 keys with no traditional DER form (e.g. ML-DSA). */
+                    if (dataSz == 0) {
+                        /* An empty (0-byte) file passes the NULL check above but
+                         * carries no key material. Handle it explicitly as a file
+                         * error instead of falling into the PEM path, where
+                         * WMALLOC(0) is implementation-defined (may return NULL and
+                         * be misreported as WS_MEMORY_E). */
+                        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Host key file is empty.");
+                        ret = WS_BAD_FILE_E;
+                    }
+                    else {
+                        int keyFormat = wolfSSHD_DetectPrivKeyFormat(data, dataSz,
+                                heap, &keyDer, &privBuf, &privBufSz);
+
+                        if (keyFormat == WS_MEMORY_E) {
+                            wolfSSH_Log(WS_LOG_ERROR,
+                                "[SSHD] Out of memory reading host private key.");
+                            ret = WS_MEMORY_E;
+                        }
+                        else if (keyFormat < 0) {
+                            wolfSSH_Log(WS_LOG_ERROR,
+                                "[SSHD] Host private key file is invalid.");
+                            ret = WS_BAD_FILE_E;
+                        }
+                        else if (keyFormat == WOLFSSH_FORMAT_OPENSSH) {
+                            wolfSSH_Log(WS_LOG_DEBUG, "[SSHD] Loading host private "
+                                        "key as OpenSSH format.");
+                        }
+                        else {
+                            wolfSSH_Log(WS_LOG_DEBUG, "[SSHD] Loading host private "
+                                        "key as DER format.");
+                        }
+
+                        if (ret == WS_SUCCESS &&
+                                wolfSSH_CTX_UsePrivateKey_buffer(*ctx, privBuf,
+                                        privBufSz, keyFormat) < 0) {
+                            if (keyFormat == WOLFSSH_FORMAT_OPENSSH) {
+                                /* Only composite ML-DSA keys support this format. */
+                                wolfSSH_Log(WS_LOG_ERROR,
+                                    "[SSHD] Failed to use host private key: "
+                                    "OpenSSH format is only supported for "
+                                    "composite ML-DSA keys; convert with "
+                                    "\"ssh-keygen -p -m PEM\".");
+                            }
+                            else {
+                                wolfSSH_Log(WS_LOG_ERROR,
+                                    "[SSHD] Failed to use host private key.");
+                            }
+                            ret = WS_BAD_ARGUMENT;
+                        }
+                    }
+
+                    if (keyDer != NULL) {
+                        WS_FORCEZERO(keyDer, dataSz);
+                        WFREE(keyDer, heap, DYNTYPE_SSHD);
+                    }
+                    /* data is the key material itself for raw DER/OpenSSH
+                     * input (privBuf aliases it directly, no copy). */
+                    WS_FORCEZERO(data, dataSz);
+                    freeBufferFromFile(data, heap);
+                }
             }
         }
     }
 
 #if defined(WOLFSSH_OSSH_CERTS) || defined(WOLFSSH_CERTS)
     if (ret == WS_SUCCESS) {
-        /* TODO: Create a helper function that uses a file instead. */
         char* hostCert = wolfSSHD_ConfigGetHostCertFile(conf);
 
         if (hostCert != NULL) {
             byte*  data;
             word32 dataSz = 0;
+        #ifdef WOLFSSH_CERTS
+            byte* der = NULL;
+            word32 derSz = 0;
+            const byte* type = NULL;
+            word32 typeSz = 0;
+            byte flavor = WOLFSSH_CERT_FLAVOR_UNKNOWN;
+        #endif
 
-            data = getBufferFromFile(hostCert, &dataSz, heap);
+            data = getBufferFromFile(hostCert, &dataSz, heap,
+                WOLFSSHD_LOAD_TRUST);
             if (data == NULL) {
+                /* secure-gate rejection or read failure, not memory */
                 wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] Error reading host key file.");
-                ret = WS_MEMORY_E;
+                    "[SSHD] Error reading host certificate file.");
+                ret = WS_BAD_FILE_E;
 
             }
 
             if (ret == WS_SUCCESS) {
-            #ifdef WOLFSSH_OPENSSH_CERTS
-                if (wolfSSH_CTX_UseOsshCert_buffer(*ctx, data, dataSz) < 0) {
-                    wolfSSH_Log(WS_LOG_ERROR,
-                        "[SSHD] Failed to use host certificate.");
-                    ret = WS_BAD_ARGUMENT;
-                }
-            #endif
             #ifdef WOLFSSH_CERTS
-                if (ret == WS_SUCCESS || ret == WS_BAD_ARGUMENT) {
-                    ret = wolfSSH_CTX_UseCert_buffer(*ctx, data, dataSz,
-                        WOLFSSH_FORMAT_PEM);
-                    if (ret != WS_SUCCESS) {
-                        ret = wolfSSH_CTX_UseCert_buffer(*ctx, data, dataSz,
+                if (dataSz == 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Host certificate file %s is empty.", hostCert);
+                    ret = WS_BAD_FILE_E;
+                }
+                else {
+                    /* Already read through the secure gate, so not _file. */
+                    ret = wolfSSH_ReadCert_buffer(data, dataSz, &der, &derSz,
+                        &type, &typeSz, &flavor, heap);
+                    if (ret == WS_SUCCESS
+                            && flavor != WOLFSSH_CERT_FLAVOR_X509) {
+                        /* Verifying OpenSSH host certs is unimplemented. */
+                        ret = WS_UNIMPLEMENTED_E;
+                    }
+                    if (ret == WS_SUCCESS) {
+                        ret = wolfSSH_CTX_UseCert_buffer(*ctx, der, derSz,
                             WOLFSSH_FORMAT_ASN1);
                     }
                     if (ret != WS_SUCCESS) {
                         wolfSSH_Log(WS_LOG_ERROR,
                             "[SSHD] Failed to load in host certificate.");
                     }
+                    if (der != NULL) {
+                        WFREE(der, heap, DYNTYPE_CERT);
+                    }
                 }
+            #else
+                /* Only OpenSSH host certificates could apply here, and they are
+                 * not implemented. Fail rather than ignore the directive. */
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] HostCertificate is set but OpenSSH host "
+                    "certificates are not supported in this build.");
+                ret = WS_UNIMPLEMENTED_E;
             #endif
 
                 freeBufferFromFile(data, heap);
@@ -424,23 +1304,259 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
 #endif /* WOLFSSH_OSSH_CERTS || WOLFSSH_CERTS */
 
 #ifdef WOLFSSH_CERTS
+    /* Load system CA certs from the OS trust store via wolfSSL into a
+     * temporary WOLFSSL_CTX, then import its cert manager. That cert manager
+     * verifies *client* certificates during user authentication, so every CA
+     * in the OS trust store becomes a login authority for this daemon. On a
+     * public trust store that is every commercial root CA, and the only
+     * remaining binding to an account is the certificate subject. Intended for
+     * a store that holds nothing but the organization's own CA. */
+    #ifdef WOLFSSL_SYS_CA_CERTS
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetSystemCA(conf)) {
+        WOLFSSL_CTX* sslCtx;
+
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] WARNING: wolfSSH_TrustedSystemCAKeys makes every CA in "
+            "the OS trust store an SSH user auth authority.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] Any cert issued by any of them whose subject matches a "
+            "local account name can log in as that account.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] Use this only when the OS trust store holds solely your "
+            "organization's CA.");
+    #ifdef WOLFSSH_NO_FPKI
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] WARNING: built without FPKI profile checking; peer certs "
+            "are held only to RFC 6187 key usage.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] A cert with no EKU, or one naming clientAuth or "
+            "secureShellClient, whose subject matches is accepted for login.");
+    #endif
+        sslCtx = wolfSSL_CTX_new(wolfSSLv23_server_method());
+        if (sslCtx == NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Unable to create temporary CTX for the system CAs");
+            ret = WS_FATAL_ERROR;
+        }
+
+        if (ret == WS_SUCCESS) {
+            if (wolfSSL_CTX_load_system_CA_certs(sslCtx) != WOLFSSL_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Issue loading system CAs");
+                ret = WS_FATAL_ERROR;
+            }
+        }
+
+        if (ret == WS_SUCCESS) {
+            if (wolfSSH_SetCertManager(*ctx,
+                wolfSSL_CTX_GetCertManager(sslCtx)) != WS_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Issue copying over system CAs");
+                ret = WS_FATAL_ERROR;
+            }
+        }
+
+        if (sslCtx != NULL) {
+            wolfSSL_CTX_free(sslCtx);
+        }
+    }
+    #else
+    /* The system CA directive is parsed unconditionally. Fail startup if it
+     * was set but wolfSSL was built without WOLFSSL_SYS_CA_CERTS, rather than
+     * silently running without the configured trust anchors. */
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetSystemCA(conf)) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_TrustedSystemCAKeys set but wolfSSL was built "
+            "without WOLFSSL_SYS_CA_CERTS.");
+        ret = WS_NOT_COMPILED;
+    }
+    #endif /* WOLFSSL_SYS_CA_CERTS */
+
+    /* Load user CA certs (trust anchors used to verify client X.509 certs)
+     * directly from a Windows certificate store into the cert manager. */
+    #if defined(WOLFSSH_CERTS) && defined(WOLFSSH_WINDOWS_CERT_STORE)
+    /* Mirror the wolfSSH_HostKeyStore* validation: the wolfSSH_WinUser* group
+     * only has an effect through LoadUserCACertsFromStore(), so accepting it
+     * without the store enabled would start the daemon with no client CA
+     * trust anchors and no indication why logins fail. */
+    if (ret == WS_SUCCESS && !wolfSSHD_ConfigGetUserCAStore(conf) &&
+            (wolfSSHD_ConfigGetWinUserPvPara(conf) != NULL ||
+             wolfSSHD_ConfigGetWinUserDwFlags(conf) != NULL ||
+             wolfSSHD_ConfigGetWinUserStores(conf) != NULL)) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] A wolfSSH_WinUser* option is set but "
+            "wolfSSH_TrustedUserCAStore is not enabled,");
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] so it would have no effect.");
+        ret = WS_BAD_ARGUMENT;
+    }
+
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetUserCAStore(conf)) {
+        ret = LoadUserCACertsFromStore(conf, *ctx, heap);
+    }
+    #else
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetUserCAStore(conf)) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_TrustedUserCAStore set but "
+            "WOLFSSH_WINDOWS_CERT_STORE is not compiled in.");
+        ret = WS_NOT_COMPILED;
+    }
+    #endif /* WOLFSSH_WINDOWS_CERT_STORE */
+
+    /* State the cert-to-user binding once at startup. Which one is in force is
+     * fixed by the wolfSSL build, not by configuration, so this cannot be
+     * derived from the config file. */
+    #if defined(WOLFSSH_CERTS) && !defined(WOLFSSL_FPKI) && defined(_WIN32)
+    if (ret == WS_SUCCESS && AnyNodeHasCertTrustAnchor(conf)) {
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] WARNING: client certificates are bound to an account by "
+            "subject CN only.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] Any CA in the trusted user CA set may assert any CN, so "
+            "keep that set narrow.");
+        wolfSSH_Log(WS_LOG_WARN,
+            "[SSHD] Build wolfSSL with FPKI for UPN binding and "
+            "AuthorizedUPNDomains.");
+    }
+
+    /* With CN-only binding, the OS trust store holds every commercial root
+     * CA, any of which could mint a certificate whose CN names a local
+     * account. Require every account to also have a per-user
+     * AuthorizedKeysFile so a subject CN match alone is never sufficient to
+     * log in; the exact certificate match in that file is the real binding.
+     * The curated wolfSSH_TrustedUserCAStore path is not held to this because
+     * its store is admin-created and the public store names are refused. */
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetSystemCA(conf)) {
+        const WOLFSSHD_CONFIG* cur;
+        word32 node = 0;
+
+        cur = conf;
+        while (cur != NULL) {
+            if (!wolfSSHD_ConfigGetAuthKeysFileSet(cur) ||
+                    !wolfSSHD_AuthKeysPatternIsPerUser(
+                        wolfSSHD_ConfigGetAuthKeysFile(cur))) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] wolfSSH_TrustedSystemCAKeys with CN-only cert "
+                    "binding requires a per-user AuthorizedKeysFile");
+                if (node == 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] for every account; the global config has "
+                        "none set before the first Match block.");
+                }
+                else {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] for every account; Match block %u has none "
+                        "(directives after a Match block do not apply to "
+                        "it).", node);
+                }
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Set AuthorizedKeysFile, use "
+                    "wolfSSH_TrustedUserCAStore with a curated store,");
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] or build wolfSSL with FPKI.");
+                ret = WS_BAD_ARGUMENT;
+                break;
+            }
+            cur = wolfSSHD_ConfigGetNext(cur);
+            node++;
+        }
+    }
+    #endif
+
+    #if defined(WOLFSSH_CERTS) && defined(WOLFSSL_FPKI)
+    /* The FPKI mirror of the gate above: with UPN binding, the realm
+     * allowlist is what constrains which CA-issued identities may log in.
+     * When the whole OS trust store is a login authority, require every
+     * config node to either set AuthorizedUPNDomains or carry its own
+     * per-user AuthorizedKeysFile (a shared file binds the certificate to
+     * nothing, so it does not qualify, matching the CN gate above). Note
+     * AuthorizedUPNDomains constrains the certificate's own UPN realm, not
+     * which trusted CA issued it: any CA in the OS store willing to emit a
+     * UPN in an allowed realm still satisfies it. The per-user
+     * AuthorizedKeysFile arm is the only one that adds an exact-certificate
+     * second factor. */
+    if (ret == WS_SUCCESS && wolfSSHD_ConfigGetSystemCA(conf)) {
+        const WOLFSSHD_CONFIG* cur;
+        const char* domains;
+
+        cur = conf;
+        while (cur != NULL) {
+            domains = wolfSSHD_ConfigGetAuthorizedUPNDomains(cur);
+            if ((domains == NULL || *domains == '\0') &&
+                    (!wolfSSHD_ConfigGetAuthKeysFileSet(cur) ||
+                     !wolfSSHD_AuthKeysPatternIsPerUser(
+                         wolfSSHD_ConfigGetAuthKeysFile(cur)))) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] wolfSSH_TrustedSystemCAKeys requires "
+                    "AuthorizedUPNDomains or a per-user");
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] AuthorizedKeysFile on every config node.");
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Note AuthorizedUPNDomains constrains the UPN "
+                    "realm only, not the issuing CA;");
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] use it only when the OS trust store holds "
+                    "solely your organization's CA.");
+                ret = WS_BAD_ARGUMENT;
+                break;
+            }
+            cur = wolfSSHD_ConfigGetNext(cur);
+        }
+    }
+
+    /* States a fixed configuration property, so notice it once here at
+     * startup rather than from the peer-triggered auth path (the log
+     * callback writes WARN unconditionally, so a per-attempt WARN would let
+     * a peer grow the log). Only emitted when a certificate trust anchor is
+     * actually configured; with no CA there is no UPN check to relax. */
+    if (ret == WS_SUCCESS && AnyNodeHasCertTrustAnchor(conf)) {
+        const WOLFSSHD_CONFIG* cur;
+        const char* domains;
+
+        cur = conf;
+        while (cur != NULL) {
+            domains = wolfSSHD_ConfigGetAuthorizedUPNDomains(cur);
+            if (domains == NULL || *domains == '\0') {
+                wolfSSH_Log(WS_LOG_WARN,
+                    "[SSHD] AuthorizedUPNDomains not set on at least one "
+                    "config node;");
+                wolfSSH_Log(WS_LOG_WARN,
+                    "[SSHD] the certificate UPN domain is not checked "
+                    "there.");
+                break;
+            }
+            cur = wolfSSHD_ConfigGetNext(cur);
+        }
+    }
+    #endif /* WOLFSSH_CERTS && WOLFSSL_FPKI */
+
+    /* load in CA certs from file set */
     if (ret == WS_SUCCESS) {
         char* caCert = wolfSSHD_ConfigGetUserCAKeysFile(conf);
         if (caCert != NULL) {
             byte*  data;
             word32 dataSz = 0;
 
-
             wolfSSH_Log(WS_LOG_INFO, "[SSHD] Using CA keys file %s", caCert);
-            data = getBufferFromFile(caCert, &dataSz, heap);
+            data = getBufferFromFile(caCert, &dataSz, heap,
+                WOLFSSHD_LOAD_TRUST);
             if (data == NULL) {
+                /* secure-gate rejection or read failure, not memory */
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Error reading CA cert file.");
-                ret = WS_MEMORY_E;
+                ret = WS_BAD_FILE_E;
 
             }
 
-            if (ret == WS_SUCCESS) {
+            if (ret == WS_SUCCESS && dataSz == 0) {
+                /* Empty means misconfigured, not a CA in another format. */
+                wolfSSH_Log(WS_LOG_ERROR, "[SSHD] CA keys file %s is empty.",
+                    caCert);
+                ret = WS_BAD_FILE_E;
+                freeBufferFromFile(data, heap);
+            }
+            else if (ret == WS_SUCCESS) {
+                /* A CA is never named on the wire, so it takes raw bytes. */
                 ret = wolfSSH_CTX_AddRootCert_buffer(*ctx, data, dataSz,
                     WOLFSSH_FORMAT_PEM);
                 if (ret != WS_SUCCESS) {
@@ -448,10 +1564,13 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
                         WOLFSSH_FORMAT_ASN1);
                 }
                 if (ret != WS_SUCCESS) {
-                #ifdef WOLFSSH_OPENSSH_CERTS
+                #ifdef WOLFSSH_OSSH_CERTS
+                    /* The file is not X.509; when OpenSSH certificates are also
+                     * built, fall through and let the OpenSSH user-auth path
+                     * consume TrustedUserCAKeys instead of failing startup. */
                     wolfSSH_Log(WS_LOG_INFO,
-                        "[SSHD] Continuing on in case CA is openssh "
-                        "style.");
+                        "[SSHD] CA keys file is not X.509; using it as an "
+                        "OpenSSH-style CA.");
                     ret = WS_SUCCESS;
                 #else
                     wolfSSH_Log(WS_LOG_ERROR,
@@ -463,7 +1582,68 @@ static int SetupCTX(WOLFSSHD_CONFIG* conf, WOLFSSH_CTX** ctx,
             }
         }
     }
+#else
+    if (ret == WS_SUCCESS && (wolfSSHD_ConfigGetSystemCA(conf)
+                              || wolfSSHD_ConfigGetUserCAStore(conf))) {
+        wolfSSH_Log(WS_LOG_ERROR,
+            "[SSHD] wolfSSH_TrustedSystemCAKeys/wolfSSH_TrustedUserCAStore set "
+            "but wolfSSH was built without WOLFSSH_CERTS.");
+        ret = WS_NOT_COMPILED;
+    }
 #endif
+
+    /* AuthorizedUPNDomains is only enforced by the FPKI UPN check, which
+     * also needs certificate support. Fail startup rather than silently
+     * ignore a configured realm policy, unless the build opts into
+     * WOLFSSH_IGNORE_UNKNOWN_CONFIG, which downgrades not-compiled-in
+     * directives to a warning the same way the wolfSSH_HostKeyStore* and
+     * wolfSSH_WinUser* handlers do. Check every config node since the
+     * directive may sit in a Match block. */
+#if !defined(WOLFSSL_FPKI) || !defined(WOLFSSH_CERTS)
+    if (ret == WS_SUCCESS) {
+        const WOLFSSHD_CONFIG* upnCur;
+        word32 upnNode = 0;
+
+        upnCur = conf;
+        while (upnCur != NULL) {
+            if (wolfSSHD_ConfigGetAuthorizedUPNDomains(upnCur) != NULL) {
+            #ifdef WOLFSSH_IGNORE_UNKNOWN_CONFIG
+                if (upnNode == 0) {
+                    wolfSSH_Log(WS_LOG_WARN,
+                        "[SSHD] Ignoring AuthorizedUPNDomains (global "
+                        "config): this build cannot enforce it;");
+                }
+                else {
+                    wolfSSH_Log(WS_LOG_WARN,
+                        "[SSHD] Ignoring AuthorizedUPNDomains (Match block "
+                        "%u): this build cannot enforce it;", upnNode);
+                }
+                wolfSSH_Log(WS_LOG_WARN,
+                    "[SSHD] it requires wolfSSL with WOLFSSL_FPKI and "
+                    "wolfSSH with certificate support.");
+            #else
+                if (upnNode == 0) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] AuthorizedUPNDomains is set (global config) "
+                        "but this build cannot enforce it;");
+                }
+                else {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] AuthorizedUPNDomains is set (Match block %u) "
+                        "but this build cannot enforce it;", upnNode);
+                }
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] it requires wolfSSL with WOLFSSL_FPKI and "
+                    "wolfSSH with certificate support.");
+                ret = WS_BAD_ARGUMENT;
+            #endif
+                break;
+            }
+            upnCur = wolfSSHD_ConfigGetNext(upnCur);
+            upnNode++;
+        }
+    }
+#endif /* !WOLFSSL_FPKI || !WOLFSSH_CERTS */
 
     if (ret == WS_SUCCESS) {
         wolfSSH_SetUserAuthTypes(*ctx, DefaultUserAuthTypes);
@@ -494,12 +1674,16 @@ static int SetupChroot(WOLFSSHD_CONFIG* usrConf)
                 "[SSHD] chdir to chroot path failed, %s", chrootPath);
             ret = WS_FATAL_ERROR;
         }
-        if (chroot(chrootPath) != 0) {
+        /* Only chroot() once the chdir() into the target succeeded, and only
+         * chdir("/") once inside the new root. Running a later step after an
+         * earlier failure could leave the process chrooted with a working
+         * directory outside the new root. */
+        if (ret == 1 && chroot(chrootPath) != 0) {
             wolfSSH_Log(WS_LOG_ERROR,
                 "[SSHD] chroot failed to path %s", chrootPath);
             ret = WS_FATAL_ERROR;
         }
-        if (chdir("/") != 0) {
+        if (ret == 1 && chdir("/") != 0) {
             wolfSSH_Log(WS_LOG_ERROR,
                 "[SSHD] chdir after chroot failed");
             ret = WS_FATAL_ERROR;
@@ -508,6 +1692,38 @@ static int SetupChroot(WOLFSSHD_CONFIG* usrConf)
     return ret;
 }
 #endif
+
+/* Resolve the force-command in effect for this session. A configured
+ * ForceCommand takes precedence over a certificate's force-command. Returns
+ * NULL when none is set. */
+static const char* GetEffectiveForcedCmd(WOLFSSHD_CONNECTION* conn,
+    WOLFSSHD_CONFIG* usrConf)
+{
+    const char* forcedCmd;
+
+    forcedCmd = wolfSSHD_ConfigGetForcedCmd(usrConf);
+#ifdef WOLFSSH_OSSH_CERTS
+    forcedCmd = wolfSSHD_AuthMergeForcedCmd(forcedCmd,
+        wolfSSHD_AuthGetForcedCmd(conn->auth));
+#else
+    (void)conn;
+#endif
+    return forcedCmd;
+}
+
+
+/* The force-command carried by an authenticated certificate, or NULL. A
+ * configured ForceCommand does not mask it: the certificate restricts what the
+ * session may do, while ForceCommand replaces what is run. */
+static const char* GetCertForcedCmd(WOLFSSHD_CONNECTION* conn)
+{
+#ifdef WOLFSSH_OSSH_CERTS
+    return wolfSSHD_AuthGetForcedCmd(conn->auth);
+#else
+    (void)conn;
+    return NULL;
+#endif
+}
 
 #ifdef WOLFSSH_SCP
 static int SCP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
@@ -542,12 +1758,10 @@ static int SCP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (wolfSSHD_AuthReducePermissionsUser(conn->auth, pPasswd->pw_uid,
             pPasswd->pw_gid) != WS_SUCCESS) {
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user ID");
-        if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-            /* stop everything if not able to reduce permissions level */
-            exit(1);
-        }
-
-        return WS_FATAL_ERROR;
+        /* could not drop to the authenticated user; terminate the
+         * per-connection process rather than continue at a higher
+         * privilege level */
+        exit(1);
     }
 #else
     /* impersonate the logged on user for file permissions */
@@ -661,12 +1875,10 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (wolfSSHD_AuthReducePermissionsUser(conn->auth, pPasswd->pw_uid,
             pPasswd->pw_gid) != WS_SUCCESS) {
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user ID");
-        if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-            /* stop everything if not able to reduce permissions level */
-            exit(1);
-        }
-
-        return WS_FATAL_ERROR;
+        /* could not drop to the authenticated user; terminate the
+         * per-connection process rather than continue at a higher
+         * privilege level */
+        exit(1);
     }
 #else
     char r[MAX_PATH];
@@ -718,6 +1930,8 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                                 * if there is still pending sends */
                 }
                 if (error == WS_EOF) {
+                    /* An ordinary session end, not a failure. */
+                    ret = 0;
                     break;
                 }
             }
@@ -744,10 +1958,19 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                     continue;
                 }
 
+                /* Drain what is buffered first. A rekey is not a drained
+                 * channel: peek reports it without looking. */
                 if (error == WS_EOF) {
-                    break;
+                    int peekRet = wolfSSH_stream_peek(ssh, NULL, 1);
+
+                    if (peekRet != WS_REKEYING && peekRet <= 0) {
+                        /* An ordinary session end, not a failure. */
+                        ret = 0;
+                        break;
+                    }
                 }
-                if (ret != WS_SUCCESS && ret != WS_CHAN_RXD) {
+                if (ret != WS_SUCCESS && ret != WS_CHAN_RXD
+                        && ret != WS_EOF) {
                     /* If not successful and no channel data, leave. */
                     break;
                 }
@@ -764,8 +1987,11 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                     error == WS_CHAN_RXD || error == WS_REKEYING ||
                     error == WS_WINDOW_FULL)
                     ret = error;
-                if (error == WS_EOF)
+                if (error == WS_EOF) {
+                    /* An ordinary session end, not a failure. */
+                    ret = 0;
                     break;
+                }
                 continue;
             }
             else if (ret == WS_REKEYING) {
@@ -774,8 +2000,17 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             }
             else if (ret < 0) {
                 error = wolfSSH_get_error(ssh);
-                if (error == WS_EOF)
+                if (error == WS_EOF) {
+                    /* An ordinary session end, not a failure. */
+                    ret = 0;
                     break;
+                }
+            }
+            else {
+                /* Channel is live with nothing buffered. Let the next select
+                 * block instead of polling at its 100 us floor. */
+                timeout = TEST_SFTP_TIMEOUT;
+                continue;
             }
 
             if (ret == WS_FATAL_ERROR && error == 0) {
@@ -806,6 +2041,43 @@ static int SFTP_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
 #define MAX_COMMAND_SZ 80
 #endif
 
+/* What a send did with the bytes it did not take, which a byte count on its
+ * own cannot say. */
+typedef enum {
+    SHELL_SEND_READY,    /* a packet-size clamp only; send again now        */
+    SHELL_SEND_BLOCKED,  /* credit, rekey or the socket; wait on the socket */
+    SHELL_SEND_NEVER     /* the channel can never take them; end the session */
+} SHELL_SEND_STATE;
+
+typedef struct {
+    int              len;    /* bytes still in shellBuffer; 0 means none held */
+    SHELL_SEND_STATE state;  /* SHELL_SEND_READY whenever len is 0            */
+    int              ext;    /* held bytes belong to the extended data stream */
+} SHELL_BACKLOG;
+
+static SHELL_SEND_STATE SHELL_BacklogState(WOLFSSH* ssh, int sendRet,
+    word32 channelId)
+{
+    WOLFSSH_CHANNEL* channel;
+
+    if (sendRet == WS_REKEYING || wolfSSH_OutputPending(ssh))
+        return SHELL_SEND_BLOCKED;
+
+    channel = wolfSSH_ChannelFind(ssh, channelId, WS_CHANNEL_ID_SELF);
+    if (channel == NULL)
+        return SHELL_SEND_NEVER;
+
+    /* a zero packet size is permanent; test it before the window, which
+     * would otherwise mask it whenever both are zero */
+    if (channel->peerMaxPacketSz == 0 || channel->maxPacketSz == 0)
+        return SHELL_SEND_NEVER;
+
+    if (channel->peerWindowSz == 0)
+        return SHELL_SEND_BLOCKED;
+
+    return SHELL_SEND_READY;
+}
+
 #ifdef WIN32
 
 /* handles creating a new shell env. and maintains SSH connection for incoming
@@ -820,8 +2092,19 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     /* default to try and read max packet size */
     #define WOLFSSHD_SHELL_BUFFER_SZ 32768
 #endif
+#ifndef WOLFSSHD_SHELL_POLL_WAIT_US
+    /* the child's console pipe is a handle, not a socket, so select() cannot
+     * watch it; wake this often to poll it with PeekNamedPipe() instead */
+    #define WOLFSSHD_SHELL_POLL_WAIT_US 800
+#endif
+#ifndef WOLFSSHD_SHELL_BLOCKED_WAIT_SEC
+    /* cap on the wait taken when only the socket can make progress */
+    #define WOLFSSHD_SHELL_BLOCKED_WAIT_SEC 1
+#endif
     byte shellBuffer[WOLFSSHD_SHELL_BUFFER_SZ];
+    byte channelBuffer[WOLFSSHD_SHELL_BUFFER_SZ];
     int cnt_r, cnt_w;
+    SHELL_BACKLOG backlog;
     HANDLE ptyIn = NULL, ptyOut = NULL;
     HANDLE cnslIn = NULL, cnslOut = NULL;
     STARTUPINFOEX ext;
@@ -832,10 +2115,24 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
 #endif
     PWSTR cmd = NULL;
     size_t cmdSz = 0;
+    PWSTR conCmdPtr = NULL;
+    size_t conCmdSz = 0;
     PROCESS_INFORMATION processInfo;
+    int processCreated = 0;
     size_t sz = 0;
     WCHAR h[MAX_PATH];
     char* forcedCmd;
+    WOLFSSH_CHANNEL* shellChannel;
+
+    /* Off the channel list, not DEFAULT_NEXT_CHANNEL, which a build can
+     * override. Same as the POSIX copy; this loop routes its reads and sends
+     * off the same id. */
+    shellChannel = wolfSSH_ChannelNext(ssh, NULL);
+    if (shellChannel == NULL || wolfSSH_ChannelGetId(shellChannel,
+            &shellChannelId, WS_CHANNEL_ID_SELF) != WS_SUCCESS) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] No session channel to service");
+        return WS_FATAL_ERROR;
+    }
 
     forcedCmd = wolfSSHD_ConfigGetForcedCmd(usrConf);
 
@@ -890,6 +2187,8 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                 /* read in case a window-change packet might be queued */
                 {
                     int rc;
+                    int selected = WS_SELECT_SEND_READY;
+                    WS_SOCKET_T fd = wolfSSH_get_fd(ssh);
                     word32 lastChannel = 0;
 
                     do {
@@ -897,7 +2196,20 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                         if (rc < 0) {
                             rc = wolfSSH_get_error(ssh);
                         }
-                    } while (rc == WS_WANT_WRITE);
+                        if (rc == WS_WANT_WRITE) {
+                            selected = tcp_select_write(fd, 1);
+                        }
+                    } while (rc == WS_WANT_WRITE
+                            && selected == WS_SELECT_SEND_READY);
+
+                    /* A dead socket ends the session */
+                    if (ret == WS_SUCCESS
+                            && (selected == WS_SELECT_ERROR_READY
+                                || selected == WS_SELECT_FAIL
+                                || rc == WS_SOCKET_ERROR_E
+                                || rc == WS_DISCONNECT)) {
+                        ret = WS_FATAL_ERROR;
+                    }
                 }
             }
         }
@@ -937,8 +2249,6 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (ret == WS_SUCCESS) {
         STARTUPINFOW si;
         PCWSTR conCmd = L"wolfsshd.exe -r ";
-        PWSTR conCmdPtr;
-        size_t conCmdSz;
 
         SetHandleInformation(ptyIn, HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(ptyOut, HANDLE_FLAG_INHERIT, 0);
@@ -971,18 +2281,27 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             &si, &processInfo) != TRUE) {
             wolfSSH_Log(WS_LOG_ERROR,
                 "[SSHD] Issue creating process, Windows error %d", GetLastError());
-            return WS_FATAL_ERROR;
+            ret = WS_FATAL_ERROR;
+            goto cleanup;
         }
 
-        CloseHandle(cnslIn);
-        CloseHandle(cnslOut);
+        processCreated = 1;
 
-        WFREE(conCmdPtr, NULL, DYNTYPE_SSHD);
+        /* Release the parent's copies of the child's stdio handles now that
+         * the child has inherited them. Holding cnslOut (write-end of stdout
+         * pipe) open would prevent the OS from signalling EOF when the child
+         * exits, making any future blocking ReadFile loop hang indefinitely. */
+        CloseHandle(cnslIn);
+        cnslIn = NULL;
+        CloseHandle(cnslOut);
+        cnslOut = NULL;
     }
 
     if (ret == WS_SUCCESS) {
-        char cmdWSize[20];
-        int cmdWSizeSz = 20;
+        /* Worst case "\x1b[8;%u;%ut" with two 10-digit word32 values is 26
+         * bytes plus the terminator; size generously. */
+        char cmdWSize[32];
+        int cmdWSizeSz;
         DWORD wrtn = 0;
 
         wolfSSH_Log(WS_LOG_INFO, "[SSHD] Successfully created process for "
@@ -990,8 +2309,15 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
 
         WaitForInputIdle(processInfo.hProcess, 1000);
 
-        /* Send initial terminal size to pseudo console with VT control sequence */
-        cmdWSizeSz = snprintf(cmdWSize, cmdWSizeSz, "\x1b[8;%d;%dt", ssh->heightRows, ssh->widthChar);
+        /* Send initial terminal size to pseudo console with VT control sequence.
+         * heightRows/widthChar are peer-supplied word32 values, so format them
+         * with %u and clamp the return value before handing it to WriteFile to
+         * avoid over-reading the stack buffer. */
+        cmdWSizeSz = WSNPRINTF(cmdWSize, sizeof(cmdWSize), "\x1b[8;%u;%ut",
+            ssh->heightRows, ssh->widthChar);
+        if (cmdWSizeSz < 0 || cmdWSizeSz >= (int)sizeof(cmdWSize)) {
+            cmdWSizeSz = (int)sizeof(cmdWSize) - 1;
+        }
         if (WriteFile(ptyIn, cmdWSize, cmdWSizeSz, &wrtn, 0) != TRUE) {
             WLOG(WS_LOG_ERROR, "Issue with pseudo console resize");
             ret = WS_FATAL_ERROR;
@@ -1002,24 +2328,51 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         SOCKET sshFd;
         byte tmp[2];
         fd_set readFds;
+        fd_set writeFds;
+        fd_set* writeFdsPtr;
         WS_SOCKET_T maxFd;
         int pending = 0;
         int readPending = 0;
+        int wantWrite = 0;
         int rc = 0;
-        DWORD processState;
+        DWORD processState = 0;
         DWORD ava;
         struct timeval t;
-
-        t.tv_sec = 0;
-        t.tv_usec = 800;
 
         sshFd = wolfSSH_get_fd(ssh);
         maxFd = sshFd;
 
-        FD_ZERO(&readFds);
-        FD_SET(sshFd, &readFds);
+        backlog.len = 0;
+        backlog.state = SHELL_SEND_READY;
+        backlog.ext = 0;
+
+        /* a send before the loop can leave output queued */
+        if (wolfSSH_OutputPending(ssh)) {
+            wantWrite = 1;
+        }
 
         do {
+            FD_ZERO(&readFds);
+            FD_SET(sshFd, &readFds);
+
+            /* Winsock rejects a non-NULL descriptor set holding no socket,
+             * so the write set is passed as NULL until a write is owed. */
+            FD_ZERO(&writeFds);
+            writeFdsPtr = NULL;
+            if (wantWrite) {
+                FD_SET(sshFd, &writeFds);
+                writeFdsPtr = &writeFds;
+            }
+
+            pending = 0;
+
+            if (backlog.len && backlog.state == SHELL_SEND_NEVER) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Channel will not take the shell output");
+                TerminateProcess(processInfo.hProcess, 1);
+                break;
+            }
+
             /* @TODO currently not blocking till data comes in */
             if (PeekNamedPipe(ptyOut, NULL, 0, NULL, &ava, NULL) == TRUE) {
                 if (ava > 0) {
@@ -1046,30 +2399,49 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                                 continue;
                             }
                         }
-                        break;
+                        /* keep looping while buffered data still needs to be
+                         * flushed to the SSH channel */
+                        if (!backlog.len)
+                            break;
                     }
-                }
-                if (wolfSSH_stream_peek(ssh, tmp, 1) <= 0) {
-                    rc = select((int)maxFd + 1, &readFds, NULL, NULL, &t);
-                    if (rc == -1) {
-                        wolfSSH_Log(WS_LOG_INFO,
-                            "[SSHD] select call waiting on socket failed");
-                        break;
-                    }
-                    /* when select times out and no socket is set as ready
-                       Windows overwrites readFds with 0. Reset the fd here
-                       for next select call */
-                    if (rc == 0) {
-                        FD_SET(sshFd, &readFds);
-                    }
-                }
-                else {
-                    pending = 1;
                 }
             }
 
-            if (rc != 0 && (pending || FD_ISSET(sshFd, &readFds))) {
+            if (wolfSSH_stream_peek(ssh, tmp, 1) > 0) {
+                pending = 1;
+            }
+
+            if (backlog.len && backlog.state == SHELL_SEND_READY) {
+                t.tv_sec = 0;
+                t.tv_usec = 0;
+            }
+            else if (backlog.len) {
+                t.tv_sec = WOLFSSHD_SHELL_BLOCKED_WAIT_SEC;
+                t.tv_usec = 0;
+            }
+            else if (readPending) {
+                /* the child's output is in hand, so do not wait */
+                t.tv_sec = 0;
+                t.tv_usec = 0;
+            }
+            else {
+                /* select() cannot watch the pipe, so wake and poll it */
+                t.tv_sec = 0;
+                t.tv_usec = WOLFSSHD_SHELL_POLL_WAIT_US;
+            }
+
+            rc = select((int)maxFd + 1, &readFds, writeFdsPtr, NULL, &t);
+            if (rc == -1) {
+                wolfSSH_Log(WS_LOG_INFO,
+                    "[SSHD] select call waiting on socket failed");
+                break;
+            }
+
+            if (FD_ISSET(sshFd, &writeFds) || backlog.len || pending
+                    || FD_ISSET(sshFd, &readFds)) {
                 word32 lastChannel = 0;
+
+                wantWrite = 0;
 
                 /* The following tries to read from the first channel inside
                    the stream. If the pending data in the socket is for
@@ -1078,18 +2450,26 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                    channel. The additional channel is only used with the
                    agent. */
                 cnt_r = wolfSSH_worker(ssh, &lastChannel);
+                if (wolfSSH_OutputPending(ssh)) {
+                    wantWrite = 1;
+                }
                 if (cnt_r < 0) {
-                    rc = wolfSSH_get_error(ssh);
-                    if (rc == WS_CHAN_RXD) {
+                    if (cnt_r == WS_CHAN_RXD || cnt_r == WS_REKEYING) {
+                        /* WS_REKEYING is returned in place of WS_CHAN_RXD */
                         if (lastChannel == shellChannelId) {
                             cnt_r = wolfSSH_ChannelIdRead(ssh,
-                                shellChannelId, shellBuffer,
-                                sizeof shellBuffer);
-                            if (cnt_r <= 0)
+                                shellChannelId, channelBuffer,
+                                sizeof channelBuffer);
+                            if (cnt_r < 0)
                                 break;
+                            /* the window adjust that read issued may itself
+                             * still be queued */
+                            if (wolfSSH_OutputPending(ssh)) {
+                                wantWrite = 1;
+                            }
                             pending = 0;
-                            if (WriteFile(ptyIn, shellBuffer, cnt_r, &cnt_r,
-                                NULL) != TRUE) {
+                            if (cnt_r > 0 && WriteFile(ptyIn, channelBuffer,
+                                cnt_r, &cnt_r, NULL) != TRUE) {
                                 wolfSSH_Log(WS_LOG_INFO,
                                     "[SSHD] Error writing to pipe for "
                                     "console");
@@ -1097,16 +2477,61 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                             }
                         }
                     }
-                    else if (rc == WS_CHANNEL_CLOSED) {
+                    else if (cnt_r == WS_CHANNEL_CLOSED) {
+                        if (backlog.len)
+                            backlog.state = SHELL_SEND_NEVER;
                         continue;
                     }
-                    else if (rc != WS_WANT_READ) {
+                    else if (cnt_r == WS_EOF) {
+                        /* The peer is done sending. No EOF of ours here, or
+                         * eofTxd latches and the child's remaining output is
+                         * refused. Closing its stdin is still owed here. */
+                        continue;
+                    }
+                    else if (cnt_r == WS_WANT_WRITE) {
+                        /* Transient; the queue drives the write side. */
+                    }
+                    else if (cnt_r != WS_FATAL_ERROR
+                            || (wolfSSH_get_error(ssh) != WS_WANT_READ
+                                && wolfSSH_get_error(ssh) != WS_WANT_WRITE)) {
                         break;
                     }
                 }
             }
 
-            if (readPending) {
+            /* if a previous send could not complete, resend the buffered data
+             * before reading more so shellBuffer is not overwritten */
+            if (backlog.len) {
+                cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
+                    shellBuffer, backlog.len);
+                if (wolfSSH_OutputPending(ssh)) {
+                    wantWrite = 1;
+                }
+                if (cnt_w == WS_WINDOW_FULL || cnt_w == WS_REKEYING ||
+                    cnt_w == WS_WANT_WRITE) {
+                    backlog.state = SHELL_BacklogState(ssh, cnt_w, shellChannelId);
+                    continue;
+                }
+                else if (cnt_w < 0) {
+                    break;
+                }
+                else {
+                    backlog.len -= cnt_w;
+                    if (backlog.len > 0) {
+                        WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
+                            backlog.len);
+                        backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                            shellChannelId);
+                        continue;
+                    }
+                    else {
+                        backlog.len = 0;
+                        backlog.state = SHELL_SEND_READY;
+                    }
+                }
+            }
+
+            if (readPending && !backlog.len) {
                 WMEMSET(shellBuffer, 0, WOLFSSHD_SHELL_BUFFER_SZ);
 
                 if (ReadFile(ptyOut, shellBuffer, WOLFSSHD_SHELL_BUFFER_SZ, &cnt_r,
@@ -1120,16 +2545,31 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                     if (cnt_r > 0) {
                         cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
                             shellBuffer, cnt_r);
-                        if (cnt_w < 0)
+                        if (wolfSSH_OutputPending(ssh)) {
+                            wantWrite = 1;
+                        }
+                        if (cnt_w > 0 && cnt_w < cnt_r) { /* partial send */
+                            backlog.len = cnt_r - cnt_w;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                shellChannelId);
+                            WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
+                                backlog.len);
+                        }
+                        else if (cnt_w == WS_WINDOW_FULL ||
+                                 cnt_w == WS_REKEYING ||
+                                 cnt_w == WS_WANT_WRITE) {
+                            backlog.len = cnt_r;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                shellChannelId);
+                        }
+                        else if (cnt_w < 0) {
                             break;
+                        }
                     }
                 }
             }
         } while (1);
 
-        if (cmd != NULL) {
-            WFREE(cmd, NULL, DYNTYPE_SSHD);
-        }
         wolfSSH_Log(WS_LOG_INFO,
             "[SSHD] Closing down process for console");
 
@@ -1143,11 +2583,36 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                 "status");
         }
 
-        CloseHandle(processInfo.hThread);
-        CloseHandle(wolfSSHD_GetAuthToken(conn->auth));
     }
 
+cleanup:
+    if (conCmdPtr != NULL) {
+        WFREE(conCmdPtr, NULL, DYNTYPE_SSHD);
+    }
+    if (cnslIn != NULL) {
+        CloseHandle(cnslIn);
+    }
+    if (cnslOut != NULL) {
+        CloseHandle(cnslOut);
+    }
+    if (ptyIn != NULL) {
+        CloseHandle(ptyIn);
+    }
+    if (ptyOut != NULL) {
+        CloseHandle(ptyOut);
+    }
+    /* back to the service account, unloading the profile needs its privileges */
     RevertToSelf();
+    if (processCreated) {
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        wolfSSHD_AuthCloseToken(conn->auth);
+    }
+    if (cmd != NULL) {
+        WFREE(cmd, NULL, DYNTYPE_SSHD);
+    }
+    WS_FORCEZERO(channelBuffer, sizeof channelBuffer);
+    WS_FORCEZERO(shellBuffer, sizeof shellBuffer);
     return ret;
 }
 #else
@@ -1172,6 +2637,110 @@ static int SHELL_IsPty(WOLFSSH* ssh)
     return ret;
 }
 
+/* set a descriptor to non blocking, returns 0 on success and -1 on failure */
+static int SHELL_SetNonBlocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] fcntl get failed");
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] fcntl set failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+#ifndef WOLFSSHD_SHELL_FLUSH_TRIES
+    #define WOLFSSHD_SHELL_FLUSH_TRIES 10
+#endif
+#ifndef WOLFSSHD_SHELL_FLUSH_WAIT_US
+    #define WOLFSSHD_SHELL_FLUSH_WAIT_US 50000
+#endif
+
+/* Send out the last of a shell's output once the child has been reaped. The
+ * SSH socket is non blocking, so retry a bounded number of times on a full
+ * window, a rekey or a would block. 'ext' selects the extended (stderr) data
+ * stream. Returns 0 on success and -1 when the data could not all be sent. */
+static int SHELL_FlushOut(WOLFSSH* ssh, WS_SOCKET_T sshFd, word32 channelId,
+    byte* buf, int sz, int ext)
+{
+    int tries = 0;
+
+    while (sz > 0 && tries < WOLFSSHD_SHELL_FLUSH_TRIES) {
+        int cnt_w;
+
+        if (ext) {
+            cnt_w = wolfSSH_extended_data_send(ssh, buf, sz);
+        }
+        else {
+            cnt_w = wolfSSH_ChannelIdSend(ssh, channelId, buf, sz);
+        }
+
+        if (cnt_w == WS_WINDOW_FULL || cnt_w == WS_REKEYING ||
+                cnt_w == WS_WANT_WRITE) {
+            fd_set fds;
+            struct timeval to;
+
+            FD_ZERO(&fds);
+            FD_SET(sshFd, &fds);
+            to.tv_sec  = 0;
+            to.tv_usec = WOLFSSHD_SHELL_FLUSH_WAIT_US;
+            if (cnt_w == WS_WANT_WRITE) {
+                select((int)sshFd + 1, NULL, &fds, NULL, &to);
+            }
+            else {
+                /* waiting on the peer's window adjust or kex packets */
+                select((int)sshFd + 1, &fds, NULL, NULL, &to);
+            }
+
+            /* process what came in, otherwise the window never opens and
+             * the rekey never finishes, and the send can not progress */
+            if (wolfSSH_worker(ssh, NULL) < 0) {
+                int err = wolfSSH_get_error(ssh);
+
+                /* A peer EOF during the final flush is expected. */
+                if (err != WS_WANT_READ && err != WS_WANT_WRITE &&
+                        err != WS_CHAN_RXD && err != WS_REKEYING &&
+                        err != WS_EOF) {
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Issue draining connection on final flush");
+                    return -1;
+                }
+            }
+            tries++;
+            continue;
+        }
+
+        if (cnt_w < 0) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Issue sending final shell output");
+            return -1;
+        }
+
+        sz -= cnt_w;
+        if (sz > 0) {
+            WMEMMOVE(buf, buf + cnt_w, sz);
+            tries++;
+        }
+    }
+
+    if (sz > 0) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to send all of the final "
+            "shell output, %d bytes dropped", sz);
+        return -1;
+    }
+
+    return 0;
+}
+
+
 /* handles creating a new shell env. and maintains SSH connection for incoming
  * user input as well as output of the shell.
  * return WS_SUCCESS on success */
@@ -1194,14 +2763,22 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
 #endif
     byte shellBuffer[WOLFSSHD_SHELL_BUFFER_SZ];
     byte channelBuffer[WOLFSSHD_SHELL_BUFFER_SZ];
-    char* forcedCmd;
-    int   windowFull = 0; /* Contains size of bytes from shellBuffer that did
-                           * not get passed on to wolfSSH yet. This happens
-                           * with window full errors or when rekeying.  */
+    const char* forcedCmd;
+    SHELL_BACKLOG backlog;
     int   wantWrite  = 0;
     int   peerConnected = 1;
     int   stdoutEmpty = 0;
+    int   stderrEmpty = 0;
     int   ptyReq = 0;
+    int   childInSz = 0;  /* Bytes read off the channel into channelBuffer
+                           * that the child has yet to take. The read is
+                           * destructive, so what a short write leaves is
+                           * carried to the next pass.  */
+    int   childInIdx = 0; /* How much of those the child has taken.  */
+
+    backlog.len = 0;
+    backlog.state = SHELL_SEND_READY;
+    backlog.ext = 0;
 
     childFd = -1;
     stdoutPipe[0] = -1;
@@ -1211,7 +2788,7 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     stdinPipe[0] = -1;
     stdinPipe[1] = -1;
 
-    forcedCmd = wolfSSHD_ConfigGetForcedCmd(usrConf);
+    forcedCmd = GetEffectiveForcedCmd(conn, usrConf);
 
     ptyReq = SHELL_IsPty(ssh);
     if (ptyReq < 0) {
@@ -1222,7 +2799,7 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     /* do not overwrite a forced command with 'exec' sub shell. Only set the
      * 'exec' command when no forced command is set */
     if (forcedCmd == NULL) {
-        forcedCmd = (char*)subCmd;
+        forcedCmd = subCmd;
     }
 
     if (forcedCmd != NULL && WSTRCMP(forcedCmd, "internal-sftp") == 0) {
@@ -1243,12 +2820,22 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (!ptyReq || forcedCmd) {
         if (pipe(stdoutPipe) != 0) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue creating stdout pipe");
+            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error lowering permissions level");
+                exit(1);
+            }
             return WS_FATAL_ERROR;
         }
         if (pipe(stderrPipe) != 0) {
             close(stdoutPipe[0]);
             close(stdoutPipe[1]);
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue creating stderr pipe");
+            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error lowering permissions level");
+                exit(1);
+            }
             return WS_FATAL_ERROR;
         }
         if (pipe(stdinPipe) != 0) {
@@ -1257,6 +2844,11 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             close(stderrPipe[0]);
             close(stderrPipe[1]);
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue creating stdin pipe");
+            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
+                wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Error lowering permissions level");
+                exit(1);
+            }
             return WS_FATAL_ERROR;
         }
     }
@@ -1267,10 +2859,30 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         /* forkpty failed, so return */
         ChildRunning = 0;
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue creating new forkpty");
+        if (!ptyReq || forcedCmd) {
+            close(stdoutPipe[0]);
+            close(stdoutPipe[1]);
+            close(stderrPipe[0]);
+            close(stderrPipe[1]);
+            close(stdinPipe[0]);
+            close(stdinPipe[1]);
+            stdoutPipe[0] = -1;
+            stdoutPipe[1] = -1;
+            stderrPipe[0] = -1;
+            stderrPipe[1] = -1;
+            stdinPipe[0]  = -1;
+            stdinPipe[1]  = -1;
+        }
+        if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                    "[SSHD] Error lowering permissions level");
+            exit(1);
+        }
         return WS_FATAL_ERROR;
     }
     else if (childPid == 0) {
-        /* Child process */
+        /* Child process. Any setup failure below exit(1)s rather than returning
+         * into the connection handler while still at a raised privilege level. */
         const char *args[] = {"-sh", NULL, NULL, NULL};
         char cmd[MAX_COMMAND_SZ];
         char shell[MAX_COMMAND_SZ];
@@ -1290,29 +2902,17 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             if (dup2(stdinPipe[0], STDIN_FILENO) == -1) {
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Error redirecting stdin pipe");
-                if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                    exit(1);
-                }
-
-                return WS_FATAL_ERROR;
+                exit(1);
             }
             if (dup2(stdoutPipe[1], STDOUT_FILENO) == -1) {
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Error redirecting stdout pipe");
-                if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                    exit(1);
-                }
-
-                return WS_FATAL_ERROR;
+                exit(1);
             }
             if (dup2(stderrPipe[1], STDERR_FILENO) == -1) {
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Error redirecting stderr pipe");
-                if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                    exit(1);
-                }
-
-                return WS_FATAL_ERROR;
+                exit(1);
             }
         }
 
@@ -1320,47 +2920,27 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         if (wolfSSHD_AuthSetGroups(conn->auth, wolfSSH_GetUsername(ssh),
                 pPasswd->pw_gid) != WS_SUCCESS) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting groups");
-            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                /* stop everything if not able to reduce permissions level */
-                exit(1);
-            }
-
-            return WS_FATAL_ERROR;
+            exit(1);
         }
 
         rc = SetupChroot(usrConf);
         if (rc < 0) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting chroot");
-            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                /* stop everything if not able to reduce permissions level */
-                exit(1);
-            }
-
-            return WS_FATAL_ERROR;
+            exit(1);
         }
         else if (rc == 1) {
             rc = chdir("/");
             if (rc != 0) {
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Error going to / after chroot");
-                if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                    /* stop everything if not able to reduce permissions level */
-                    exit(1);
-                }
-
-                return WS_FATAL_ERROR;
+                exit(1);
             }
         }
 
         if (wolfSSHD_AuthReducePermissionsUser(conn->auth, pPasswd->pw_uid,
             pPasswd->pw_gid) != WS_SUCCESS) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user ID");
-            if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-                /* stop everything if not able to reduce permissions level */
-                exit(1);
-            }
-
-            return WS_FATAL_ERROR;
+            exit(1);
         }
 
         setenv("HOME", pPasswd->pw_dir, 1);
@@ -1415,7 +2995,7 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         else { /* open interactive shell */
             ret = execv(cmd, (char**)args);
         }
-        if (ret && errno) {
+        if (ret) {
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue opening shell");
             exit(1);
         }
@@ -1425,17 +3005,31 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (wolfSSHD_AuthReducePermissionsUser(conn->auth, pPasswd->pw_uid,
         pPasswd->pw_gid) != WS_SUCCESS) {
         wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Error setting user ID");
-        if (wolfSSHD_AuthReducePermissions(conn->auth) != WS_SUCCESS) {
-            /* stop everything if not able to reduce permissions level */
-            exit(1);
-        }
-
-        return WS_FATAL_ERROR;
+        /* could not drop to the authenticated user; kill the already
+         * forked shell child and terminate the per-connection process
+         * rather than continue at a higher privilege level */
+        kill(childPid, SIGKILL);
+        exit(1);
     }
     sshFd = wolfSSH_get_fd(ssh);
 
     struct termios tios;
     word32 shellChannelId = 0;
+    WOLFSSH_CHANNEL* shellChannel;
+
+    /* Off the channel list, not DEFAULT_NEXT_CHANNEL, which a build can
+     * override. The session channel is the only one open here. lastRxId is
+     * no use: no request path sets it. A wrong id drops the peer's input. */
+    shellChannel = wolfSSH_ChannelNext(ssh, NULL);
+    if (shellChannel == NULL || wolfSSH_ChannelGetId(shellChannel,
+            &shellChannelId, WS_CHANNEL_ID_SELF) != WS_SUCCESS) {
+        /* The shell child is already forked, and nothing below can reach the
+         * peer without an id to address, so take it down with us. */
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] No session channel to service");
+        kill(childPid, SIGKILL);
+        return WS_FATAL_ERROR;
+    }
+
     signal(SIGCHLD, ChildSig);
     signal(SIGINT, SIG_DFL);
 
@@ -1471,113 +3065,266 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         close(stdinPipe[0]);
     }
 
-    while (ChildRunning || windowFull || !stdoutEmpty || peerConnected) {
+    /* The loop below is the only reader of the child's output, so it must
+     * never be the thing waiting on the child. A descriptor that cannot be
+     * made non-blocking keeps the old behaviour: the write can stall, which
+     * is still better than dropping the peer's input on the floor. The read
+     * paths already treat EAGAIN as nothing to report. */
+    (void)SHELL_SetNonBlocking((!ptyReq || forcedCmd) ?
+            stdinPipe[1] : childFd);
+
+    while (ChildRunning || backlog.len || !stdoutEmpty || peerConnected) {
         byte tmp[2];
         fd_set readFds;
         fd_set writeFds;
         WS_SOCKET_T maxFd;
         int cnt_r;
         int cnt_w;
+        WOLFSSH_CHANNEL* current;
         int pending = 0;
+        int childStalled = 0; /* The child would not take the rest of what it
+                               * is owed on this pass.  */
+
+        if (backlog.len && backlog.state == SHELL_SEND_NEVER) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] Channel will not take the shell output");
+            kill(childPid, SIGINT);
+            break;
+        }
 
         FD_ZERO(&readFds);
         FD_SET(sshFd, &readFds);
         maxFd = sshFd;
 
         FD_ZERO(&writeFds);
-        if (windowFull || wantWrite) {
+        /* Only queued output waits on writability. */
+        if (wantWrite) {
             FD_SET(sshFd, &writeFds);
         }
 
-        if (wolfSSH_stream_peek(ssh, tmp, 1) <= 0) {
-            /* select on stdout/stderr pipes with forced commands */
-            if (!ptyReq || forcedCmd) {
-                FD_SET(stdoutPipe[0], &readFds);
-                if (stdoutPipe[0] > maxFd)
-                    maxFd = stdoutPipe[0];
+        /* Buffered shell input is a wake condition in its own right.
+         * wolfSSH_stream_peek() goes blind once the channel is at EOF, so
+         * leaning on it alone would park undrained bytes in a select() that
+         * nothing else can wake. */
+        current = wolfSSH_ChannelFind(ssh, shellChannelId, WS_CHANNEL_ID_SELF);
+        if (current != NULL
+                && current->inputBuffer.length > current->inputBuffer.idx) {
+            pending = 1;
+        }
 
-                FD_SET(stderrPipe[0], &readFds);
-                if (stderrPipe[0] > maxFd)
-                    maxFd = stderrPipe[0];
+        if (!pending && wolfSSH_stream_peek(ssh, tmp, 1) > 0) {
+            pending = 1; /* found some pending SSH data */
+        }
+
+        /* Watch the child's output only on a pass that would read it. A held
+         * backlog skips those reads, and an exited child's pipe is always
+         * ready, so watching it then spins. A pipe that has reported EOF
+         * stays ready for the same reason: drop it once it has. */
+        if (!backlog.len) {
+            if (!ptyReq || forcedCmd) {
+                if (!stdoutEmpty) {
+                    FD_SET(stdoutPipe[0], &readFds);
+                    if (stdoutPipe[0] > maxFd)
+                        maxFd = stdoutPipe[0];
+                }
+
+                if (!stderrEmpty) {
+                    FD_SET(stderrPipe[0], &readFds);
+                    if (stderrPipe[0] > maxFd)
+                        maxFd = stderrPipe[0];
+                }
             }
-            else {
+            else if (!stdoutEmpty) {
                 FD_SET(childFd, &readFds);
                 if (childFd > maxFd)
                     maxFd = childFd;
             }
+        }
 
-            rc = select((int)maxFd + 1, &readFds, &writeFds, NULL, NULL);
-            if (rc == -1)
+        /* Bytes the child has not taken yet: wait for it to make room. */
+        if (childInIdx < childInSz) {
+            int childIn = (!ptyReq || forcedCmd) ? stdinPipe[1] : childFd;
+
+            if (childIn != -1) {
+                FD_SET(childIn, &writeFds);
+                if (childIn > maxFd)
+                    maxFd = childIn;
+            }
+        }
+
+        {
+            struct timeval noWait;
+            struct timeval* timeout = NULL;
+
+            if (backlog.len && backlog.state == SHELL_SEND_READY) {
+                noWait.tv_sec = 0;
+                noWait.tv_usec = 0;
+                timeout = &noWait;
+            }
+            else if (pending && childInIdx == childInSz && !backlog.len) {
+                /* the drain needs the child caught up and no backlog held */
+                noWait.tv_sec = 0;
+                noWait.tv_usec = 0;
+                timeout = &noWait;
+            }
+            else if (stdoutEmpty && !backlog.len) {
+                /* The child's output is drained and nothing is held. With the
+                 * child gone the foot of the loop ends the session this pass,
+                 * so do not wait on a peer that has nothing left to send.
+                 * While it is still running its SIGCHLD is the only wake left,
+                 * and one handled between the test here and the call below
+                 * would not interrupt it, so bound that wait. */
+                noWait.tv_sec = ChildRunning ? 1 : 0;
+                noWait.tv_usec = 0;
+                timeout = &noWait;
+            }
+
+            rc = select((int)maxFd + 1, &readFds, &writeFds, NULL, timeout);
+            if (rc == -1) {
+                /* Signal (e.g. SIGCHLD from child exit) interrupted select.
+                 * Re-evaluate the loop condition so a held backlog and the
+                 * remaining pipe contents still get drained. */
+                if (errno == EINTR)
+                    continue;
                 break;
-        }
-        else {
-            pending = 1; /* found some pending SSH data */
+            }
         }
 
-        if (wantWrite || windowFull || pending || FD_ISSET(sshFd, &readFds)) {
-            word32 lastChannel = 0;
+        if (wantWrite || backlog.len || pending || childInIdx < childInSz
+                || FD_ISSET(sshFd, &readFds)) {
+            word32 avail;
 
             wantWrite = 0;
-            /* The following tries to read from the first channel inside
-               the stream. If the pending data in the socket is for
-               another channel, this will return an error with id
-               WS_CHAN_RXD. That means the agent has pending data in its
-               channel. The additional channel is only used with the
-               agent. */
-            cnt_r = wolfSSH_worker(ssh, &lastChannel);
+            /* The worker services the transport. What lands on the shell
+               channel is handed to the child by the drain below, which names
+               the channel itself, so the id the worker would report here is
+               not needed. */
+            cnt_r = wolfSSH_worker(ssh, NULL);
+            if (wolfSSH_OutputPending(ssh)) {
+                wantWrite = 1;
+            }
             if (cnt_r < 0) {
-                rc = wolfSSH_get_error(ssh);
-                if (rc == WS_CHAN_RXD) {
-                    if (!windowFull) { /* don't rewrite channeldBuffer if full
-                                        * of windowFull left overs */
-                        if (lastChannel == shellChannelId) {
-                            cnt_r = wolfSSH_ChannelIdRead(ssh, shellChannelId,
-                                channelBuffer,
-                                sizeof channelBuffer);
-                            if (cnt_r <= 0)
-                                break;
-
-                            if (!ptyReq || forcedCmd) {
-                                cnt_w = (int)write(stdinPipe[1], channelBuffer,
-                                    cnt_r);
-                            }
-                            else {
-                                cnt_w = (int)write(childFd, channelBuffer,
-                                    cnt_r);
-                            }
-                            if (cnt_w <= 0)
-                                break;
-                        }
-                    }
+                if (cnt_r == WS_CHAN_RXD) {
+                    /* Arrival only; the drain below owns the read. */
                 }
-                else if (rc == WS_CHANNEL_CLOSED) {
+                else if (cnt_r == WS_CHANNEL_CLOSED) {
+                    /* The channel is retired, so nothing more can reach the
+                     * child and the drain below is skipped on this pass.
+                     * Close its stdin here or it blocks forever on input
+                     * that cannot come. */
+                    if (stdinPipe[1] != -1 && (!ptyReq || forcedCmd)) {
+                        close(stdinPipe[1]);
+                        stdinPipe[1] = -1;
+                        /* Nothing left to write it to. */
+                        childInIdx = 0;
+                        childInSz = 0;
+                    }
+                    if (backlog.len)
+                        backlog.state = SHELL_SEND_NEVER;
                     peerConnected = 0;
                     continue;
                 }
-                else if (rc == WS_WANT_WRITE) {
-                    wantWrite = 1;
+                else if (cnt_r == WS_EOF) {
+                    /* Half-close, handled below. */
+                }
+                else if (cnt_r == WS_REKEYING) {
                     continue;
                 }
-                else if (rc == WS_REKEYING) {
-                    wantWrite = 1;
-                    continue;
+                else if (cnt_r == WS_WANT_WRITE) {
+                    /* Transient; the queue drives the write side. */
                 }
-                else if (rc != WS_WANT_READ) {
+                else if (cnt_r != WS_FATAL_ERROR
+                        || (wolfSSH_get_error(ssh) != WS_WANT_READ
+                            && wolfSSH_get_error(ssh) != WS_WANT_WRITE)) {
                     /* unexpected error, kill off child process */
                     kill(childPid, SIGKILL);
                     break;
                 }
             }
 
-            /* did the channel just receive an EOF? */
-            if (cnt_r == 0) {
-                int eof;
-                WOLFSSH_CHANNEL* current;
+            /* The shell channel's own buffer, looked up again because the
+             * worker above can retire it. */
+            current = wolfSSH_ChannelFind(ssh, shellChannelId,
+                WS_CHANNEL_ID_SELF);
+            avail = (current != NULL) ?
+                current->inputBuffer.length - current->inputBuffer.idx : 0;
 
-                current = wolfSSH_ChannelFind(ssh, lastChannel,
-                    WS_CHANNEL_ID_SELF);
-                eof = wolfSSH_ChannelGetEof(current);
-                if (eof && (!ptyReq || forcedCmd)) {
+            /* Hand over what the peer sent, this pass or left buffered
+             * while the window was full; this is the only copy. Gated on
+             * backlog.len, not because the buffers overlap -- shellBuffer
+             * and channelBuffer are disjoint. While the peer will not take
+             * the child's output, pulling more off the channel only parks it
+             * somewhere the shutdown path cannot see. The backlog clears as
+             * soon as the peer reads. One buffer at a time: what the child
+             * will not take yet is carried to the next pass. */
+            if (childInIdx == childInSz && avail > 0 && !backlog.len) {
+                cnt_r = wolfSSH_ChannelIdRead(ssh, shellChannelId,
+                    channelBuffer, sizeof channelBuffer);
+                if (cnt_r <= 0)
+                    break;
+
+                /* The credit that read issued may still be queued. */
+                if (wolfSSH_OutputPending(ssh))
+                    wantWrite = 1;
+
+                childInIdx = 0;
+                childInSz = cnt_r;
+
+                /* Data behind the peer's EOF, RFC 4254 section 5.3. Stdin
+                 * is gone, so drop it rather than write to fd -1 and end the
+                 * session on an EBADF. */
+                if ((!ptyReq || forcedCmd) && stdinPipe[1] == -1)
+                    childInIdx = childInSz;
+
+                avail = current->inputBuffer.length - current->inputBuffer.idx;
+            }
+
+            /* The read took the bytes off the channel, so this is the only
+             * copy: a short write has to be finished, not dropped. The
+             * descriptor is non-blocking, so a child that has stopped
+             * reading leaves the rest here for the next pass rather than
+             * parking this loop inside write() -- which is the deadlock,
+             * since the child stops reading exactly when its output has
+             * nowhere to go and only this loop can empty it. */
+            while (childInIdx < childInSz) {
+                if (!ptyReq || forcedCmd) {
+                    cnt_w = (int)write(stdinPipe[1], channelBuffer + childInIdx,
+                        childInSz - childInIdx);
+                }
+                else {
+                    cnt_w = (int)write(childFd, channelBuffer + childInIdx,
+                        childInSz - childInIdx);
+                }
+                if (cnt_w <= 0) {
+                    /* errno only speaks for a -1 return. */
+                    if (cnt_w < 0 && errno == EINTR)
+                        continue;
+                    if (cnt_w < 0
+                            && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        childStalled = 1;
+                    }
+                    break;
+                }
+                childInIdx += cnt_w;
+            }
+            if (childInIdx < childInSz && !childStalled)
+                break;
+            if (childInIdx == childInSz) {
+                childInIdx = 0;
+                childInSz = 0;
+            }
+
+            /* Peer done sending: close the child's stdin, but only once what
+             * it already sent has been handed over. Closing early drops it
+             * and the next write lands on fd -1. A channel that is gone is
+             * the peer being done too -- DoChannelClose() retires it, and the
+             * id was validated at entry, so a miss here cannot mean a wrong
+             * id. Leaving the pipe open then would block the child forever on
+             * a stdin nothing will ever close. */
+            if (stdinPipe[1] != -1 && (!ptyReq || forcedCmd)) {
+                if (current == NULL
+                        || (wolfSSH_ChannelGetEof(current) && avail == 0
+                            && childInIdx == childInSz)) {
                     /* SSH is done, close stdin pipe to child process */
                     close(stdinPipe[1]);
                     stdinPipe[1] = -1;
@@ -1585,25 +3332,41 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             }
         }
 
-        /* if the window was previously full, try resending the data */
-        if (windowFull) {
-            cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
-                    shellBuffer, windowFull);
-            if (cnt_w == WS_WINDOW_FULL || cnt_w == WS_REKEYING) {
-                continue;
+        /* bytes a previous send did not take, retried before reading more */
+        if (backlog.len) {
+            if (backlog.ext) {
+                cnt_w = wolfSSH_extended_data_send(ssh, shellBuffer,
+                        backlog.len);
             }
-            else if (cnt_w == WS_WANT_WRITE) {
+            else {
+                cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
+                        shellBuffer, backlog.len);
+            }
+            if (wolfSSH_OutputPending(ssh)) {
                 wantWrite = 1;
+            }
+            if (cnt_w < 0) {
+                if (cnt_w != WS_WINDOW_FULL && cnt_w != WS_REKEYING
+                        && cnt_w != WS_WANT_WRITE) {
+                    kill(childPid, SIGINT);
+                    break;
+                }
+                backlog.state = SHELL_BacklogState(ssh, cnt_w, shellChannelId);
                 continue;
             }
             else {
-                windowFull -= cnt_w;
-                if (windowFull > 0) {
-                    WMEMMOVE(shellBuffer, shellBuffer + cnt_w, windowFull);
+                backlog.len -= cnt_w;
+                if (backlog.len > 0) {
+                    WMEMMOVE(shellBuffer, shellBuffer + cnt_w, backlog.len);
+                    backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                            shellChannelId);
                     continue;
                 }
-                if (windowFull < 0)
-                    windowFull = 0;
+                else {
+                    backlog.len = 0;
+                    backlog.state = SHELL_SEND_READY;
+                    backlog.ext = 0;
+                }
             }
         }
 
@@ -1611,29 +3374,47 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             if (FD_ISSET(stderrPipe[0], &readFds)) {
                 cnt_r = (int)read(stderrPipe[0], shellBuffer,
                     sizeof shellBuffer);
-                /* This read will return 0 on EOF */
-                if (cnt_r <= 0) {
+                /* errno only speaks for a -1 return. A 0 is EOF and leaves
+                 * it alone, so testing it there reads whatever the last
+                 * call left -- an EINTR from the child's SIGCHLD ends the
+                 * loop with the peer's output still queued. */
+                if (cnt_r < 0) {
                     int err = errno;
-                    if (err != EAGAIN && err != 0) {
+                    if (err != EINTR && err != EAGAIN
+                            && err != EWOULDBLOCK) {
                         break;
                     }
+                }
+                else if (cnt_r == 0) {
+                    stderrEmpty = 1;
                 }
                 else {
                     if (cnt_r > 0) {
                         cnt_w = wolfSSH_extended_data_send(ssh, shellBuffer,
                             cnt_r);
-                        if (cnt_w > 0 && cnt_w < cnt_r) { /* partial send */
-                            windowFull = cnt_r - cnt_w;
-                            WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
-                                windowFull);
+                        if (wolfSSH_OutputPending(ssh)) {
+                            wantWrite = 1;
                         }
-                        else if (cnt_w == WS_WINDOW_FULL ||
-                                 cnt_w == WS_REKEYING) {
-                            windowFull = cnt_r; /* save amount to be sent */
+                        if (cnt_w > 0 && cnt_w < cnt_r) { /* partial send */
+                            backlog.len = cnt_r - cnt_w;
+                            backlog.ext = 1;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
+                            WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
+                                backlog.len);
+                            /* don't let the stdout read below trample the
+                             * buffered stderr remainder */
                             continue;
                         }
-                        else if (cnt_w == WS_WANT_WRITE) {
-                            wantWrite = 1;
+                        else if (cnt_w == WS_WINDOW_FULL ||
+                                 cnt_w == WS_REKEYING
+                                 || cnt_w == WS_WANT_WRITE) {
+                            backlog.len = cnt_r;
+                            backlog.ext = 1;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
+                            if (cnt_w == WS_WANT_WRITE)
+                                wantWrite = 1;
                             continue;
                         }
                         else if (cnt_w < 0)
@@ -1649,7 +3430,8 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                 /* This read will return 0 on EOF */
                 if (cnt_r < 0) {
                     int err = errno;
-                    if (err != EAGAIN && err != 0) {
+                    if (err != EINTR && err != EAGAIN
+                            && err != EWOULDBLOCK) {
                         break;
                     }
                 }
@@ -1660,18 +3442,26 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
                     if (cnt_r > 0) {
                         cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
                                 shellBuffer, cnt_r);
+                        if (wolfSSH_OutputPending(ssh)) {
+                            wantWrite = 1;
+                        }
                         if (cnt_w > 0 && cnt_w < cnt_r) { /* partial send */
-                            windowFull = cnt_r - cnt_w;
+                            backlog.len = cnt_r - cnt_w;
+                            backlog.ext = 0;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
                             WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
-                                windowFull);
+                                backlog.len);
                         }
                         else if (cnt_w == WS_WINDOW_FULL ||
-                                 cnt_w == WS_REKEYING) {
-                            windowFull = cnt_r; /* save amount to be sent */
-                            continue;
-                        }
-                        else if (cnt_w == WS_WANT_WRITE) {
-                            wantWrite = 1;
+                                 cnt_w == WS_REKEYING
+                                 || cnt_w == WS_WANT_WRITE) {
+                            backlog.len = cnt_r;
+                            backlog.ext = 0;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
+                            if (cnt_w == WS_WANT_WRITE)
+                                wantWrite = 1;
                             continue;
                         }
                         else if (cnt_w < 0) {
@@ -1685,29 +3475,41 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         else {
             if (FD_ISSET(childFd, &readFds)) {
                 cnt_r = (int)read(childFd, shellBuffer, sizeof shellBuffer);
-                /* This read will return 0 on EOF */
-                if (cnt_r <= 0) {
+                /* Treat a 0 return as EOF so the loop can shut down. */
+                if (cnt_r < 0) {
                     int err = errno;
-                    if (err != EAGAIN && err != 0) {
+                    if (err != EINTR && err != EAGAIN
+                            && err != EWOULDBLOCK) {
                         break;
                     }
+                }
+                else if (cnt_r == 0) {
+                    stdoutEmpty = 1;
                 }
                 else {
                     if (cnt_r > 0) {
                         cnt_w = wolfSSH_ChannelIdSend(ssh, shellChannelId,
                                 shellBuffer, cnt_r);
+                        if (wolfSSH_OutputPending(ssh)) {
+                            wantWrite = 1;
+                        }
                         if (cnt_w > 0 && cnt_w < cnt_r) { /* partial send */
-                            windowFull = cnt_r - cnt_w;
+                            backlog.len = cnt_r - cnt_w;
+                            backlog.ext = 0;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
                             WMEMMOVE(shellBuffer, shellBuffer + cnt_w,
-                                windowFull);
+                                backlog.len);
                         }
                         else if (cnt_w == WS_WINDOW_FULL ||
-                                 cnt_w == WS_REKEYING) {
-                            windowFull = cnt_r;
-                            continue;
-                        }
-                        else if (cnt_w == WS_WANT_WRITE) {
-                            wantWrite = 1;
+                                 cnt_w == WS_REKEYING
+                                 || cnt_w == WS_WANT_WRITE) {
+                            backlog.len = cnt_r;
+                            backlog.ext = 0;
+                            backlog.state = SHELL_BacklogState(ssh, cnt_w,
+                                    shellChannelId);
+                            if (cnt_w == WS_WANT_WRITE)
+                                wantWrite = 1;
                             continue;
                         }
                         else if (cnt_w < 0) {
@@ -1719,7 +3521,7 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
             }
         }
 
-        if (!ChildRunning && peerConnected && stdoutEmpty && !windowFull) {
+        if (!ChildRunning && peerConnected && stdoutEmpty && !backlog.len) {
             peerConnected = 0;
         }
     }
@@ -1750,18 +3552,22 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
     if (!ptyReq || forcedCmd) {
         int readSz;
 
-        fcntl(stdoutPipe[0], F_SETFL, fcntl(stdoutPipe[0], F_GETFL)
-            | O_NONBLOCK);
-        readSz = (int)read(stdoutPipe[0], shellBuffer, sizeof shellBuffer);
-        if (readSz > 0) {
-            wolfSSH_ChannelIdSend(ssh, shellChannelId, shellBuffer, readSz);
+        /* when the pipe can not be made non blocking skip the drain, a
+         * blocking read here could hang the connection process */
+        if (SHELL_SetNonBlocking(stdoutPipe[0]) == 0) {
+            readSz = (int)read(stdoutPipe[0], shellBuffer, sizeof shellBuffer);
+            if (readSz > 0) {
+                SHELL_FlushOut(ssh, sshFd, shellChannelId, shellBuffer, readSz,
+                    0);
+            }
         }
 
-        fcntl(stderrPipe[0], F_SETFL, fcntl(stderrPipe[0], F_GETFL)
-            | O_NONBLOCK);
-        readSz = (int)read(stderrPipe[0], shellBuffer, sizeof shellBuffer);
-        if (readSz > 0) {
-            wolfSSH_extended_data_send(ssh, shellBuffer, readSz);
+        if (SHELL_SetNonBlocking(stderrPipe[0]) == 0) {
+            readSz = (int)read(stderrPipe[0], shellBuffer, sizeof shellBuffer);
+            if (readSz > 0) {
+                SHELL_FlushOut(ssh, sshFd, shellChannelId, shellBuffer, readSz,
+                    1);
+            }
         }
 
         close(stdoutPipe[0]);
@@ -1771,38 +3577,148 @@ static int SHELL_Subsystem(WOLFSSHD_CONNECTION* conn, WOLFSSH* ssh,
         }
     }
 
+    WS_FORCEZERO(channelBuffer, sizeof channelBuffer);
+    WS_FORCEZERO(shellBuffer, sizeof shellBuffer);
     (void)conn;
     return WS_SUCCESS;
 }
 #endif
 #endif
 
-#ifdef WIN32
-static volatile int timeOut = 0;
+#ifdef _WIN32
+/* Cancels and frees the login grace time threadpool timer for a connection. */
+static void CancelLoginTimer(WOLFSSHD_CONNECTION* conn)
+{
+    if (conn != NULL && conn->loginTimer != NULL) {
+        /* setting the due time to NULL cancels any pending timer */
+        SetThreadpoolTimer(conn->loginTimer, NULL, 0, 0);
+        WaitForThreadpoolTimerCallbacks(conn->loginTimer, TRUE);
+        CloseThreadpoolTimer(conn->loginTimer);
+        conn->loginTimer = NULL;
+    }
+}
+
+/* threadpool callback marking a connection as timed out at the grace deadline */
+static VOID CALLBACK GraceTimeoutCb(PTP_CALLBACK_INSTANCE instance, PVOID ctx,
+        PTP_TIMER timer)
+{
+    WOLFSSHD_CONNECTION* conn = (WOLFSSHD_CONNECTION*)ctx;
+
+    if (conn != NULL) {
+        /* published with an interlocked write so the connection thread reading
+         * the flag in LoginGraceExpired() sees it without a data race; OR is
+         * used because mingw-w64 has no InterlockedExchange8, and the flag
+         * only ever transitions 0 -> 1 */
+        InterlockedOr8((volatile CHAR*)&conn->timeOut, 1);
+    }
+    (void)instance;
+    (void)timer;
+}
 #else
-static __thread int timeOut = 0;
-#endif
+/* Set by the SIGALRM handler when the login grace time expires. A signal
+ * handler may only access a volatile sig_atomic_t object, so the handler sets
+ * just this flag and the accept loop observes it. */
+static volatile sig_atomic_t loginGraceTimedOut = 0;
+
 static void alarmCatch(int signum)
 {
-    timeOut = 1;
+    loginGraceTimedOut = 1;
     (void)signum;
+}
+#endif
+
+/* Returns non-zero once the login grace time has expired for this connection.
+ * On Windows the threadpool callback records it on the connection; on POSIX the
+ * SIGALRM handler sets a sig_atomic_t flag that the accept loop reads here. */
+static int LoginGraceExpired(WOLFSSHD_CONNECTION* conn)
+{
+#ifdef _WIN32
+    /* interlocked read pairs with the InterlockedOr8 in GraceTimeoutCb;
+     * the OR with 0 is a read-modify-write, hence the non-const parameter */
+    return InterlockedOr8((volatile CHAR*)&conn->timeOut, 0);
+#else
+    (void)conn;
+    return (int)loginGraceTimedOut;
+#endif
 }
 
 static int UserAuthResult(byte result,
         WS_UserAuthData* authData, void* userAuthResultCtx)
 {
+    int ret = WS_SUCCESS;
+#if defined(WOLFSSH_OSSH_CERTS) && !defined(_WIN32)
+    WOLFSSHD_CONNECTION* conn = (WOLFSSHD_CONNECTION*)userAuthResultCtx;
+#else
     (void)authData;
-    (void)userAuthResultCtx;
+#endif
 
     if (result == WOLFSSH_USERAUTH_SUCCESS) {
-    #ifndef WIN32
-        /* @TODO alarm catch on windows */
+        /* authentication finished in time, cancel the login grace timer */
+    #ifdef _WIN32
+        CancelLoginTimer((WOLFSSHD_CONNECTION*)userAuthResultCtx);
+    #else
+        (void)userAuthResultCtx;
         alarm(0);
+    #endif
+    #if defined(WOLFSSH_OSSH_CERTS) && !defined(_WIN32)
+        /* Auth (incl. the user signature) has verified, so stash the cert's
+         * force-command now, bound to the authenticated credential. Fail closed
+         * if the copy fails so the session cannot run unrestricted. */
+        if (conn != NULL && authData != NULL &&
+                authData->type == WOLFSSH_USERAUTH_PUBLICKEY &&
+                authData->sf.publicKey.isOsshCert &&
+                authData->sf.publicKey.forceCommand != NULL &&
+                authData->sf.publicKey.forceCommandSz > 0) {
+            ret = wolfSSHD_AuthSetCertForcedCmd(conn->auth,
+                    authData->sf.publicKey.forceCommand,
+                    authData->sf.publicKey.forceCommandSz);
+        }
     #endif
     }
 
-    return WS_SUCCESS;
+    return ret;
 }
+
+#if defined(WOLFSSH_SFTP) || defined(WOLFSSH_SCP)
+/* Returns 1 if root's forced-commands-only ForceCommand isn't
+ * "internal-sftp": SFTP/SCP never honor ForceCommand (only SHELL_Subsystem
+ * does), so this blocks the confinement bypass. No-op on Windows
+ * (pPasswd is NULL there). */
+static int IsRootTransferBlocked(WPASSWD* pPasswd, WOLFSSHD_CONFIG* usrConf)
+{
+#ifdef _WIN32
+    (void)pPasswd;
+    (void)usrConf;
+    return 0;
+#else
+    char* forcedCmd;
+
+    if (pPasswd == NULL || pPasswd->pw_uid != 0) {
+        return 0;
+    }
+    if (wolfSSHD_ConfigGetPermitRoot(usrConf) !=
+            WOLFSSHD_PERMIT_ROOT_FORCED_CMD) {
+        return 0;
+    }
+
+    forcedCmd = wolfSSHD_ConfigGetForcedCmd(usrConf);
+    return (forcedCmd == NULL || WSTRCMP(forcedCmd, "internal-sftp") != 0);
+#endif
+}
+
+/* Logs and returns 1 if 'what' (e.g. "SFTP subsystem", "SCP session") is
+ * blocked for root by IsRootTransferBlocked(); 0 otherwise. */
+static int RejectRootTransfer(WPASSWD* pPasswd, WOLFSSHD_CONFIG* usrConf,
+        const char* what)
+{
+    if (IsRootTransferBlocked(pPasswd, usrConf)) {
+        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] %s for root requires ForceCommand "
+            "internal-sftp under forced-commands-only", what);
+        return 1;
+    }
+    return 0;
+}
+#endif /* WOLFSSH_SFTP || WOLFSSH_SCP */
 
 /* handle wolfSSH accept and directing to correct subsystem */
 #ifdef _WIN32
@@ -1813,6 +3729,9 @@ static void* HandleConnection(void* arg)
 {
     int ret = WS_SUCCESS;
     int error;
+#ifdef _WIN32
+    byte threaded = 0;
+#endif
 
     WOLFSSHD_CONNECTION* conn = NULL;
     WOLFSSH* ssh = NULL;
@@ -1833,25 +3752,54 @@ static void* HandleConnection(void* arg)
 
     if (ret == WS_SUCCESS) {
         int select_ret = 0;
+        int timedOut = 0;
         long graceTime;
 
         wolfSSH_set_fd(ssh, conn->fd);
         wolfSSH_SetUserAuthCtx(ssh, conn->auth);
+        /* let UserAuthResult reach this connection to cancel the grace timer
+         * and to reach conn->auth for the cert force-command */
+        wolfSSH_SetUserAuthResultCtx(ssh, conn);
+        wolfSSH_SetChannelReqCtx(ssh, conn);
+    #if defined(WOLFSSH_OSSH_CERTS) && !defined(_WIN32)
+        /* Unix-only: each connection is a forked child with its own copy of the
+         * auth struct. Windows does not enforce OpenSSH certs. */
+        wolfSSHD_AuthSetPeerIp(conn->auth, conn->ip);
+    #endif
 
-        /* set alarm for login grace time */
+        /* arm the login grace timer */
         graceTime = wolfSSHD_AuthGetGraceTime(conn->auth);
         if (graceTime > 0) {
-    #ifdef WIN32
-            /* @TODO SetTimer(NULL, NULL, graceTime, alarmCatch); */
+    #ifdef _WIN32
+            FILETIME due;
+            ULARGE_INTEGER rel;
+
+            /* negative relative time, in 100 ns units */
+            rel.QuadPart = (ULONGLONG)(-((LONGLONG)graceTime * 10000000LL));
+            due.dwLowDateTime  = rel.LowPart;
+            due.dwHighDateTime = rel.HighPart;
+
+            conn->loginTimer = CreateThreadpoolTimer(GraceTimeoutCb, conn, NULL);
+            if (conn->loginTimer == NULL) {
+                /* fail closed: mark the connection as timed out so the accept
+                 * loop exits immediately rather than enforcing no grace time */
+                InterlockedOr8((volatile CHAR*)&conn->timeOut, 1);
+                wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Unable to create login grace "
+                            "timer, closing connection");
+            }
+            else {
+                SetThreadpoolTimer(conn->loginTimer, &due, 0, 0);
+            }
     #else
             signal(SIGALRM, alarmCatch);
+            loginGraceTimedOut = 0; /* clear any stale state before arming */
             alarm((unsigned int)graceTime);
     #endif
         }
 
         ret = wolfSSH_accept(ssh);
         error = wolfSSH_get_error(ssh);
-        while (timeOut == 0 && (ret != WS_SUCCESS
+        while (LoginGraceExpired(conn) == 0 && (ret != WS_SUCCESS
                 && ret != WS_SCP_INIT && ret != WS_SFTP_COMPLETE)
                 && (error == WS_WANT_READ || error == WS_WANT_WRITE)) {
 
@@ -1869,16 +3817,24 @@ static void* HandleConnection(void* arg)
                 error = WS_FATAL_ERROR;
         }
 
-        wolfSSH_Log(WS_LOG_ERROR,
-                    "[SSHD] grace time = %ld timeout = %d", graceTime, timeOut);
+        /* read the flag once through the accessor; on Windows this is an
+         * interlocked read of the value the threadpool callback published, on
+         * POSIX it is the SIGALRM handler's loginGraceTimedOut flag */
+        timedOut = LoginGraceExpired(conn);
+        wolfSSH_Log(WS_LOG_INFO,
+                    "[SSHD] grace time = %ld timeout = %d", graceTime,
+                    timedOut);
         if (graceTime > 0) {
-            if (timeOut) {
+            /* only report a grace failure when authentication did not also
+             * complete in the same accept iteration */
+            if (timedOut && ret != WS_SUCCESS &&
+                ret != WS_SFTP_COMPLETE && ret != WS_SCP_INIT) {
                 wolfSSH_Log(WS_LOG_ERROR,
                     "[SSHD] Failed login within grace period");
              }
 
-    #ifdef WIN32
-            /* @TODO SetTimer(NULL, NULL, graceTime, alarmCatch); */
+    #ifdef _WIN32
+            CancelLoginTimer(conn); /* cancel any pending timer */
     #else
             alarm(0); /* cancel any alarm */
     #endif
@@ -1896,6 +3852,7 @@ static void* HandleConnection(void* arg)
         WPASSWD* pPasswd = NULL;
         WOLFSSHD_CONFIG* usrConf;
         char* usr;
+        const char* forcedCmd = NULL;
 
         /* get configuration for user */
         usr     = wolfSSH_GetUsername(ssh);
@@ -1916,16 +3873,18 @@ static void* HandleConnection(void* arg)
                 ret = WS_FATAL_ERROR;
             }
         }
+    #else
+        WOLFSSH_UNUSED(pPasswd);
     #endif
 
         if (ret != WS_FATAL_ERROR) {
-            /* check for any forced command set for the user */
             switch (wolfSSH_GetSessionType(ssh)) {
                 case WOLFSSH_SESSION_SHELL:
                 #ifdef WOLFSSH_SHELL
                     if (ret == WS_SUCCESS) {
                         wolfSSH_Log(WS_LOG_INFO, "[SSHD] Entering new shell");
-                        SHELL_Subsystem(conn, ssh, pPasswd, usrConf, NULL);
+                        ret = SHELL_Subsystem(conn, ssh, pPasswd, usrConf,
+                                NULL);
                     }
                 #else
                     wolfSSH_Log(WS_LOG_ERROR,
@@ -1935,11 +3894,32 @@ static void* HandleConnection(void* arg)
                     break;
 
                 case WOLFSSH_SESSION_SUBSYSTEM:
+                    /* A certificate force-command overrides the requested
+                     * subsystem. "internal-sftp" still permits SFTP; any other
+                     * command denies file transfer (fail closed). */
+                    forcedCmd = GetCertForcedCmd(conn);
+                    if (forcedCmd != NULL &&
+                            WSTRCMP(forcedCmd, "internal-sftp") != 0) {
+                        wolfSSH_Log(WS_LOG_ERROR,
+                            "[SSHD] Cert force-command set for user %s; "
+                            "denying subsystem request",
+                            wolfSSH_GetUsername(ssh));
+                        ret = WS_FATAL_ERROR;
+                        break;
+                    }
+
                     /* test for known subsystems */
                     switch (ret) {
                         case WS_SFTP_COMPLETE:
                         #ifdef WOLFSSH_SFTP
-                            ret = SFTP_Subsystem(conn, ssh, pPasswd, usrConf);
+                            if (RejectRootTransfer(pPasswd, usrConf,
+                                    "SFTP subsystem")) {
+                                ret = WS_FATAL_ERROR;
+                            }
+                            else {
+                                ret = SFTP_Subsystem(conn, ssh, pPasswd,
+                                        usrConf);
+                            }
                         #else
                             err_sys("SFTP not compiled in. Please use "
                                     "--enable-sftp");
@@ -1948,7 +3928,25 @@ static void* HandleConnection(void* arg)
 
                         case WS_SCP_INIT:
                         #ifdef WOLFSSH_SCP
-                            ret = SCP_Subsystem(conn, ssh, pPasswd, usrConf);
+                            /* any certificate force-command, including
+                             * internal-sftp, denies SCP */
+                            if (forcedCmd != NULL) {
+                                wolfSSH_Log(WS_LOG_ERROR,
+                                    "[SSHD] Cert force-command set for user "
+                                    "%s; denying SCP",
+                                    wolfSSH_GetUsername(ssh));
+                                ret = WS_FATAL_ERROR;
+                            }
+                            else if (RejectRootTransfer(pPasswd, usrConf,
+                                    "SCP session")) {
+                                ret = WS_FATAL_ERROR;
+                            }
+                            else {
+                                /* Intentional: SCP grants no more than the
+                                 * SFTP access already permitted above. */
+                                ret = SCP_Subsystem(conn, ssh, pPasswd,
+                                        usrConf);
+                            }
                         #else
                             err_sys("SCP not compiled in. Please use "
                                     "--enable-scp");
@@ -1971,7 +3969,7 @@ static void* HandleConnection(void* arg)
                         wolfSSH_Log(WS_LOG_INFO,
                             "[SSHD] Entering exec session [%s]",
                                 wolfSSH_GetSessionCommand(ssh));
-                        SHELL_Subsystem(conn, ssh, pPasswd, usrConf,
+                        ret = SHELL_Subsystem(conn, ssh, pPasswd, usrConf,
                                 wolfSSH_GetSessionCommand(ssh));
                     }
                 #endif /* WOLFSSH_SHELL */
@@ -1979,7 +3977,23 @@ static void* HandleConnection(void* arg)
                     /* SCP can be an exec type */
                     if (ret == WS_SCP_INIT) {
                     #ifdef WOLFSSH_SCP
-                        ret = SCP_Subsystem(conn, ssh, pPasswd, usrConf);
+                        /* any certificate force-command denies SCP */
+                        forcedCmd = GetCertForcedCmd(conn);
+                        if (forcedCmd != NULL) {
+                            wolfSSH_Log(WS_LOG_ERROR,
+                                "[SSHD] Cert force-command set for user %s; "
+                                "denying SCP", wolfSSH_GetUsername(ssh));
+                            ret = WS_FATAL_ERROR;
+                        }
+                        else if (RejectRootTransfer(pPasswd, usrConf,
+                                "SCP session")) {
+                            ret = WS_FATAL_ERROR;
+                        }
+                        else {
+                            /* Intentional: SCP grants no more than the
+                             * SFTP access already permitted above. */
+                            ret = SCP_Subsystem(conn, ssh, pPasswd, usrConf);
+                        }
                     #else
                         err_sys("SCP not compiled in. Please use "
                                 "--enable-scp");
@@ -1995,6 +4009,8 @@ static void* HandleConnection(void* arg)
                     ret = WS_NOT_COMPILED;
             }
         }
+
+        wolfSSHD_ConfigFree(usrConf);
     }
 
     error = wolfSSH_get_error(ssh);
@@ -2018,7 +4034,7 @@ static void* HandleConnection(void* arg)
                 error = wolfSSH_get_error(ssh);
 
                 /* peer successfully closed down gracefully */
-                if (ret == WS_CHANNEL_CLOSED) {
+                if (ret == WS_CHANNEL_CLOSED || ret == WS_EOF) {
                     ret = 0;
                     break;
                 }
@@ -2055,13 +4071,32 @@ static void* HandleConnection(void* arg)
         shutdown(conn->fd, 1);
         /* Spin until socket closes. */
         do {
-            ret = (int)recv(conn->fd, sc, 1024, 0);
+            ret = (int)recv(conn->fd, (char*)sc, 1024, 0);
         } while (ret > 0);
 
         WCLOSESOCKET(conn->fd);
     }
     wolfSSH_Log(WS_LOG_INFO, "[SSHD] Return from closing connection = %d", ret);
+#ifdef _WIN32
+    if (conn != NULL) {
+        threaded = conn->isThreaded;
+        /* free the per-connection auth allocated in StartSSHD */
+        wolfSSHD_AuthFreeUser(conn->auth);
+    }
+#endif
     WFREE(conn, NULL, DYNTYPE_SSHD);
+
+    /* The repeat state is per connection only when each connection is its own
+     * process (POSIX fork) or the lone in-process connection. Windows daemon
+     * threads share it, so flushing here would clear a streak another live
+     * connection thread still owns; the shutdown flush covers that path. */
+#ifdef _WIN32
+    if (!threaded) {
+        wolfSSHDLoggingFlush();
+    }
+#else
+    wolfSSHDLoggingFlush();
+#endif
 
 #ifdef _WIN32
     return 0;
@@ -2090,6 +4125,11 @@ static int NewConnection(WOLFSSHD_CONNECTION* conn)
             /* child process */
             WCLOSESOCKET(conn->listenFd);
             signal(SIGINT, SIG_DFL);
+            /* fork copies the parent's log suppression state; reset it so the
+             * child neither drops its first message nor claims the parent's
+             * repeat count. */
+            logRepeats = 0;
+            lastLogMsg[0] = '\0';
             (void)HandleConnection((void*)conn);
             exit(0);
         }
@@ -2101,6 +4141,10 @@ static int NewConnection(WOLFSSHD_CONNECTION* conn)
 
             wolfSSH_Log(WS_LOG_INFO, "[SSHD] Spawned new process %d\n", pd);
             WCLOSESOCKET(conn->fd);
+
+            /* the child process has its own copy of the connection, free the
+               parent's copy here */
+            WFREE(conn, NULL, DYNTYPE_SSHD);
         }
     }
 #else
@@ -2114,7 +4158,8 @@ static int NewConnection(WOLFSSHD_CONNECTION* conn)
             ret = WS_FATAL_ERROR;
         }
         else {
-            wolfSSH_Log(WS_LOG_INFO, "[SSHD] Spawned new thread %d\n", id);
+            wolfSSH_Log(WS_LOG_INFO, "[SSHD] Spawned new thread %lu\n",
+                (unsigned long)id);
             CloseHandle(t);
         }
     }
@@ -2204,20 +4249,52 @@ static void wolfSSHD_ServiceCb(DWORD CtrlCode)
 }
 
 
-static char* _convertHelper(WCHAR* in, void* heap) {
-    int retSz;
-    char* ret;
-    
-    retSz = (int)wcslen(in) * 2;
-    ret   = (char*)WMALLOC(retSz + 1, heap, DYNTYPE_SSHD);
-    if (ret != NULL) {
-        size_t numConv = 0;
-        if (wcstombs_s(&numConv, ret, retSz, in, retSz) != 0) {
-            WFREE(ret, heap, DYNTYPE_SSHD);
-            ret = NULL;
+/* *err is only meaningful when NULL is returned: WS_MEMORY_E on alloc
+ * failure, WS_FATAL_ERROR on conversion failure. */
+static char* _convertHelper(WCHAR* in, void* heap, int* err)
+{
+    char* ret = NULL;
+    size_t needed = 0;
+
+    *err = WS_SUCCESS;
+
+    /* Query the exact size, including the null. An empty argument sized
+     * the buffer at 0, which made the convert below fail with EINVAL. */
+    if (wcstombs_s(&needed, NULL, 0, in, 0) == 0 && needed > 0) {
+        ret = (char*)WMALLOC(needed, heap, DYNTYPE_SSHD);
+        if (ret == NULL) {
+            *err = WS_MEMORY_E;
+        }
+        else {
+            size_t numConv = 0;
+            if (wcstombs_s(&numConv, ret, needed, in, needed) != 0) {
+                WFREE(ret, heap, DYNTYPE_SSHD);
+                ret = NULL;
+                *err = WS_FATAL_ERROR;
+            }
         }
     }
+    else {
+        *err = WS_FATAL_ERROR;
+    }
     return ret;
+}
+
+/* free the argv/cmdArgs buffers built from the wide command line. Safe to
+ * call on partially initialized state: NULL argv or cmdArgs is ignored. */
+static void _freeWinArgs(char** argv, DWORD argc, LPWSTR* cmdArgs)
+{
+    DWORD z;
+
+    if (argv != NULL) {
+        for (z = 0; z < argc; z++) {
+            WFREE(argv[z], NULL, DYNTYPE_SSHD);
+        }
+        WFREE(argv, NULL, DYNTYPE_SSHD);
+    }
+    if (cmdArgs != NULL) {
+        LocalFree(cmdArgs);
+    }
 }
 
 static void StartSSHD(DWORD argc, LPTSTR* wargv)
@@ -2241,9 +4318,6 @@ static int StartSSHD(int argc, char** argv)
 
     logFile = stderr;
     wolfSSH_SetLoggingCb(wolfSSHDLoggingCb);
-#ifdef DEBUG_WOLFSSL
-    wolfSSL_Debugging_ON();
-#endif
 
 #ifdef _WIN32
     char** argv = NULL;
@@ -2258,11 +4332,12 @@ static int StartSSHD(int argc, char** argv)
     if (cmdArgs == NULL) {
         ret = WS_FATAL_ERROR;
     }
-    argc = cmdArgC;
 
     if (ret == WS_SUCCESS) {
-        for (i = 0; i < argc; i++) {
-            if (WSTRCMP((char*)(cmdArgs[i]), "-D") == 0) {
+        for (i = 0; i < (DWORD)cmdArgC; i++) {
+            /* cmdArgs entries are wide strings (CommandLineToArgvW); compare
+             * as such instead of reinterpreting as narrow char data. */
+            if (wcscmp(cmdArgs[i], L"-D") == 0) {
                 isDaemon = 0;
             }
         }
@@ -2271,24 +4346,40 @@ static int StartSSHD(int argc, char** argv)
     if (isDaemon) {
         /* Set the logging to go to OutputDebugString */
         wolfSSH_SetLoggingCb(ServiceDebugCb);
+    }
 
-        if (ret == WS_SUCCESS) {
-            /* we want the arguments to be normal char strings not wchar_t */
-            argv = (char**)WMALLOC(argc * sizeof(char*), NULL, DYNTYPE_SSHD);
-            if (argv == NULL) {
-                ret = WS_MEMORY_E;
-            }
-            else {
-                unsigned int z;
-                for (z = 0; z < argc; z++) {
-                    argv[z] = _convertHelper(cmdArgs[z], NULL);
+    if (ret == WS_SUCCESS) {
+        /* Rebuild argv from cmdArgs, not the caller's wargv: wargv is
+         * narrow data when called from main(), so it may not be a real
+         * wide string. cmdArgs is always correct either way. */
+        argc = (DWORD)cmdArgC;
+
+        /* we want the arguments to be normal char strings not wchar_t */
+        argv = (char**)WMALLOC(argc * sizeof(char*), NULL, DYNTYPE_SSHD);
+        if (argv == NULL) {
+            ret = WS_MEMORY_E;
+        }
+        else {
+            unsigned int z;
+
+            /* Zero first: _freeWinArgs() walks all argc slots. */
+            WMEMSET(argv, 0, argc * sizeof(char*));
+            for (z = 0; z < argc; z++) {
+                int convErr = WS_FATAL_ERROR;
+
+                argv[z] = _convertHelper(cmdArgs[z], NULL, &convErr);
+                if (argv[z] == NULL) {
+                    /* mygetopt() dereferences every entry it walks. */
+                    wolfSSH_Log(WS_LOG_ERROR,
+                        "[SSHD] Unable to convert argument %u, ret = %d.",
+                        z, convErr);
+                    ret = convErr;
+                    break;
                 }
             }
         }
     }
-    else {
-        argv = (char**)wargv;
-    }
+    (void)wargv;
 #endif
 
     signal(SIGINT, interruptCatch);
@@ -2305,7 +4396,8 @@ static int StartSSHD(int argc, char** argv)
         }
     }
 
-    while ((ch = mygetopt(argc, argv, "?f:p:h:dDE:o:t")) != -1) {
+    while (ret == WS_SUCCESS &&
+            (ch = mygetopt(argc, argv, "?f:p:h:dDE:o:t")) != -1) {
         switch (ch) {
         case 'f':
             configFile = myoptarg;
@@ -2343,6 +4435,8 @@ static int StartSSHD(int argc, char** argv)
 
         case 'd':
             debugMode = 1; /* turn on debug mode */
+            wolfSSL_Debugging_ON();
+            wolfSSH_Debugging_ON();
             break;
 
         case 'D':
@@ -2350,10 +4444,17 @@ static int StartSSHD(int argc, char** argv)
             break;
 
         case 'E':
-            ret = WFOPEN(NULL, &logFile, myoptarg, "ab");
-            if (ret != 0 || logFile == WBADFILE) {
-                fprintf(stderr, "Unable to open log file %s\n", myoptarg);
-                ret = WS_FATAL_ERROR;
+            /* guarded like -p so a success here cannot overwrite an error an
+             * earlier option recorded */
+            if (ret == WS_SUCCESS) {
+                ret = WFOPEN(NULL, &logFile, myoptarg, "ab");
+                if (ret != 0 || logFile == WBADFILE) {
+                    fprintf(stderr, "Unable to open log file %s\n", myoptarg);
+                    /* option parsing continues and may log before the error
+                     * is acted on, so never leave the stream NULL */
+                    logFile = stderr;
+                    ret = WS_FATAL_ERROR;
+                }
             }
             break;
 
@@ -2366,6 +4467,7 @@ static int StartSSHD(int argc, char** argv)
             #ifndef _WIN32
             return WS_FATAL_ERROR;
             #else
+            _freeWinArgs(argv, argc, cmdArgs);
             return;
             #endif
         #endif
@@ -2379,6 +4481,7 @@ static int StartSSHD(int argc, char** argv)
         #ifndef _WIN32
             return WS_SUCCESS;
         #else
+            _freeWinArgs(argv, argc, cmdArgs);
             return;
         #endif
 
@@ -2387,9 +4490,34 @@ static int StartSSHD(int argc, char** argv)
         #ifndef _WIN32
             return WS_SUCCESS;
         #else
+            _freeWinArgs(argv, argc, cmdArgs);
             return;
         #endif
         }
+    }
+
+    if (logFile == NULL) {
+        logFile = stderr;
+    }
+#ifdef _WIN32
+    /* The early -D detection (wide-string comparison of cmdArgs before
+     * conversion) may have set ServiceDebugCb even when -D was supplied.
+     * Now that mygetopt has been processed, restore the file-based
+     * callback in any case where output should go to logFile:
+     *   - isDaemon==0 running interactively, logs to logFile (stderr)
+     *   - isDaemon==1 but -E was used, logs to the specified file
+     * This must happen BEFORE config/SetupCTX so their log messages are
+     * captured in the file (or stderr) rather than lost to
+     * OutputDebugString. */
+    if (!isDaemon || logFile != stderr) {
+        wolfSSH_SetLoggingCb(wolfSSHDLoggingCb);
+    }
+#endif
+
+    /* Must run before privilege drop so the shadow file is accessible.
+     * Degrades to a fixed-cost fake hash if the shadow read fails. */
+    if (ret == WS_SUCCESS && !testMode) {
+        wolfSSHD_AuthInit();
     }
 
     if (ret == WS_SUCCESS) {
@@ -2406,8 +4534,20 @@ static int StartSSHD(int argc, char** argv)
     }
 
     /* check if host key file was passed in */
-    if (hostKeyFile != NULL) {
-        wolfSSHD_ConfigSetHostKeyFile(conf, hostKeyFile);
+    if (ret == WS_SUCCESS && hostKeyFile != NULL) {
+    #if defined(WOLFSSH_CERTS) && defined(WOLFSSH_WINDOWS_CERT_STORE)
+        /* The store branch in SetupCTX() wins over the file path, so an
+         * accepted -h here would be silently discarded. */
+        if (wolfSSHD_ConfigGetHostKeyStore(conf) != NULL) {
+            wolfSSH_Log(WS_LOG_ERROR,
+                "[SSHD] -h host key file conflicts with the configured "
+                "wolfSSH_HostKeyStore. Use one or the other.");
+            ret = WS_BAD_ARGUMENT;
+        }
+    #endif
+        if (ret == WS_SUCCESS) {
+            wolfSSHD_ConfigSetHostKeyFile(conf, hostKeyFile);
+        }
     }
 
     if (ret == WS_SUCCESS) {
@@ -2421,10 +4561,6 @@ static int StartSSHD(int argc, char** argv)
             wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue creating auth struct");
             ret = WS_MEMORY_E;
         }
-    }
-
-    if (logFile == NULL) {
-        logFile = stderr;
     }
 
     /* run as a daemon or service */
@@ -2462,7 +4598,11 @@ static int StartSSHD(int argc, char** argv)
                 exit(EXIT_SUCCESS);
             }
 
-            umask(0);
+            /* Not umask(0): every per-connection child inherits this, and
+             * nothing sets one later, so a cleared mask reaches the user's
+             * shell and the SCP receive path. Files created there came out
+             * 0666 and directories 0777. */
+            umask(WOLFSSHD_DEFAULT_UMASK);
             if (chdir("/") < 0) {
                 ret = WS_FATAL_ERROR;
             }
@@ -2513,11 +4653,9 @@ static int StartSSHD(int argc, char** argv)
                 if (SetServiceStatus(serviceStatusHandle, &serviceStatus) == FALSE) {
                     wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Issue updating service status");
                 }
+                _freeWinArgs(argv, argc, cmdArgs);
                 return;
             }
-        }
-        if (cmdArgs != NULL) {
-            LocalFree(cmdArgs);
         }
     }
 #endif
@@ -2561,10 +4699,15 @@ static int StartSSHD(int argc, char** argv)
                     "[SSHD] Failed to malloc memory for connection");
                 break;
             }
+            WMEMSET(conn, 0, sizeof(WOLFSSHD_CONNECTION));
 
             conn->auth = auth;
             conn->listenFd = (int)listenFd;
             conn->isThreaded = isDaemon;
+#ifdef _WIN32
+            conn->timeOut = 0;
+            conn->loginTimer = NULL;
+#endif
 
             /* wait for a connection */
             if (PendingConnection(listenFd)) {
@@ -2622,10 +4765,33 @@ static int StartSSHD(int argc, char** argv)
                     }
 #endif
                 }
+#ifdef _WIN32
+                {
+                    WOLFSSHD_AUTH* connAuth =
+                        wolfSSHD_AuthCreateUser(NULL, conf);
+                    if (connAuth == NULL) {
+                        wolfSSH_Log(WS_LOG_ERROR, "[SSHD] Failed to create "
+                            "auth struct for connection");
+                        WCLOSESOCKET(conn->fd);
+                        WFREE(conn, NULL, DYNTYPE_SSHD);
+                        continue;
+                    }
+                    conn->auth = connAuth;
+                }
+#endif
                 ret = NewConnection(conn);
+                if (ret != WS_SUCCESS) {
+                    /* on failure the connection was not handed off, it is
+                       still owned here and needs cleaned up */
+                    WCLOSESOCKET(conn->fd);
+                #ifdef _WIN32
+                    wolfSSHD_AuthFreeUser(conn->auth);
+                #endif
+                    WFREE(conn, NULL, DYNTYPE_SSHD);
+                }
             }
             else {
-                XFREE(conn, NULL, DYNTYPE_SSHD);
+                WFREE(conn, NULL, DYNTYPE_SSHD);
             }
 #ifdef _WIN32
             /* check if service has been shutdown */
@@ -2634,6 +4800,10 @@ static int StartSSHD(int argc, char** argv)
                 quit = 1;
             }
 #endif
+        }
+        if (quit && logFile) {
+            wolfSSHDLoggingFlush();
+            fprintf(logFile, "Closing down wolfSSHD\n");
         }
     }
 
@@ -2662,14 +4832,17 @@ static int StartSSHD(int argc, char** argv)
     wolfSSHD_AuthFreeUser(auth);
     wolfSSH_Cleanup();
 
-#ifdef _WIN32
-    if (isDaemon) { /* free up temporary memory used for conversion of args from wchar_t */
-        unsigned int z;
-        for (z = 0; z < argc; z++) {
-            WFREE(argv[z], NULL, DYNTYPE_SSHD);
-        }
-        WFREE(argv, NULL, DYNTYPE_SSHD);
+    if (debugMode) {
+        wolfSSH_Debugging_OFF();
+        wolfSSL_Debugging_OFF();
     }
+
+#ifdef _WIN32
+    /* free up temporary memory used for conversion of args from wchar_t.
+     * Not gated on isDaemon: argv/cmdArgs are allocated in both daemon and
+     * -D modes. _freeWinArgs() tolerates NULL argv/cmdArgs from an early
+     * failure, and argc tracks argv's length once it is allocated. */
+    _freeWinArgs(argv, argc, cmdArgs);
 #else
     return 0;
 #endif

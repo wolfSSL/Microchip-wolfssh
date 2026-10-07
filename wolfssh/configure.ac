@@ -3,7 +3,7 @@
 # All right reserved.
 
 AC_COPYRIGHT([Copyright (C) 2014-2026 wolfSSL Inc.])
-AC_INIT([wolfssh],[1.5.0],[support@wolfssl.com],[wolfssh],[https://www.wolfssl.com])
+AC_INIT([wolfssh],[1.6.0],[support@wolfssl.com],[wolfssh],[https://www.wolfssl.com])
 AC_PREREQ([2.69])
 AC_CONFIG_AUX_DIR([build-aux])
 
@@ -18,7 +18,7 @@ AC_ARG_PROGRAM
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_HEADERS([config.h])
 
-WOLFSSH_LIBRARY_VERSION=20:0:2
+WOLFSSH_LIBRARY_VERSION=21:0:3
 #                        | | |
 #                  +-----+ | +----+
 #                  |       |      |
@@ -88,6 +88,30 @@ AC_ARG_WITH(wolfssl,
 
 AC_CHECK_LIB([wolfssl],[wolfCrypt_Init],,[AC_MSG_ERROR([libwolfssl is required for ${PACKAGE}. It can be obtained from https://www.wolfssl.com/download.html/ .])])
 AC_CHECK_FUNCS([gethostbyname getaddrinfo gettimeofday inet_ntoa memset socket wc_ecc_set_rng])
+
+# futimens()/utimensat() declarations are feature-test-macro gated, so a plain
+# AC_CHECK_FUNCS link test can pass while the prototype stays hidden at compile
+# time. Probe through the real header so a positive result is build-safe.
+AC_MSG_CHECKING([for futimens])
+AC_LINK_IFELSE(
+  [AC_LANG_PROGRAM([[#include <sys/stat.h>
+#include <time.h>]],
+                   [[struct timespec ts[2]; (void)futimens(0, ts);]])],
+  [AC_DEFINE([HAVE_FUTIMENS], [1], [futimens() available and declared])
+   AC_MSG_RESULT([yes])],
+  [AC_MSG_RESULT([no])])
+
+AC_MSG_CHECKING([for utimensat])
+AC_LINK_IFELSE(
+  [AC_LANG_PROGRAM([[#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>]],
+                   [[struct timespec ts[2];
+                     (void)utimensat(AT_FDCWD, "x", ts, AT_SYMLINK_NOFOLLOW);]])],
+  [AC_DEFINE([HAVE_UTIMENSAT], [1], [utimensat() available and declared])
+   AC_MSG_RESULT([yes])],
+  [AC_MSG_RESULT([no])])
+
 AC_CHECK_DECLS([[pread],[pwrite]],,[unistd.h])
 
 # DEBUG
@@ -151,6 +175,11 @@ AC_ARG_ENABLE([sftp],
     [AS_HELP_STRING([--enable-sftp],[Enable SFTP support (default: disabled)])],
     [ENABLED_SFTP=$enableval],[ENABLED_SFTP=no])
 
+# SFTP buffer zeroization
+AC_ARG_ENABLE([sftp-zeroize],
+    [AS_HELP_STRING([--disable-sftp-zeroize],[Disable zeroization of SFTP file payload buffers before free (default: enabled)])],
+    [ENABLED_SFTP_ZEROIZE=$enableval],[ENABLED_SFTP_ZEROIZE=yes])
+
 # SSHD
 AC_ARG_ENABLE([sshd],
     [AS_HELP_STRING([--enable-sshd],[Enable SSHD support (default: disabled)])],
@@ -186,6 +215,17 @@ AC_ARG_ENABLE([certs],
     [AS_HELP_STRING([--enable-certs],[Enable X.509 cert support (default: disabled)])],
     [ENABLED_CERTS=$enableval],[ENABLED_CERTS=no])
 
+# OpenSSH certs
+AC_ARG_ENABLE([ossh-certs],
+    [AS_HELP_STRING([--enable-ossh-certs],[Enable OpenSSH certificate user auth (default: disabled)])],
+    [ENABLED_OSSH_CERTS=$enableval],[ENABLED_OSSH_CERTS=no])
+
+# Windows certificate store (host/client keys)
+AC_ARG_ENABLE([windows-cert-store],
+    [AS_HELP_STRING([--enable-windows-cert-store],[Enable Windows certificate store integration for keys (default: disabled)])],
+    [ENABLED_WINDOWS_CERT_STORE=$enableval],
+    [ENABLED_WINDOWS_CERT_STORE=no])
+
 # TPM 2.0 Support
 AC_ARG_ENABLE([tpm],
     [AS_HELP_STRING([--enable-tpm],[Enable TPM 2.0 support (default: disabled)])],
@@ -195,6 +235,11 @@ AC_ARG_ENABLE([tpm],
 AC_ARG_ENABLE([smallstack],
     [AS_HELP_STRING([--enable-smallstack],[Enable small stack (default: disabled)])],
     [ENABLED_SMALLSTACK=$enableval],[ENABLED_SMALLSTACK=no])
+
+# Allow "none" cipher/MAC
+AC_ARG_ENABLE([none-cipher],
+    [AS_HELP_STRING([--enable-none-cipher],[Allow negotiating the insecure "none" cipher/MAC, disabling encryption/integrity (default: disabled)])],
+    [ENABLED_NONE_CIPHER=$enableval],[ENABLED_NONE_CIPHER=no])
 
 # use PAM lib
 AC_ARG_WITH([pam],
@@ -220,6 +265,28 @@ AS_IF([test "x$ENABLED_ALL" = "xyes"],
 AS_IF([test "x$ENABLED_SSHD" = "xyes"],
       [ENABLED_SHELL=yes])
 
+# The client app runs every session's I/O on threads, so it needs a threaded
+# wolfSSL. Probe for the macro rather than trust the flags, it arrives through
+# wolfSSL's options.h. Asking for the client outright is an error; getting it
+# from --enable-all only drops it, so --enable-all still works here.
+AS_IF([test "x$ENABLED_SSHCLIENT" = "xyes"],[
+  AC_MSG_CHECKING([whether wolfSSL is single threaded])
+  AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM([[#ifdef WOLFSSL_USER_SETTINGS
+                       #include <wolfssl/wolfcrypt/settings.h>
+                       #else
+                       #include <wolfssl/options.h>
+                       #endif]],
+                     [[#ifndef SINGLE_THREADED
+                       #error "threaded"
+                       #endif]])],
+    [AC_MSG_RESULT([yes])
+     AS_IF([test "x$enable_sshclient" = "xyes"],
+           [AC_MSG_ERROR([--enable-sshclient requires a threaded wolfSSL.])],
+           [AC_MSG_NOTICE([single threaded wolfSSL, not building the ssh client app])
+            ENABLED_SSHCLIENT=no])],
+    [AC_MSG_RESULT([no])])])
+
 # Set the defined flags for the code.
 AS_IF([test "x$ENABLED_INLINE" = "xno"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DNO_INLINE"])
@@ -235,6 +302,8 @@ AS_IF([test "x$ENABLED_SCP" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_SCP"])
 AS_IF([test "x$ENABLED_SFTP" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_SFTP"])
+AS_IF([test "x$ENABLED_SFTP_ZEROIZE" = "xno"],
+      [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_NO_SFTP_BUFFER_ZERO"])
 AS_IF([test "x$ENABLED_FWD" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_FWD"])
 AS_IF([test "x$ENABLED_TERM" = "xyes"],
@@ -245,10 +314,53 @@ AS_IF([test "x$ENABLED_AGENT" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_AGENT"])
 AS_IF([test "x$ENABLED_CERTS" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_CERTS"])
+AS_IF([test "x$ENABLED_OSSH_CERTS" = "xyes"],
+      [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_OSSH_CERTS"])
+dnl Initialize before the feature block so a stray WINCERT_LIBS value in the
+dnl environment is never silently appended to LIBS for an unrelated build.
+WINCERT_LIBS=
+AS_IF([test "x$ENABLED_WINDOWS_CERT_STORE" = "xyes"],
+    [AS_IF([test "x$ENABLED_CERTS" != "xyes"],
+        [AC_MSG_ERROR([--enable-windows-cert-store requires X.509 cert support (--enable-certs)])])
+     AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_WINDOWS_CERT_STORE"
+     dnl Only the mingw triplets define _WIN32, which wolfssh/internal.h
+     dnl requires. MSYS/Cygwin toolchains do not.
+     dnl Accumulate the libraries in WINCERT_LIBS; they are appended to LIBS
+     dnl after the remaining AC_CHECK_LIB/AX_HARDEN_CC_COMPILER_FLAGS probes
+     dnl so a missing libncrypt cannot make those probes fail with unrelated
+     dnl error messages.
+     AS_CASE([$host],
+         [*mingw*],[WINCERT_LIBS="-lcrypt32 -lncrypt"],
+         [AC_MSG_ERROR([--enable-windows-cert-store is only supported on _WIN32 Windows hosts (mingw)])])
+     dnl Fail at configure time, not first link, when the SDK headers are
+     dnl absent. The link libraries are stock mingw import libs, so probing
+     dnl the headers is enough and keeps working without a cross-built
+     dnl wolfSSL installed.
+     AC_CHECK_HEADERS([windows.h],,
+         [AC_MSG_ERROR([windows.h not found; --enable-windows-cert-store needs the Windows SDK headers])])
+     AC_CHECK_HEADERS([wincrypt.h ncrypt.h],,
+         [AC_MSG_ERROR([wincrypt.h/ncrypt.h not found; --enable-windows-cert-store needs the Windows SDK headers])],
+         [[#include <windows.h>]])])
 AS_IF([test "x$ENABLED_SMALLSTACK" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_SMALL_STACK"])
+AS_IF([test "x$ENABLED_NONE_CIPHER" = "xyes"],
+      [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_ALLOW_NONE_CIPHER"])
+dnl The client app shows host key fingerprints and writes known_hosts
+dnl entries, both base64. wolfSSL only enables its encoder by default on
+dnl x86_64, so check for it rather than fail later on a hidden prototype.
 AS_IF([test "x$ENABLED_SSHCLIENT" = "xyes"],
-      [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_SSHCLIENT"])
+      [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_SSHCLIENT"
+       AC_MSG_CHECKING([for Base64_Encode_NoNl])
+       AC_LINK_IFELSE(
+         [AC_LANG_PROGRAM([[#include <wolfssl/options.h>
+#include <wolfssl/wolfcrypt/coding.h>]],
+                          [[byte out[8];
+                            word32 outSz = sizeof(out);
+                            (void)Base64_Encode_NoNl((const byte*)"x", 1,
+                                    out, &outSz);]])],
+         [AC_MSG_RESULT([yes])],
+         [AC_MSG_RESULT([no])
+          AC_MSG_ERROR([the SSH client app needs base64 encoding for host key fingerprints and known_hosts entries. Rebuild wolfSSL with --enable-base64encode, or leave out --enable-sshclient.])])])
 AS_IF([test "x$ENABLED_TPM" = "xyes"],
       [AM_CPPFLAGS="$AM_CPPFLAGS -DWOLFSSH_TPM"
        AC_CHECK_LIB([wolftpm],[wolfTPM2_Init],,[AC_MSG_ERROR([libwolftpm is required for ${PACKAGE}. It can be obtained from https://www.wolfssl.com/download.html/ .])])])
@@ -281,11 +393,21 @@ AS_IF([test "x$ENABLED_SSHD" = "xyes"],[
 
 AC_CONFIG_LINKS([keys/gretel-key-rsa.pub:keys/gretel-key-rsa.pub
                  keys/gretel-key-rsa.pem:keys/gretel-key-rsa.pem
+                 keys/gretel-key-ecc.pub:keys/gretel-key-ecc.pub
+                 keys/gretel-key-ecc.pem:keys/gretel-key-ecc.pem
                  keys/server-key-rsa.der:keys/server-key-rsa.der
                  keys/server-key-ecc.der:keys/server-key-ecc.der
-                 keys/server-key-ecc-521.der:keys/server-key-ecc-521.der])
+                 keys/server-key-ecc-521.der:keys/server-key-ecc-521.der
+                 keys/server-key-ed25519.der:keys/server-key-ed25519.der
+                 keys/ca-cert-ecc.der:keys/ca-cert-ecc.der
+                 keys/ca-key-ecc.der:keys/ca-key-ecc.der
+                 keys/server-cert.der:keys/server-cert.der
+                 keys/fred-cert.der:keys/fred-cert.der
+                 keys/fred-key.der:keys/fred-key.der])
 
 # Set the automake conditionals.
+AM_CONDITIONAL([BUILD_SERVER],[test "x$ENABLED_SERVER" = "xyes"])
+AM_CONDITIONAL([BUILD_CLIENT],[test "x$ENABLED_CLIENT" = "xyes"])
 AM_CONDITIONAL([BUILD_EXAMPLE_SERVERS],[test "x$ENABLED_EXAMPLES" = "xyes"])
 AM_CONDITIONAL([BUILD_EXAMPLE_CLIENTS],[test "x$ENABLED_EXAMPLES" = "xyes"])
 AM_CONDITIONAL([BUILD_INLINE],[test "x$ENABLED_INLINE" = "xyes"])
@@ -304,10 +426,28 @@ AM_CONDITIONAL([BUILD_KEYBOARD_INTERACTIVE],[test "x$ENABLED_KEYBOARD_INTERACTIV
 
 AX_HARDEN_CC_COMPILER_FLAGS
 
+dnl A test that is configured out compiles down to "return 77", the automake
+dnl skip code, and so does the main() that forwards to it. Apple's linker folds
+dnl the two identical bodies together, then writes LC_MAIN entryoff 0, so the
+dnl binary starts executing at the Mach-O header and dies with SIGILL instead
+dnl of skipping. Turn the folding off where the linker understands the flag;
+dnl GNU ld rejects it and is unaffected.
+AX_CHECK_LINK_FLAG([-Wl,-no_deduplicate],
+                   [AM_LDFLAGS="$AM_LDFLAGS -Wl,-no_deduplicate"])
+
+AS_IF([test -n "$WINCERT_LIBS"],[LIBS="$LIBS $WINCERT_LIBS"])
+
 CREATE_HEX_VERSION
 AC_SUBST([AM_CPPFLAGS])
 AC_SUBST([AM_CFLAGS])
 AC_SUBST([AM_LDFLAGS])
+
+# Tools used by the SBOM targets (see Makefile.am `make sbom`).  GIT is used
+# only to derive SOURCE_DATE_EPOCH for reproducible SBOM output; all three are
+# optional and the target reports a clear error when a required one is missing.
+AC_PATH_PROG([PYTHON3], [python3])
+AC_PATH_PROG([PYSPDXTOOLS], [pyspdxtools])
+AC_PATH_PROG([GIT], [git])
 
 # FINAL
 AC_CONFIG_FILES([Makefile wolfssh/version.h])
@@ -342,10 +482,14 @@ AS_ECHO(["   * psuedo-terminal:           $ENABLED_TERM"])
 AS_ECHO(["   * echoserver shell support:  $ENABLED_SHELL"])
 AS_ECHO(["   * scp:                       $ENABLED_SCP"])
 AS_ECHO(["   * sftp:                      $ENABLED_SFTP"])
+AS_ECHO(["   * sftp buffer zeroize:       $ENABLED_SFTP_ZEROIZE"])
+AS_ECHO(["   * allow none cipher/MAC:     $ENABLED_NONE_CIPHER"])
 AS_ECHO(["   * sshd:                      $ENABLED_SSHD"])
 AS_ECHO(["   * ssh client:                $ENABLED_SSHCLIENT"])
 AS_ECHO(["   * agent:                     $ENABLED_AGENT"])
 AS_ECHO(["   * TPM 2.0 support:           $ENABLED_TPM"])
 AS_ECHO(["   * TCP/IP Forwarding:         $ENABLED_FWD"])
 AS_ECHO(["   * X.509 Certs:               $ENABLED_CERTS"])
+AS_ECHO(["   * OpenSSH Certs:             $ENABLED_OSSH_CERTS"])
+AS_ECHO(["   * Windows cert store:        $ENABLED_WINDOWS_CERT_STORE"])
 AS_ECHO(["   * Examples:                  $ENABLED_EXAMPLES"])

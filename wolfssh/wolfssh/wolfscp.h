@@ -107,27 +107,73 @@ enum WS_ScpFileStates {
 #endif /* NO_FILESYSTEM */
 #endif /* WOLFSSH_SCP_USER_CALLBACKS */
 
-typedef int (*WS_CallbackScpRecv)(WOLFSSH*, int, const char*, const char*,
-                                  int, word64, word64, word32, byte*, word32,
-                                  word32, void*);
-typedef int (*WS_CallbackScpSend)(WOLFSSH*, int, const char*, char*, word32,
-                                  word64*, word64*, int*, word32, word32*,
-                                  byte*, word32, void*);
+typedef int (*WS_CallbackScpRecv)(WOLFSSH* ssh, int state,
+                                  const char* basePath, const char* fileName,
+                                  int fileMode, word64 mTime, word64 aTime,
+                                  word32 totalFileSz, byte* buf, word32 bufSz,
+                                  word32 fileOffset, void* ctx);
+/* Send callback. Returns the number of octets placed in "buf", or one of the
+ * WS_SCP_* status codes, or a negative error to abort the transfer.
+ *
+ * "fileNameSz" is the capacity of the "fileName" buffer, not the length of any
+ * name already in it.
+ *
+ * Returning 0 is only valid on the call that fills in metadata (file name,
+ * mode, times, totalFileSz) and has no data ready yet; the library then sends
+ * the file header and calls back with WOLFSSH_SCP_CONTINUE_FILE_TRANSFER. A
+ * second 0 in a row while "fileOffset" is still short of "totalFileSz" is
+ * treated as a stalled callback and aborts the transfer, since there is no
+ * "no data right now" status in this API. Callbacks that can block should do
+ * so rather than returning 0. */
+typedef int (*WS_CallbackScpSend)(WOLFSSH* ssh, int state,
+                                  const char* peerRequest, char* fileName,
+                                  word32 fileNameSz, word64* mTime,
+                                  word64* aTime, int* fileMode,
+                                  word32 fileOffset, word32* totalFileSz,
+                                  byte* buf, word32 bufSz, void* ctx);
 
-WOLFSSH_API void  wolfSSH_SetScpRecv(WOLFSSH_CTX*, WS_CallbackScpRecv);
-WOLFSSH_API void  wolfSSH_SetScpSend(WOLFSSH_CTX*, WS_CallbackScpSend);
+WOLFSSH_API void  wolfSSH_SetScpRecv(WOLFSSH_CTX* ctx, WS_CallbackScpRecv cb);
+WOLFSSH_API void  wolfSSH_SetScpSend(WOLFSSH_CTX* ctx, WS_CallbackScpSend cb);
 
-WOLFSSH_API void  wolfSSH_SetScpRecvCtx(WOLFSSH*, void*);
-WOLFSSH_API void  wolfSSH_SetScpSendCtx(WOLFSSH*, void*);
+WOLFSSH_API void  wolfSSH_SetScpRecvCtx(WOLFSSH* ssh, void* ctx);
+WOLFSSH_API void  wolfSSH_SetScpSendCtx(WOLFSSH* ssh, void* ctx);
 
-WOLFSSH_API void* wolfSSH_GetScpRecvCtx(WOLFSSH*);
-WOLFSSH_API void* wolfSSH_GetScpSendCtx(WOLFSSH*);
+WOLFSSH_API void* wolfSSH_GetScpRecvCtx(WOLFSSH* ssh);
+WOLFSSH_API void* wolfSSH_GetScpSendCtx(WOLFSSH* ssh);
 
-WOLFSSH_API int   wolfSSH_SetScpErrorMsg(WOLFSSH*, const char*);
+/* NULL ssh or message returns WS_BAD_ARGUMENT */
+WOLFSSH_API int   wolfSSH_SetScpErrorMsg(WOLFSSH* ssh, const char* message);
 
-WOLFSSH_API int   wolfSSH_SCP_connect(WOLFSSH*, byte*);
-WOLFSSH_API int   wolfSSH_SCP_to(WOLFSSH*, const char*, const char*);
-WOLFSSH_API int   wolfSSH_SCP_from(WOLFSSH*, const char*, const char*);
+WOLFSSH_API int   wolfSSH_SCP_connect(WOLFSSH* ssh, byte* cmd);
+WOLFSSH_API int   wolfSSH_SCP_to(WOLFSSH* ssh, const char* src,
+        const char* dst);
+WOLFSSH_API int   wolfSSH_SCP_from(WOLFSSH* ssh, const char* src,
+        const char* dst);
+/* Server side. Drives an SCP transfer on a channel whose "exec scp ..."
+ * command is already bound. This is the same work wolfSSH_accept() does
+ * through its WS_SCP_INIT re-entry, exposed so an application can start the
+ * transfer itself; use one or the other, not both. Call it once
+ * wolfSSH_accept() has returned and the exec channel-request callback has
+ * reported an SCP command, not from inside that callback.
+ *
+ * Returns WS_SCP_COMPLETE when the transfer is done. On a non-blocking
+ * socket it returns WS_WANT_READ or WS_WANT_WRITE with the transfer part
+ * done; call it again on the same session until it completes. */
+WOLFSSH_API int   wolfSSH_SCP_accept(WOLFSSH* ssh);
+
+/* Tells an SCP request from an ordinary exec, for use from an exec
+ * channel-request callback and by wolfSSH_accept() itself, so the two
+ * cannot disagree about what starts a transfer.
+ *
+ * Returns 1 when the channel's session command starts an SCP transfer, 0
+ * when it does not, and WS_BAD_ARGUMENT when channel is NULL. "scp" must
+ * stand as its own token: a bare prefix match would take "scpbackup" as a
+ * transfer. The test runs over the recorded command size rather than the
+ * string length, and a command carrying a NUL anywhere within that size
+ * is not an SCP command: the parse that serves the transfer walks a C
+ * string, so a NUL would silently drop whatever follows it. */
+WOLFSSH_API int   wolfSSH_ChannelCommandIsScp(
+        const WOLFSSH_CHANNEL* channel);
 
 
 #ifdef __cplusplus

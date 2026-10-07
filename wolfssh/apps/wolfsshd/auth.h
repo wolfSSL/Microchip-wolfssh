@@ -12,18 +12,35 @@
 #ifndef WOLFAUTH_H
 #define WOLFAUTH_H
 
+#ifndef WOLFSSH_SSHD_USER
+    #define WOLFSSH_SSHD_USER sshd
+#endif
+#define WOLFSSH_USER_GET_STRING(x) #x
+#define WOLFSSH_USER_STRING(x) WOLFSSH_USER_GET_STRING(x)
+
+/* Mirrors the condition auth.c uses to define its (translation-unit-local)
+ * HAVE_SHADOW; kept as a single macro here so the two can't drift apart. */
+#if !defined(_WIN32) && !(defined(__OSX__) || defined(__APPLE__))
+    #define WOLFSSHD_HAVE_SHADOW
+#endif
+
 #if 0
+
 typedef struct USER_NODE USER_NODE;
 
 USER_NODE* AddNewUser(USER_NODE* list, byte type, const byte* username,
                        word32 usernameSz, const byte* value, word32 valueSz);
 #endif
 
-void SetAuthKeysPattern(const char* pattern);
 int DefaultUserAuth(byte authType, WS_UserAuthData* authData, void* ctx);
 int DefaultUserAuthTypes(WOLFSSH* ssh, void* ctx);
 
 typedef struct WOLFSSHD_AUTH WOLFSSHD_AUTH;
+
+enum {
+    WSSHD_AUTH_FAILURE =  0,
+    WSSHD_AUTH_SUCCESS =  1
+};
 
 /*
  * Returns WSSHD_AUTH_SUCCESS if user found, WSSHD_AUTH_FAILURE if user not
@@ -45,8 +62,11 @@ typedef int (*CallbackCheckPassword)(const char* usr, const byte* psw,
  */
 typedef int (*CallbackCheckPublicKey)(const char* usr,
                                       const WS_UserAuthData_PublicKey* pubKey,
-                                      const char* usrCaKeysFile, WOLFSSHD_AUTH* authCtx);
+                                      const char* usrCaKeysFile,
+                                      const char* authorizedKeysFile,
+                                      WOLFSSHD_AUTH* authCtx);
 
+void wolfSSHD_AuthInit(void);
 WOLFSSHD_AUTH* wolfSSHD_AuthCreateUser(void* heap, const WOLFSSHD_CONFIG* conf);
 int wolfSSHD_AuthFreeUser(WOLFSSHD_AUTH* auth);
 int wolfSSHD_AuthReducePermissions(WOLFSSHD_AUTH* auth);
@@ -56,12 +76,113 @@ int wolfSSHD_AuthReducePermissionsUser(WOLFSSHD_AUTH* auth, WUID_T uid,
 int wolfSSHD_AuthSetGroups(const WOLFSSHD_AUTH* auth, const char* usr,
     WGID_T gid);
 long wolfSSHD_AuthGetGraceTime(const WOLFSSHD_AUTH* auth);
+int wolfSSHD_AuthKeysPatternIsPerUser(const char* pattern);
+#ifdef WOLFSSH_OSSH_CERTS
+void wolfSSHD_AuthSetPeerIp(WOLFSSHD_AUTH* auth, const char* ip);
+const char* wolfSSHD_AuthGetForcedCmd(const WOLFSSHD_AUTH* auth);
+const char* wolfSSHD_AuthMergeForcedCmd(const char* configCmd,
+        const char* certCmd);
+int wolfSSHD_AuthSetCertForcedCmd(WOLFSSHD_AUTH* auth, const byte* cmd,
+        word32 cmdSz);
+#endif
+/* Wraps wolfSSHD_GetUserConf with this user's resolved group set. The result is
+ * a newly allocated config the caller frees with wolfSSHD_ConfigFree(). */
 WOLFSSHD_CONFIG* wolfSSHD_AuthGetUserConf(const WOLFSSHD_AUTH* auth,
         const char* usr, const char* host,
         const char* localAdr, word16* localPort, const char* RDomain,
         const char* adr);
 #ifdef _WIN32
 HANDLE wolfSSHD_GetAuthToken(const WOLFSSHD_AUTH* auth);
+void wolfSSHD_AuthCloseToken(WOLFSSHD_AUTH* auth);
 int wolfSSHD_GetHomeDirectory(WOLFSSHD_AUTH* auth, WOLFSSH* ssh, WCHAR* out, int outSz);
+#endif
+
+/* Secure open for trusted files, shared by the authorized_keys path (auth.c)
+ * and the trust-anchor loads in wolfsshd.c (host key, host cert, user CA keys).
+ * See the definition in auth.c for the meaning of each argument. */
+int wolfSSHD_OpenSecureFile(const char* path, WUID_T ownerUid,
+    int rejectReadable, int relaxPerms, void* heap, WFILE** out);
+
+/* classifies a loaded host private key buffer as OpenSSH or ASN1/DER.
+ * *keyDer is a WMALLOC'd (heap, DYNTYPE_SSHD) buffer to WS_FORCEZERO +
+ * WFREE on a PEM decode, else NULL. */
+int wolfSSHD_DetectPrivKeyFormat(byte* data, word32 dataSz, void* heap,
+    byte** keyDer, byte** privBuf, word32* privBufSz);
+
+#ifdef WOLFSSHD_UNIT_TEST
+#ifndef _WIN32
+extern int (*wsshd_setregid_cb)(WGID_T, WGID_T);
+extern int (*wsshd_setreuid_cb)(WUID_T, WUID_T);
+extern int (*wsshd_setegid_cb)(WGID_T);
+extern int (*wsshd_seteuid_cb)(WUID_T);
+extern struct passwd* (*wsshd_getpwnam_cb)(const char*);
+extern int (*wsshd_setgroups_cb)(int, const WGID_T*);
+#ifdef WOLFSSHD_HAVE_SHADOW
+extern struct spwd* (*wsshd_getspnam_cb)(const char*);
+#endif
+extern int (*wsshd_getgrouplist_cb)(const char*, WGID_T, WGID_T*, int*);
+int wolfSSHD_GetUserGroupNames(void* heap, const char* usr, WGID_T primaryGid,
+        char*** outNames, word32* outCount);
+void wolfSSHD_FreeUserGroupNames(void* heap, char** names, word32 count);
+int SearchForPubKey(const char* path, const char* authKeysFile,
+                    const char* user,
+                    const WS_UserAuthData_PublicKey* pubKeyCtx,
+                    WUID_T uid, int strictModes);
+#endif
+word32 wolfsshd_test_MaxLineSz(void);
+#if defined(WOLFSSH_HAVE_LIBCRYPT) || defined(WOLFSSH_HAVE_LIBLOGIN)
+int CheckPasswordHashUnix(const char* input, const char* stored);
+#endif
+#ifdef WOLFSSHD_HAVE_SHADOW
+void GetFakeHashFromTemplate(const char* tmpl, char* out, word32 outSz);
+#ifdef WOLFSSHD_UNIT_TEST
+/* Pure test hooks under HAVE_SHADOW && WOLFSSHD_UNIT_TEST. */
+void wolfSSHD_SetCachedFakeHashForTest(const char* hash);
+void wolfSSHD_GetCachedFakeHashForTest(char* out, word32 outSz);
+int wolfSSHD_GetCachedFakeHashCountForTest(void);
+/* Parses one "user:hash:..." line into the fake-hash cache. */
+void AddShadowLineToFakeHashCache(char* line);
+/* Reads a shadow file stream line by line into the fake-hash cache. */
+void ScanShadowFile(WFILE* f);
+#ifndef WOLFSSH_USE_PAM
+/* Returns 1 when the shadow aging fields deny the account a login. */
+int IsShadowExpired(const struct spwd* sp, long today);
+#endif
+#endif
+#endif
+/* Not shadow-specific in auth.c, so not excluded on OSX/APPLE. */
+#if !defined(_WIN32) && !defined(WOLFSSH_USE_PAM)
+/* Returns WSSHD_AUTH_* for auth result, or WS_* for system errors. */
+int CheckPasswordUnix(const char* usr, const byte* pw, word32 pwSz,
+                       WOLFSSHD_AUTH* authCtx);
+#endif
+#ifdef WOLFSSHD_UNIT_TEST
+void DoFakePasswordCheck(WS_UserAuthData* authData);
+/* Pure test hooks under WOLFSSHD_UNIT_TEST. */
+void wolfSSHD_ResetFakePasswordCheckCountForTest(void);
+int wolfSSHD_GetFakePasswordCheckCountForTest(void);
+#endif
+/* isCert: skips wire-format cross-check for DER certs. */
+int CheckAuthKeysLine(char* line, word32 lineSz, const byte* key,
+                      word32 keySz, int isCert);
+int ResolveAuthKeysPath(const char* homeDir, const char* pattern,
+                        const char* user, char* resolved);
+int CAKeysFileDiffers(const char* a, const char* b);
+int MatchUPNToUser(const char* usr, const char* name, int nameSz,
+                   const char* allowList);
+int IsRootLoginDenied(int isRoot, WOLFSSHD_CONFIG* usrConf);
+int IsRootPasswordAuthBlocked(int isRoot, WOLFSSHD_CONFIG* usrConf);
+int IsRootPubKeyForcedCmdMissing(int isRoot, WOLFSSHD_CONFIG* usrConf);
+int wolfSSHD_GetUserAuthTypes(const WOLFSSHD_CONFIG* usrConf);
+#if defined(WOLFSSH_OSSH_CERTS) && !defined(_WIN32)
+int OsshPrefixMatch(const byte* a, const byte* b, int bits, int len);
+int OsshSourceAddrMatch(const byte* list, word32 listSz, const char* peerIp);
+int OsshCertCheckPrincipal(const WS_UserAuthData_PublicKey* pubKeyCtx,
+        const char* name);
+int OsshCertCheckValidity(const WS_UserAuthData_PublicKey* pubKeyCtx);
+int CheckPublicKeyUnix(const char* name,
+        const WS_UserAuthData_PublicKey* pubKeyCtx, const char* usrCaKeysFile,
+        const char* authorizedKeysFile, WOLFSSHD_AUTH* authCtx);
+#endif
 #endif
 #endif /* WOLFAUTH_H */

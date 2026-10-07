@@ -16,12 +16,30 @@ EXTRA_DIST+= \
             keys/gretel-key-ecc-384.der keys/gretel-key-ecc-384.pem keys/gretel-key-ecc-384.pub \
             keys/gretel-key-ecc-521.der keys/gretel-key-ecc-521.pem keys/gretel-key-ecc-521.pub \
             keys/gretel-key-rsa.der keys/gretel-key-rsa.pem keys/gretel-key-rsa.pub \
+            keys/hansel-key-ed25519.der keys/hansel-key-ed25519.pem keys/hansel-key-ed25519.pub \
+            keys/gretel-key-ed25519.der keys/gretel-key-ed25519.pem keys/gretel-key-ed25519.pub \
             keys/pubkeys-ecc.txt keys/pubkeys-ecc-384.txt keys/pubkeys-ecc-521.txt \
             keys/pubkeys-rsa.txt keys/passwd.txt keys/ca-cert-ecc.der \
             keys/ca-cert-ecc.pem keys/ca-key-ecc.der keys/ca-key-ecc.pem \
             keys/server-cert.der keys/server-cert.pem \
+            keys/server-cert-ed25519.der keys/server-cert-ed25519.pem \
             keys/fred-cert.der keys/fred-cert.pem \
             keys/server-key.pem keys/fred-key.der keys/fred-key.pem \
             keys/id_ecdsa keys/id_ecdsa.pub keys/id_rsa keys/id_rsa.pub \
-            keys/renewcerts.sh keys/renewcerts.cnf
+            keys/renewcerts.sh keys/renewcerts.cnf \
+            keys/server-key-ed25519.der keys/server-key-ed25519.pem \
+            keys/server-key-mldsa44.der keys/server-key-mldsa44.pem \
+            keys/server-key-mldsa65.der \
+            keys/server-key-mldsa87.der keys/server-key-mldsa44ed25519 \
+            keys/server-key-mldsa44es256 keys/server-key-mldsa65ed25519 \
+            keys/server-key-mldsa65es256 keys/server-key-mldsa87ed448 \
+            keys/server-key-mldsa87es384 \
+            keys/renew-ossh-certs.sh \
+            keys/ossh-ca keys/ossh-ca.pub \
+            keys/ossh-ca-rsa keys/ossh-ca-rsa.pub \
+            keys/ossh-ca-ecdsa keys/ossh-ca-ecdsa.pub \
+            keys/ossh-bad-ca keys/ossh-bad-ca.pub \
+            keys/ossh-user keys/ossh-user.pub \
+            keys/ossh-user-rsa keys/ossh-user-rsa.pub \
+            keys/ossh-user-ecdsa keys/ossh-user-ecdsa.pub
 

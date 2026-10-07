@@ -52,6 +52,28 @@
 #endif
 
 
+#ifndef WOLFSSH_MAX_PASSPHRASE_SZ
+    #define WOLFSSH_MAX_PASSPHRASE_SZ 256
+#endif
+
+
+/* Read buffer size for a reply from an agent. Covers a signature and its
+ * message header for any key up to RSA-8192. */
+#ifndef WOLFSSH_AGENT_MAX_RSP_SZ
+    #define WOLFSSH_AGENT_MAX_RSP_SZ 2048
+#endif
+
+/* Largest agent message this build will handle. The peer declares the
+ * length, so it is bounded before it drives an allocation. */
+#ifndef WOLFSSH_AGENT_MAX_MSG_SZ
+    #define WOLFSSH_AGENT_MAX_MSG_SZ 262144
+#endif
+
+/* Starting size and growth step for the channel accumulation buffer. */
+#ifndef WOLFSSH_AGENT_RELAY_CHUNK_SZ
+    #define WOLFSSH_AGENT_RELAY_CHUNK_SZ 512
+#endif
+
 /* payloadSz is an estimate, but it shall be greater-than/equal-to
  * the actual value. */
 static int PrepareMessage(WOLFSSH_AGENT_CTX* agent, word32 payloadSz)
@@ -361,22 +383,28 @@ static int PostSuccess(WOLFSSH_AGENT_CTX* agent)
 static int PostLock(WOLFSSH_AGENT_CTX* agent,
         const byte* passphrase, word32 passphraseSz)
 {
-    char pp[32];
-    word32 ppSz;
+    char* pp;
+    int ret = WS_SUCCESS;
 
-    (void)agent;
     WLOG(WS_LOG_AGENT, "Posting lock to agent %p", agent);
-    WOLFSSH_UNUSED(agent);
 
-    ppSz = sizeof(pp) - 1;
-    if (passphraseSz < ppSz)
-        ppSz = passphraseSz;
+    pp = (char*)WMALLOC(passphraseSz + 1, agent->heap, DYNTYPE_STRING);
+    if (pp == NULL)
+        ret = WS_MEMORY_E;
 
-    WMEMCPY(pp, passphrase, ppSz);
-    pp[ppSz] = 0;
-    WLOG(WS_LOG_AGENT, "Locking with passphrase '%s'", pp);
+    if (ret == WS_SUCCESS) {
+        WMEMCPY(pp, passphrase, passphraseSz);
+        pp[passphraseSz] = 0;
+#ifdef SHOW_SECRETS
+        WLOG(WS_LOG_AGENT, "Locking with passphrase '%s'", pp);
+#else
+        WLOG(WS_LOG_AGENT, "Locking with passphrase");
+#endif
+        WS_FORCEZERO(pp, passphraseSz);
+        WFREE(pp, agent->heap, DYNTYPE_STRING);
+    }
 
-    return WS_SUCCESS;
+    return ret;
 }
 
 
@@ -384,22 +412,28 @@ static int PostLock(WOLFSSH_AGENT_CTX* agent,
 static int PostUnlock(WOLFSSH_AGENT_CTX* agent,
         const byte* passphrase, word32 passphraseSz)
 {
-    char pp[32];
-    word32 ppSz;
+    char* pp;
+    int ret = WS_SUCCESS;
 
-    (void)agent;
     WLOG(WS_LOG_AGENT, "Posting unlock to agent %p", agent);
-    WOLFSSH_UNUSED(agent);
 
-    ppSz = sizeof(pp) - 1;
-    if (passphraseSz < ppSz)
-        ppSz = passphraseSz;
+    pp = (char*)WMALLOC(passphraseSz + 1, agent->heap, DYNTYPE_STRING);
+    if (pp == NULL)
+        ret = WS_MEMORY_E;
 
-    WMEMCPY(pp, passphrase, ppSz);
-    pp[ppSz] = 0;
-    WLOG(WS_LOG_AGENT, "Unlocking with passphrase '%s'", pp);
+    if (ret == WS_SUCCESS) {
+        WMEMCPY(pp, passphrase, passphraseSz);
+        pp[passphraseSz] = 0;
+#ifdef SHOW_SECRETS
+        WLOG(WS_LOG_AGENT, "Unlocking with passphrase '%s'", pp);
+#else
+        WLOG(WS_LOG_AGENT, "Unlocking with passphrase");
+#endif
+        WS_FORCEZERO(pp, passphraseSz);
+        WFREE(pp, agent->heap, DYNTYPE_STRING);
+    }
 
-    return WS_SUCCESS;
+    return ret;
 }
 
 
@@ -427,6 +461,7 @@ static int PostAddRsaId(WOLFSSH_AGENT_CTX* agent,
             ret = wc_Sha256Update(&sha, key, nSz + eSz + (LENGTH_SZ * 2));
         if (ret == 0)
             ret = wc_Sha256Final(&sha, id->id);
+        wc_Sha256Free(&sha);
 
         if (ret == 0)
             ret = WS_SUCCESS;
@@ -509,6 +544,7 @@ static int PostAddEcdsaId(WOLFSSH_AGENT_CTX* agent,
                     curveNameSz + qSz + (LENGTH_SZ * 2));
         if (ret == 0)
             ret = wc_Sha256Final(&sha, id->id);
+        wc_Sha256Free(&sha);
 
         if (ret == 0)
             ret = WS_SUCCESS;
@@ -575,6 +611,7 @@ static int PostRemoveId(WOLFSSH_AGENT_CTX* agent,
             ret = wc_Sha256Update(&sha, keyBlob, keyBlobSz);
         if (ret == 0)
             ret = wc_Sha256Final(&sha, id);
+        wc_Sha256Free(&sha);
         ret = (ret == 0) ? WS_SUCCESS : WS_CRYPTO_FAILED;
     }
 
@@ -652,13 +689,22 @@ static WOLFSSH_AGENT_ID* FindKeyId(WOLFSSH_AGENT_ID* id,
         ret = wc_Sha256Final(&sha, digest);
         ret = (ret == 0) ? WS_SUCCESS : WS_CRYPTO_FAILED;
     }
+    else {
+        ret = WS_CRYPTO_FAILED;
+    }
+    wc_Sha256Free(&sha);
 
     if (ret == WS_SUCCESS) {
+        /* only compare equal-length blobs to avoid an over-read */
         while (id != NULL &&
                 WMEMCMP(digest, id->id, WC_SHA256_DIGEST_SIZE) != 0 &&
-                WMEMCMP(keyBlob, id->keyBlob, keyBlobSz)) {
+                (id->keyBlobSz != keyBlobSz ||
+                 WMEMCMP(keyBlob, id->keyBlob, id->keyBlobSz) != 0)) {
             id = id->next;
         }
+    }
+    else {
+        id = NULL;
     }
 
     return id;
@@ -674,7 +720,7 @@ static int SignHashRsa(WOLFSSH_AGENT_KEY_RSA* rawKey, enum wc_HashType hashType,
 {
     RsaKey key;
     byte encSig[MAX_ENCODED_SIG_SZ];
-    int encSigSz, ret;
+    int encSigSz, ret, rc;
 
     ret = wc_InitRsaKey(&key, heap);
     if (ret == 0) {
@@ -684,7 +730,12 @@ static int SignHashRsa(WOLFSSH_AGENT_KEY_RSA* rawKey, enum wc_HashType hashType,
         mp_read_unsigned_bin(&key.p, rawKey->p, rawKey->pSz);
         mp_read_unsigned_bin(&key.q, rawKey->q, rawKey->qSz);
         mp_read_unsigned_bin(&key.u, rawKey->iqmp, rawKey->iqmpSz);
-
+    }
+#ifndef RSA_LOW_MEM
+    if (ret == 0)
+        ret = wolfSSH_CalcRsaDX(&key);
+#endif
+    if (ret == 0) {
         encSigSz = wc_EncodeSignature(encSig, digest, digestSz,
                 wc_HashGetOID(hashType));
         if (encSigSz <= 0) {
@@ -694,12 +745,15 @@ static int SignHashRsa(WOLFSSH_AGENT_KEY_RSA* rawKey, enum wc_HashType hashType,
     }
     if (ret == 0) {
         WLOG(WS_LOG_INFO, "Signing hash with RSA.");
-        *sigSz = wc_RsaSSL_Sign(encSig, encSigSz, sig, *sigSz, &key, rng);
-        if (*sigSz <= 0) {
+        /* Keep the result signed. Storing it straight into the unsigned
+         * *sigSz would turn a negative error into a huge length. */
+        rc = wc_RsaSSL_Sign(encSig, encSigSz, sig, *sigSz, &key, rng);
+        if (rc <= 0) {
             WLOG(WS_LOG_DEBUG, "Bad RSA Sign");
             ret = WS_RSA_E;
         }
         else {
+            *sigSz = (word32)rc;
             ret = wolfSSH_RsaVerify(sig, *sigSz,
                     encSig, encSigSz, &key, heap, "SignHashRsa");
         }
@@ -785,10 +839,10 @@ static int PostSignRequest(WOLFSSH_AGENT_CTX* agent,
         word32 flags)
 {
     WOLFSSH_AGENT_ID* id = NULL;
+    byte* sig = NULL;
     int ret = WS_SUCCESS;
-    byte sig[256];
     byte digest[WC_MAX_DIGEST_SIZE];
-    word32 sigSz = sizeof(sig);
+    word32 sigSz = 0;
     word32 digestSz = sizeof(digest);
     enum wc_HashType hashType;
     int curveId = 0, signRsa = 0, signEcc = 0;
@@ -860,6 +914,36 @@ static int PostSignRequest(WOLFSSH_AGENT_CTX* agent,
             ret = WS_CRYPTO_FAILED;
     }
 
+    /* Size the signature buffer from the identity. */
+    if (ret == WS_SUCCESS) {
+#if !defined(WOLFSSH_NO_RSA_SHA2_256) || \
+    !defined(WOLFSSH_NO_RSA_SHA2_512)
+        if (signRsa) {
+            /* The signature is as long as the modulus. The stored mpint
+             * carries a leading zero byte for the sign bit. */
+            sigSz = id->key.rsa.nSz;
+            if (sigSz > (RSA_MAX_SIZE / 8) + 1) {
+                WLOG(WS_LOG_AGENT, "Sign: RSA key too large.");
+                ret = WS_BUFFER_E;
+            }
+        }
+#endif
+#if !defined(WOLFSSH_NO_ECDSA_SHA2_NISTP256) || \
+    !defined(WOLFSSH_NO_ECDSA_SHA2_NISTP384) || \
+    !defined(WOLFSSH_NO_ECDSA_SHA2_NISTP521)
+        if (signEcc)
+            sigSz = ECDSA_ASN_SIG_SZ;
+#endif
+        if (ret == WS_SUCCESS && sigSz == 0)
+            ret = WS_BUFFER_E;
+    }
+
+    if (ret == WS_SUCCESS) {
+        sig = (byte*)WMALLOC(sigSz, agent->heap, DYNTYPE_AGENT_BUFFER);
+        if (sig == NULL)
+            ret = WS_MEMORY_E;
+    }
+
     if (ret == WS_SUCCESS) {
 #if !defined(WOLFSSH_NO_RSA_SHA2_256) || \
     !defined(WOLFSSH_NO_RSA_SHA2_512)
@@ -882,6 +966,9 @@ static int PostSignRequest(WOLFSSH_AGENT_CTX* agent,
         if (ret == WS_SUCCESS)
             ret = SendSignResponse(agent, sig, sigSz);
     }
+
+    if (sig != NULL)
+        WFREE(sig, agent->heap, DYNTYPE_AGENT_BUFFER);
 
     WLOG_LEAVE(ret);
     return ret;
@@ -1233,7 +1320,8 @@ static int DoAgentLock(WOLFSSH_AGENT_CTX* agent,
         ato32(buf + begin, &passphraseSz);
         begin += LENGTH_SZ;
 
-        if (begin + passphraseSz > len) {
+        if (passphraseSz > WOLFSSH_MAX_PASSPHRASE_SZ ||
+                begin + passphraseSz > len) {
             ret = WS_PARSE_E;
         }
     }
@@ -1277,7 +1365,8 @@ static int DoAgentUnlock(WOLFSSH_AGENT_CTX* agent,
         ato32(buf + begin, &passphraseSz);
         begin += LENGTH_SZ;
 
-        if (begin + passphraseSz > len)
+        if (passphraseSz > WOLFSSH_MAX_PASSPHRASE_SZ ||
+                begin + passphraseSz > len)
             ret = WS_PARSE_E;
     }
 
@@ -1352,23 +1441,18 @@ static int DoMessage(WOLFSSH_AGENT_CTX* agent,
     if (ret == WS_SUCCESS) {
         WLOG(WS_LOG_AGENT, "len = %u, idx = %u", len, *idx);
         begin = *idx;
-        if (begin > len) {
+
+        /* GetSize bounds the prefix and the payload; a nonzero payloadSz
+         * then covers the msg id read below. Reject 0: payloadSz - 1 is
+         * used as a length. */
+        if (GetSize(&payloadSz, buf, len, &begin) != WS_SUCCESS) {
             ret = WS_OVERFLOW_E;
         }
-    }
-
-    if (ret == WS_SUCCESS) {
-        if (LENGTH_SZ + MSG_ID_SZ + begin > len) {
-            ret = WS_OVERFLOW_E;
-        }
-    }
-
-    if (ret == WS_SUCCESS) {
-        ato32(buf + begin, &payloadSz);
-        WLOG(WS_LOG_AGENT, "payloadSz = %u", payloadSz);
-        begin += LENGTH_SZ;
-        if (payloadSz > len - begin) {
-            ret = WS_OVERFLOW_E;
+        else {
+            WLOG(WS_LOG_AGENT, "payloadSz = %u", payloadSz);
+            if (payloadSz == 0) {
+                ret = WS_OVERFLOW_E;
+            }
         }
     }
 
@@ -1491,6 +1575,60 @@ static WOLFSSH_AGENT_CTX* AgentInit(WOLFSSH_AGENT_CTX* agent, void* heap)
 }
 
 
+/* Makes room for needSz bytes past what the buffer still holds unread,
+ * allocating the buffer on first use. */
+static int AgentBufferPrep(WOLFSSH_AGENT_CTX* agent,
+        WOLFSSH_BUFFER** bufPtr, word32 needSz)
+{
+    WOLFSSH_BUFFER* buf;
+    int ret = WS_SUCCESS;
+
+    buf = *bufPtr;
+
+    if (buf == NULL) {
+        buf = (WOLFSSH_BUFFER*)WMALLOC(sizeof(*buf), agent->heap,
+                DYNTYPE_AGENT_BUFFER);
+        if (buf == NULL)
+            ret = WS_MEMORY_E;
+        else {
+            ret = BufferInit(buf, 0, agent->heap);
+            if (ret != WS_SUCCESS)
+                WFREE(buf, agent->heap, DYNTYPE_AGENT_BUFFER);
+            else
+                *bufPtr = buf;
+        }
+    }
+
+    if (ret == WS_SUCCESS)
+        ret = GrowBuffer(buf, needSz);
+
+    return ret;
+}
+
+
+/* Drops whatever the buffer holds, keeping the allocation. */
+static void AgentBufferReset(WOLFSSH_BUFFER* buf)
+{
+    if (buf != NULL) {
+        if (buf->bufferSz > 0)
+            WS_FORCEZERO(buf->buffer, buf->bufferSz);
+        buf->length = 0;
+        buf->idx = 0;
+    }
+}
+
+
+/* Releases one of the agent's buffers and its contents. */
+static void AgentBufferFree(WOLFSSH_AGENT_CTX* agent, WOLFSSH_BUFFER** bufPtr)
+{
+    if (*bufPtr != NULL) {
+        ShrinkBuffer(*bufPtr, 1);
+        WFREE(*bufPtr, agent->heap, DYNTYPE_AGENT_BUFFER);
+        *bufPtr = NULL;
+    }
+}
+
+
 WOLFSSH_AGENT_CTX* wolfSSH_AGENT_new(void* heap)
 {
     WOLFSSH_AGENT_CTX* agent;
@@ -1515,6 +1653,8 @@ void wolfSSH_AGENT_free(WOLFSSH_AGENT_CTX* agent)
         heap = agent->heap;
         if (agent->msg != NULL)
             WFREE(agent->msg, agent->heap, DYNTYPE_AGENT_BUFFER);
+        AgentBufferFree(agent, &agent->rxBuf);
+        AgentBufferFree(agent, &agent->relayBuf);
         wc_FreeRng(&agent->rng);
         wolfSSH_AGENT_ID_list_free(agent->idList, heap);
         WMEMSET(agent, 0, sizeof(*agent));
@@ -1563,10 +1703,10 @@ void wolfSSH_AGENT_ID_free(WOLFSSH_AGENT_ID* id, void* heap)
 
     if (id != NULL) {
         if (id->keyBuffer != NULL) {
-            WMEMSET(id->keyBuffer, 0, id->keyBufferSz);
+            WS_FORCEZERO(id->keyBuffer, id->keyBufferSz);
             WFREE(id->keyBuffer, heap, DYNTYPE_STRING);
         }
-        WMEMSET(id, 0, sizeof(WOLFSSH_AGENT_ID));
+        WS_FORCEZERO(id, sizeof(WOLFSSH_AGENT_ID));
         WFREE(id, heap, DYNTYPE_AGENT_ID);
     }
 
@@ -1654,6 +1794,95 @@ int wolfSSH_AGENT_enable(WOLFSSH* ssh, byte isEnabled)
 }
 
 
+int wolfSSH_AGENT_ChannelOpen(WOLFSSH* ssh)
+{
+    WOLFSSH_AGENT_CTX* newAgent = NULL;
+    WOLFSSH_CHANNEL* newChannel = NULL;
+    int ret = WS_SUCCESS;
+    /* wolfSSH_accept() clears only want-read/want-write/auth-pending, so a
+     * WS_BAD_ARGUMENT latched by a poll kills the handshake. */
+    int recordError = 0;
+
+    WLOG_ENTER();
+
+    if (ssh == NULL)
+        ret = WS_SSH_NULL_E;
+    else if (ssh->ctx->side != WOLFSSH_ENDPOINT_SERVER) {
+        /* Server side only. wolfSSH_connect() sets ssh->agent too, so the
+         * checks below would report a channel a client never opened. */
+        ret = WS_BAD_ARGUMENT;
+    }
+    else if (SendAfterDisconnect(ssh)) {
+        /* The session is over, so neither a new open nor the flush of one
+         * queued before the disconnect may go out. RFC 4253 section 11.1.
+         * WS_DISCONNECT is in ssh->error, where the rest of the API puts
+         * it. */
+        ret = WS_FATAL_ERROR;
+    }
+    else if (!ssh->useAgent) {
+        /* Nothing asked for agent forwarding on this session. */
+        ret = WS_BAD_ARGUMENT;
+    }
+    else if (ssh->agent == NULL) {
+        /* Nothing else sets ssh->agent, so a NULL one means "not opened
+         * yet". Idempotent, so a poll cannot open a second channel. */
+        WLOG(WS_LOG_AGENT, "Starting agent channel");
+
+        newAgent = wolfSSH_AGENT_new(ssh->ctx->heap);
+        if (newAgent == NULL)
+            ret = WS_MEMORY_E;
+
+        if (ret == WS_SUCCESS) {
+            newChannel = ChannelNew(ssh, ID_CHANTYPE_AUTH_AGENT,
+                    ssh->ctx->windowSz, ssh->ctx->maxPacketSz);
+            if (newChannel == NULL)
+                ret = WS_MEMORY_E;
+        }
+
+        if (ret == WS_SUCCESS) {
+            word32 flushes = ssh->txFlushCount;
+
+            recordError = 1;
+            ret = SendChannelOpenSession(ssh, newChannel);
+
+            /* What commits is the open reaching the peer, not the return:
+             * a highwater callback failing after the flush is not a send
+             * that never left. */
+            if (!SendPacketDelivered(ssh, flushes, ret)) {
+                ChannelDelete(newChannel, ssh->ctx->heap);
+            }
+            else {
+                /* Publish on a queued open too, so a retry takes the
+                 * already-open path rather than opening a second. */
+                ChannelAppend(ssh, newChannel);
+                newAgent->channel = newChannel->channel;
+                ssh->agent = newAgent;
+                newAgent = NULL;
+                if (ssh->ctx->agentCb) {
+                    ssh->ctx->agentCb(WOLFSSH_AGENT_LOCAL_SETUP,
+                            ssh->agentCbCtx);
+                }
+            }
+        }
+
+        if (newAgent != NULL)
+            wolfSSH_AGENT_free(newAgent);
+    }
+    else if (wolfSSH_OutputPending(ssh)) {
+        /* Any queued output, not just this open. Flush it rather than
+         * report a success the peer hasn't seen. */
+        recordError = 1;
+        ret = wolfSSH_SendPacket(ssh);
+    }
+
+    if (recordError)
+        ssh->error = ret;
+
+    WLOG_LEAVE(ret);
+    return ret;
+}
+
+
 int wolfSSH_AGENT_worker(WOLFSSH* ssh)
 {
     int ret = WS_SUCCESS;
@@ -1663,17 +1892,135 @@ int wolfSSH_AGENT_worker(WOLFSSH* ssh)
     if (ssh == NULL)
         ret = WS_SSH_NULL_E;
 
-    while (1) {
-        if (ret == WS_SUCCESS) {
+    if (ret == WS_SUCCESS) {
+        if (ssh->agent == NULL)
+            ret = WS_AGENT_NULL_E;
+    }
 
-            SendSuccess(NULL);
-            DoMessage(NULL, NULL, 0, NULL);
-            ssh->agent->state = AGENT_STATE_DONE;
-            break;
-        }
+    if (ret == WS_SUCCESS) {
+        SendSuccess(NULL);
+        DoMessage(NULL, NULL, 0, NULL);
+        ssh->agent->state = AGENT_STATE_DONE;
     }
 
     WLOG_LEAVE(ret);
+    return ret;
+}
+
+
+/* Writes the whole buffer to the agent, following up a short write. Reports
+ * the count sent in writtenSz, so a caller can tell a failure that sent
+ * nothing from one that sent part of the message. */
+static int AgentWriteAll(WOLFSSH* ssh, const byte* buf, word32 bufSz,
+        word32* writtenSz)
+{
+    word32 idx = 0;
+    int ret = WS_SUCCESS;
+    int sz;
+
+    while (ret == WS_SUCCESS && idx < bufSz) {
+        sz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_WRITE,
+                (byte*)(buf + idx), bufSz - idx, ssh->agentCbCtx);
+        if (sz <= 0 || (word32)sz > bufSz - idx)
+            ret = WS_AGENT_CXN_FAIL;
+        else
+            idx += (word32)sz;
+    }
+
+    if (writtenSz != NULL)
+        *writtenSz = idx;
+
+    return ret;
+}
+
+
+/* Writes one whole message to the agent, reconnecting once when the socket
+ * is dead and nothing went out. */
+static int AgentWriteMessage(WOLFSSH* ssh, const byte* buf, word32 bufSz)
+{
+    word32 wroteSz = 0;
+    int ret;
+
+    ret = AgentWriteAll(ssh, buf, bufSz, &wroteSz);
+    if (ret != WS_SUCCESS && wroteSz == 0 && ssh->ctx->agentCb) {
+        /* Only retry when nothing went out */
+        ret = ssh->ctx->agentCb(WOLFSSH_AGENT_LOCAL_SETUP, ssh->agentCbCtx);
+        if (ret != WS_AGENT_SUCCESS)
+            ret = WS_AGENT_CXN_FAIL;
+        else
+            ret = AgentWriteAll(ssh, buf, bufSz, NULL);
+    }
+
+    return ret;
+}
+
+
+/* Reads exactly bufSz bytes from the agent, looping over short reads. */
+static int AgentReadFull(WOLFSSH* ssh, byte* buf, word32 bufSz)
+{
+    word32 idx = 0;
+    int ret = WS_SUCCESS;
+    int sz;
+
+    while (ret == WS_SUCCESS && idx < bufSz) {
+        sz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_READ,
+                buf + idx, bufSz - idx, ssh->agentCbCtx);
+        if (sz <= 0 || (word32)sz > bufSz - idx)
+            ret = WS_AGENT_CXN_FAIL;
+        else
+            idx += (word32)sz;
+    }
+
+    return ret;
+}
+
+
+/* Reads one whole agent message into ssh->agent->rxBuf, length prefix and
+ * all, so msgSz counts those four bytes. msg and msgSz may be NULL. */
+static int AgentReadMessage(WOLFSSH* ssh, byte** msg, word32* msgSz)
+{
+    WOLFSSH_AGENT_CTX* agent;
+    byte hdr[LENGTH_SZ];
+    word32 payloadSz = 0;
+    word32 wholeSz = 0;
+    int ret;
+
+    agent = ssh->agent;
+    ret = AgentReadFull(ssh, hdr, (word32)sizeof(hdr));
+
+    if (ret == WS_SUCCESS) {
+        word32 begin = 0;
+
+        GetUint32(&payloadSz, hdr, (word32)sizeof(hdr), &begin);
+        if (payloadSz == 0 || payloadSz > WOLFSSH_AGENT_MAX_MSG_SZ) {
+            WLOG(WS_LOG_AGENT, "agent message size %u out of range", payloadSz);
+            ret = WS_BUFFER_E;
+        }
+        else {
+            wholeSz = payloadSz + LENGTH_SZ;
+        }
+    }
+
+    /* The last reply is spent, so drop it before asking for room. */
+    if (ret == WS_SUCCESS)
+        AgentBufferReset(agent->rxBuf);
+
+    if (ret == WS_SUCCESS)
+        ret = AgentBufferPrep(agent, &agent->rxBuf, wholeSz);
+
+    if (ret == WS_SUCCESS) {
+        WMEMCPY(agent->rxBuf->buffer, hdr, LENGTH_SZ);
+        ret = AgentReadFull(ssh, agent->rxBuf->buffer + LENGTH_SZ, payloadSz);
+    }
+
+    if (ret == WS_SUCCESS) {
+        agent->rxBuf->length = wholeSz;
+        if (msg != NULL)
+            *msg = agent->rxBuf->buffer;
+        if (msgSz != NULL)
+            *msgSz = wholeSz;
+    }
+
     return ret;
 }
 
@@ -1682,7 +2029,9 @@ int wolfSSH_AGENT_Relay(WOLFSSH* ssh,
         const byte* msg, word32* msgSz, byte* rsp, word32* rspSz)
 {
     WOLFSSH_AGENT_CTX* agent = NULL;
-    int ret = WS_SUCCESS, sz;
+    byte* agentRsp = NULL;
+    word32 agentRspSz = 0;
+    int ret = WS_SUCCESS;
 
     WLOG_ENTER();
 
@@ -1717,40 +2066,25 @@ int wolfSSH_AGENT_Relay(WOLFSSH* ssh,
 
     if (ret == WS_SUCCESS) {
         /* Write msg to the agent socket. */
-        sz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_WRITE,
-                (byte*)msg, *msgSz, ssh->agentCbCtx);
-        if (sz > 0) {
-            *msgSz = (word32)sz;
-        }
-        else {
-            if (sz == WS_CBIO_ERR_GENERAL) {
-                if (ssh->ctx->agentCb) {
-                    ret = ssh->ctx->agentCb(WOLFSSH_AGENT_LOCAL_SETUP,
-                            ssh->agentCbCtx);
-                    if (ret != WS_AGENT_SUCCESS)
-                        ret = WS_AGENT_CXN_FAIL;
-                }
-
-                if (ret == WS_AGENT_SUCCESS) {
-                    sz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_WRITE,
-                            (byte*)msg, *msgSz, ssh->agentCbCtx);
-                    if (sz > 0)
-                        *msgSz = (word32)sz;
-                    else
-                        ret = WS_AGENT_CXN_FAIL;
-                }
-            }
-        }
+        ret = AgentWriteMessage(ssh, msg, *msgSz);
     }
 
     if (ret == WS_SUCCESS) {
-        sz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_READ,
-                rsp, *rspSz, ssh->agentCbCtx);
-        if (sz > 0)
-            *rspSz = (word32)sz;
-        else
-            ret = WS_AGENT_CXN_FAIL;
+        ret = AgentReadMessage(ssh, &agentRsp, &agentRspSz);
+    }
 
+    if (ret == WS_SUCCESS) {
+        if (agentRspSz > *rspSz) {
+            WLOG(WS_LOG_AGENT, "agent reply too large for the caller buffer");
+            ret = WS_BUFFER_E;
+        }
+        else {
+            WMEMCPY(rsp, agentRsp, agentRspSz);
+            *rspSz = agentRspSz;
+        }
+        /* The caller has the reply now, so it is not one this session still
+         * owes the channel. */
+        AgentBufferReset(ssh->agent->rxBuf);
     }
 
     if (ret == WS_AGENT_SUCCESS)
@@ -1768,6 +2102,177 @@ int wolfSSH_AGENT_Relay(WOLFSSH* ssh,
 }
 
 
+/* Sends what is left of the agent's reply, tracking it in rxBuf->idx.
+ * Returns WS_WANT_WRITE while any of the reply is still owed. */
+static int AgentRelaySendReply(WOLFSSH* ssh, word32 channelId)
+{
+    WOLFSSH_BUFFER* rsp;
+    word32 flushes;
+    int ret = WS_SUCCESS;
+    int txd;
+
+    rsp = ssh->agent->rxBuf;
+
+    if (rsp != NULL && rsp->idx < rsp->length) {
+        flushes = ssh->txFlushCount;
+        txd = wolfSSH_ChannelIdSend(ssh, channelId, rsp->buffer + rsp->idx,
+                rsp->length - rsp->idx);
+
+        /* The send names what holds an unfinished reply, so pass it on. */
+        if (txd > 0)
+            rsp->idx += (word32)txd;
+        else if (txd == WS_WANT_WRITE || txd == WS_WINDOW_FULL
+                || txd == WS_REKEYING)
+            ret = txd;
+        else if (SendPacketDelivered(ssh, flushes, txd))
+            /* The peer has the bytes under a failing return, and how many is
+             * not recoverable, so the reply cannot resume. */
+            ret = WS_AGENT_CXN_FAIL;
+        else if (txd < 0)
+            ret = txd;
+        else
+            ret = WS_AGENT_CXN_FAIL;
+    }
+
+    /* Queued bytes still have to go out, whatever holds the reply. */
+    if ((ret == WS_SUCCESS || ret == WS_WINDOW_FULL || ret == WS_REKEYING)
+            && wolfSSH_OutputPending(ssh)) {
+        txd = wolfSSH_SendPacket(ssh);
+        if (txd != WS_SUCCESS && txd != WS_WANT_WRITE)
+            ret = txd;
+        else if (wolfSSH_OutputPending(ssh))
+            /* Bytes still queued wait on a writable socket. */
+            ret = WS_WANT_WRITE;
+    }
+
+    /* Done only once every byte is out of rxBuf. */
+    if (ret == WS_SUCCESS && rsp != NULL && rsp->idx < rsp->length)
+        ret = WS_WANT_WRITE;
+
+    if (ret == WS_SUCCESS)
+        AgentBufferReset(rsp);
+
+    return ret;
+}
+
+
+int wolfSSH_AGENT_RelayChannel(WOLFSSH* ssh, word32 channelId)
+{
+    WOLFSSH_AGENT_CTX* agent = NULL;
+    WOLFSSH_BUFFER* in = NULL;
+    word32 msgSz = 0;
+    word32 wholeSz;
+    word32 begin;
+    int ret = WS_SUCCESS;
+    int rxd;
+    int progress;
+
+    WLOG_ENTER();
+
+    if (ssh == NULL)
+        ret = WS_SSH_NULL_E;
+
+    if (ret == WS_SUCCESS) {
+        if (ssh->agent == NULL)
+            ret = WS_AGENT_NULL_E;
+    }
+
+    if (ret == WS_SUCCESS) {
+        agent = ssh->agent;
+
+        /* A different channel means the held bytes belong to a conversation
+         * that is over, so they are dropped rather than prepended. */
+        if (!agent->relayActive || agent->relayChannel != channelId) {
+            AgentBufferReset(agent->relayBuf);
+            AgentBufferReset(agent->rxBuf);
+            agent->relayChannel = channelId;
+            agent->relayActive = 1;
+        }
+
+        if (agent->state == AGENT_STATE_INIT && ssh->ctx->agentCb) {
+            ret = ssh->ctx->agentCb(WOLFSSH_AGENT_LOCAL_SETUP,
+                    ssh->agentCbCtx);
+            if (ret == WS_AGENT_SUCCESS)
+                agent->state = AGENT_STATE_CONNECTED;
+            else
+                ret = WS_AGENT_CXN_FAIL;
+        }
+    }
+
+    /* Finish the last call's reply first */
+    if (ret == WS_SUCCESS)
+        ret = AgentRelaySendReply(ssh, channelId);
+
+    /* One read reports only what is buffered now, so keep going while
+     * anything moves. */
+    while (ret == WS_SUCCESS) {
+        progress = 0;
+
+        ret = AgentBufferPrep(agent, &agent->relayBuf,
+                WOLFSSH_AGENT_RELAY_CHUNK_SZ);
+        if (ret != WS_SUCCESS)
+            break;
+        in = agent->relayBuf;
+
+        rxd = wolfSSH_ChannelIdRead(ssh, channelId, in->buffer + in->length,
+                in->bufferSz - in->length);
+        if (rxd < 0)
+            ret = rxd;
+        else if (rxd > 0) {
+            in->length += (word32)rxd;
+            progress = 1;
+        }
+
+        while (ret == WS_SUCCESS && in->length - in->idx >= LENGTH_SZ) {
+            begin = in->idx;
+            GetUint32(&msgSz, in->buffer, in->length, &begin);
+            if (msgSz == 0 || msgSz > WOLFSSH_AGENT_MAX_MSG_SZ) {
+                WLOG(WS_LOG_AGENT, "agent message size %u out of range", msgSz);
+                AgentBufferReset(in);
+                ret = WS_BUFFER_E;
+                break;
+            }
+
+            wholeSz = msgSz + LENGTH_SZ;
+            if (in->length - in->idx < wholeSz) {
+                /* Make room for the rest and wait for it. */
+                ret = AgentBufferPrep(agent, &agent->relayBuf, wholeSz);
+                in = agent->relayBuf;
+                break;
+            }
+
+            ret = AgentWriteMessage(ssh, in->buffer + in->idx, wholeSz);
+            /* An add-identity request carries a private key. */
+            WS_FORCEZERO(in->buffer + in->idx, wholeSz);
+            in->idx += wholeSz;
+
+            if (ret == WS_SUCCESS)
+                ret = AgentReadMessage(ssh, NULL, NULL);
+
+            if (ret == WS_SUCCESS)
+                ret = AgentRelaySendReply(ssh, channelId);
+
+            progress = 1;
+        }
+
+        if (!progress)
+            break;
+    }
+
+    /* A read late in the loop can credit the window with nothing left to
+     * frame, so drive and report that write too. */
+    if (ret == WS_SUCCESS)
+        ret = AgentRelaySendReply(ssh, channelId);
+
+    if (ret != WS_SUCCESS && ret != WS_WANT_WRITE && ret != WS_WINDOW_FULL
+            && ret != WS_REKEYING && agent != NULL)
+        agent->error = ret;
+
+    WLOG_LEAVE(ret);
+    return ret;
+}
+
+
 int wolfSSH_AGENT_SignRequest(WOLFSSH* ssh,
         const byte* digest, word32 digestSz,
         byte* sig, word32* sigSz,
@@ -1775,7 +2280,7 @@ int wolfSSH_AGENT_SignRequest(WOLFSSH* ssh,
         word32 flags)
 {
     int ret = WS_SUCCESS;
-    byte rxBuf[512];
+    byte* rxBuf = NULL;
     int rxSz;
     word32 idx = 0;
     WOLFSSH_AGENT_CTX* agent = NULL;
@@ -1793,6 +2298,13 @@ int wolfSSH_AGENT_SignRequest(WOLFSSH* ssh,
     if (ret == WS_SUCCESS) {
         if (sigSz == NULL)
             ret = WS_BAD_ARGUMENT;
+    }
+
+    if (ret == WS_SUCCESS) {
+        rxBuf = (byte*)WMALLOC(WOLFSSH_AGENT_MAX_RSP_SZ,
+                ssh->agent->heap, DYNTYPE_AGENT_BUFFER);
+        if (rxBuf == NULL)
+            ret = WS_MEMORY_E;
     }
 
     if (ret == WS_SUCCESS) {
@@ -1829,7 +2341,7 @@ int wolfSSH_AGENT_SignRequest(WOLFSSH* ssh,
 
     if (ret == WS_SUCCESS) {
         rxSz = ssh->ctx->agentIoCb(WOLFSSH_AGENT_IO_READ,
-                rxBuf, sizeof(rxBuf), ssh->agentCbCtx);
+                rxBuf, WOLFSSH_AGENT_MAX_RSP_SZ, ssh->agentCbCtx);
         if (rxSz > 0) {
             ret = DoMessage(ssh->agent, rxBuf, rxSz, &idx);
             if (ret == WS_SUCCESS) {
@@ -1875,6 +2387,11 @@ int wolfSSH_AGENT_SignRequest(WOLFSSH* ssh,
     if (ssh != NULL && ssh->ctx != NULL && ssh->ctx->agentCb != NULL) {
         ssh->ctx->agentCb(WOLFSSH_AGENT_LOCAL_CLEANUP, ssh->agentCbCtx);
     }
+
+    /* The agent's message was parsed in place out of this buffer, so it is
+     * freed after the last use of agent->msg. */
+    if (rxBuf != NULL)
+        WFREE(rxBuf, ssh->agent->heap, DYNTYPE_AGENT_BUFFER);
 
     WLOG_LEAVE(ret);
     return ret;

@@ -22,6 +22,7 @@
 #include <wolfssh/port.h>
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/coding.h>
+#include <wolfssl/wolfcrypt/memory.h>
 #include "apps/wolfssh/common.h"
 #ifndef USE_WINDOWS_API
     #include <termios.h>
@@ -35,7 +36,9 @@ static byte userPublicKeyBuf[512];
 static byte* userPublicKey = userPublicKeyBuf;
 static const byte* userPublicKeyType = NULL;
 static byte userPassword[256];
+#if !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
 static const byte* userPrivateKeyType = NULL;
+#endif
 static byte userPublicKeyAlloc = 0;
 static word32 userPublicKeySz = 0;
 static byte pubKeyLoaded = 0; /* was a public key loaded */
@@ -44,18 +47,9 @@ static byte* userPrivateKey = userPrivateKeyBuf;
 static byte userPrivateKeyAlloc = 0;
 static word32 userPublicKeyTypeSz = 0;
 static word32 userPrivateKeySz = sizeof(userPrivateKeyBuf);
+#if !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
 static word32 userPrivateKeyTypeSz = 0;
 static byte isPrivate = 0;
-
-
-#ifdef WOLFSSH_CERTS
-#if 0
-/* compiled in for using RSA certificates instead of ECC certificate */
-static const byte publicKeyType[] = "x509v3-ssh-rsa";
-static const byte privateKeyType[] = "ssh-rsa";
-#else
-static const byte publicKeyType[] = "x509v3-ecdsa-sha2-nistp256";
-#endif
 #endif
 
 
@@ -65,10 +59,12 @@ static inline void ato32(const byte* c, word32* u32)
 }
 
 
-static int load_der_file(const char* filename, byte** out, word32* outSz)
+/* Reads the text file filename into a nul terminated buffer, so callers can
+ * treat it as a C string. The caller frees out. Returns 0 on success. */
+static int load_text_file(const char* filename, char** out, word32* outSz)
 {
     WFILE* file;
-    byte* in;
+    char* in;
     long inSz;
     int ret;
 
@@ -79,7 +75,7 @@ static int load_der_file(const char* filename, byte** out, word32* outSz)
     if (ret != 0 || file == WBADFILE)
         return -1;
 
-    if (WFSEEK(NULL, file, 0, WSEEK_END) != 0) {
+    if (!WFSEEK_SUCCESS(WFSEEK(NULL, file, 0, WSEEK_END))) {
         WFCLOSE(NULL, file);
         return -1;
     }
@@ -91,28 +87,25 @@ static int load_der_file(const char* filename, byte** out, word32* outSz)
         return -1;
     }
 
-    in = (byte*)WMALLOC(inSz, NULL, 0);
+    in = (char*)WMALLOC(inSz + 1, NULL, 0);
     if (in == NULL) {
         WFCLOSE(NULL, file);
         return -1;
     }
 
     ret = (int)WFREAD(NULL, in, 1, inSz, file);
-    if (ret <= 0 || ret != inSz) {
-        ret = -1;
-        WFREE(in, NULL, 0);
-        in = 0;
-        inSz = 0;
-    }
-    else
-        ret = 0;
+    WFCLOSE(NULL, file);
 
+    if (ret <= 0 || (long)ret != inSz) {
+        WFREE(in, NULL, 0);
+        return -1;
+    }
+
+    in[inSz] = '\0';
     *out = in;
     *outSz = (word32)inSz;
 
-    WFCLOSE(NULL, file);
-
-    return ret;
+    return 0;
 }
 
 
@@ -135,6 +128,9 @@ static int ParseRFC6187(const byte* in, word32 inSz, byte** leafOut,
 
     /* Skip the name */
     ato32(in, &l);
+    if (l > inSz - sizeof(word32))
+        return WS_BUFFER_E;
+
     m += l + sizeof(word32);
 
     /* Get the cert count */
@@ -180,20 +176,113 @@ void ClientIPOverride(int flag)
 #endif /* WOLFSSH_CERTS */
 
 
-static int AppendKeyToFile(const char* filename, const char* name,
-        const char* type, const char* key)
+/* A known_hosts entry is whitespace-delimited and newline-terminated. Each
+ * stored field must be non-empty and free of spaces and control bytes,
+ * otherwise it could inject extra fields or a forged entry into the file.
+ * Returns WS_SUCCESS when the field is safe to store, WS_BAD_ARGUMENT
+ * otherwise. */
+static int IsFieldStorable(const char* field)
 {
-    WFILE *f;
-    int ret;
+    const char* p;
+    int ret = WS_SUCCESS;
 
-    ret = WFOPEN(NULL, &f, filename, "a");
-    if (ret == 0 && f != WBADFILE) {
-        fprintf(f, "%s %s %s\n", name, type, key);
-        WFCLOSE(NULL, f);
+    if (field == NULL || *field == '\0') {
+        ret = WS_BAD_ARGUMENT;
+    }
+    else {
+        for (p = field; *p != '\0'; p++) {
+            if ((unsigned char)*p <= ' ' || (unsigned char)*p == 0x7f) {
+                ret = WS_BAD_ARGUMENT;
+                break;
+            }
+        }
     }
 
     return ret;
 }
+
+
+/* A known_hosts entry has to start on its own line.
+ * Returns 1 when a separating newline has to go out ahead of the entry. */
+static int AppendNeedsNewline(const char* filename)
+{
+    WFILE *f = WBADFILE;
+    char last = '\n';
+    int needs = 0;
+
+    if (WFOPEN(NULL, &f, filename, "rb") != 0 || f == WBADFILE) {
+        /* No file to run into; the append creates it. */
+        return 0;
+    }
+
+    /* The seek fails on an empty file, which needs no separator either. */
+    if (WFSEEK_SUCCESS(WFSEEK(NULL, f, -1, WSEEK_END))
+            && WFREAD(NULL, &last, 1, 1, f) == 1) {
+        needs = (last != '\n');
+    }
+
+    WFCLOSE(NULL, f);
+
+    return needs;
+}
+
+
+static int AppendKeyToFile(const char* filename, const char* name,
+        const char* type, const char* key)
+{
+    WFILE *f = WBADFILE;
+    int ret;
+
+    /* The host name comes from the command line and the key type comes from
+     * the peer's host-key blob; both are untrusted and must not carry field or
+     * line separators. The key is Base64 and cannot contain a separator, so
+     * the same check on it only guards against a NULL or empty value reaching
+     * fprintf. */
+    ret = IsFieldStorable(name);
+    if (ret == WS_SUCCESS) {
+        ret = IsFieldStorable(type);
+    }
+    if (ret == WS_SUCCESS) {
+        ret = IsFieldStorable(key);
+    }
+    if (ret == WS_SUCCESS) {
+        const int needsNewline = AppendNeedsNewline(filename);
+
+        /* Binary mode: text mode would translate '\n' to CRLF on Windows,
+         * and known_hosts is conventionally LF-terminated regardless of
+         * platform. */
+        ret = WFOPEN(NULL, &f, filename, "ab");
+        if (ret == 0 && f != WBADFILE) {
+            /* Check the write and the close so a failed or truncated entry
+             * (for example on a full disk) is reported rather than appearing
+             * to pin the key. The close flushes buffered output, so a write
+             * error can surface there. */
+            if (fprintf(f, "%s%s %s %s\n", needsNewline ? "\n" : "",
+                        name, type, key) < 0) {
+                ret = WS_BAD_FILE_E;
+            }
+            if (WFCLOSE(NULL, f) != 0 && ret == WS_SUCCESS) {
+                ret = WS_BAD_FILE_E;
+            }
+        }
+        else if (ret == 0) {
+            /* WFOPEN reported success but produced no usable handle; surface
+             * an error instead of silently returning success. */
+            ret = WS_BAD_FILE_E;
+        }
+    }
+
+    return ret;
+}
+
+
+#ifdef WOLFSSH_TEST_INTERNAL
+int wolfSSH_TestAppendKeyToFile(const char* filename, const char* name,
+        const char* type, const char* key)
+{
+    return AppendKeyToFile(filename, name, type, key);
+}
+#endif
 
 
 static int FingerprintKey(const byte* pubKey, word32 pubKeySz, char* out)
@@ -212,12 +301,18 @@ static int FingerprintKey(const byte* pubKey, word32 pubKeySz, char* out)
         wc_Sha256Free(&sha);
     }
 
-    if (ret == 0)
+    if (ret == 0) {
+#ifdef WOLFSSL_BASE64_ENCODE
         ret = Base64_Encode_NoNl(digest, sizeof(digest), (byte*)fp, &fpSz);
+#else
+        ret = WS_NOT_COMPILED;
+#endif
+    }
 
     if (ret == 0) {
-        if (fp[fpSz] == '=') {
-            fp[fpSz] = 0;
+        if (fpSz > 0 && fp[fpSz - 1] == '=') {
+            /* Remove trailing padding */
+            fp[fpSz - 1] = 0;
         }
 
         WSTRCAT(out, "SHA256:");
@@ -282,7 +377,7 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
 
     if (ret == 0) {
         sz = 0;
-        ret = load_der_file(knownHostsName, (byte**)&knownHosts, &sz);
+        ret = load_text_file(knownHostsName, &knownHosts, &sz);
     }
 
     if (ret == 0) {
@@ -294,11 +389,6 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
     }
 
     if (ret == 0) {
-        /* load_der_file() loads exactly what's in the file. Since it is
-         * NL terminated lines of known host data, and the last line ends
-         * in a NL, overwrite that with a nul to terminate the new string. */
-        knownHosts[sz - 1] = 0;
-
         encodedKey = (char*)WMALLOC(WOLFSSH_CLIENT_ENCKEY_SIZE_ESTIMATE
                 + WOLFSSH_CLIENT_PUBKEYTYPE_SIZE_ESTIMATE
                 + WOLFSSH_CLIENT_FINGERPRINT_SIZE_ESTIMATE, NULL, 0);
@@ -316,10 +406,15 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
         fp[0] = 0;
 
         /* Get the key type out of the key. */
-        ato32(pubKey, &sz);
-        if ((sz > pubKeySz - sizeof(word32))
-                    || (sz > WOLFSSH_CLIENT_PUBKEYTYPE_SIZE_ESTIMATE - 1)) {
+        if (pubKeySz < sizeof(word32)) {
             ret = -1;
+        }
+        else {
+            ato32(pubKey, &sz);
+            if ((sz > pubKeySz - sizeof(word32))
+                        || (sz > WOLFSSH_CLIENT_PUBKEYTYPE_SIZE_ESTIMATE - 1)) {
+                ret = -1;
+            }
         }
     }
 
@@ -328,7 +423,11 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
         pubKeyType[sz] = 0;
 
         sz = WOLFSSH_CLIENT_ENCKEY_SIZE_ESTIMATE;
+#ifdef WOLFSSL_BASE64_ENCODE
         ret = Base64_Encode_NoNl(pubKey, pubKeySz, (byte*)encodedKey, &sz);
+#else
+        ret = WS_NOT_COMPILED;
+#endif
     }
 
     if (ret == 0)
@@ -340,6 +439,14 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
         lineCount++;
         line = WSTRSEP(&cursor, "\n");
         if (line != NULL && *line) {
+            /* Non-empty was checked above, so the last byte is a real one. */
+            word32 lineSz = (word32)WSTRLEN(line);
+
+            /* Remove trailing CR if present for comparison below */
+            if (line[lineSz - 1] == '\r') {
+                line[lineSz - 1] = 0;
+            }
+
             name = WSTRSEP(&line, " ");
             keyType = WSTRSEP(&line, " ");
             key = WSTRSEP(&line, " ");
@@ -369,10 +476,8 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
                             printf("This key matches other servers:\n");
                             otherMatch = 1;
                         }
-                        if (otherMatch) {
-                            printf("\t%s:%u: %s\n",
-                                    knownHostsName, lineCount, name);
-                        }
+                        printf("\t%s:%u: %s\n",
+                                knownHostsName, lineCount, name);
                     }
                 }
             }
@@ -413,6 +518,9 @@ int ClientPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
             if (GetConfirmation()) {
                 ret = AppendKeyToFile(knownHostsName,
                         targetName, pubKeyType, encodedKey);
+            }
+            else {
+                ret = -1;
             }
         }
     }
@@ -607,7 +715,6 @@ int ClientSetEcho(int type)
 #else
     static int echoInit = 0;
     static DWORD originalTerm;
-    static CONSOLE_SCREEN_BUFFER_INFO screenOrig;
     HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
     if (!echoInit) {
         if (GetConsoleMode(stdinHandle, &originalTerm) == 0) {
@@ -657,24 +764,30 @@ int ClientSetEcho(int type)
 int ClientUseCert(const char* certName)
 {
     int ret = 0;
+#if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+        !defined(WOLFSSH_USER_FILESYSTEM)
+    byte flavor = WOLFSSH_CERT_FLAVOR_UNKNOWN;
+#endif
 
     if (certName != NULL) {
-    #ifdef WOLFSSH_CERTS
-        ret = load_der_file(certName, &userPublicKey, &userPublicKeySz);
-        if (ret == 0) {
-            userPublicKeyType = publicKeyType;
-            userPublicKeyTypeSz = (word32)WSTRLEN((const char*)publicKeyType);
+    #if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+            !defined(WOLFSSH_USER_FILESYSTEM)
+        /* Form comes from the file, algorithm name from the certificate. */
+        ret = wolfSSH_ReadCert_file(certName, &userPublicKey, &userPublicKeySz,
+                &userPublicKeyType, &userPublicKeyTypeSz, &flavor, NULL);
+        if (ret == WS_SUCCESS) {
             pubKeyLoaded = 1;
             userPublicKeyAlloc = 1;
         }
         else {
+            /* Out params are cleared on failure; restore the static buf. */
             userPublicKey = userPublicKeyBuf;
             userPublicKeySz = 0;
             userPublicKeyType = NULL;
             userPublicKeyAlloc = 0;
         }
     #else
-        fprintf(stderr, "Certificate support not compiled in");
+        fprintf(stderr, "Certificate file support not compiled in\n");
         ret = WS_NOT_COMPILED;
     #endif
     }
@@ -689,6 +802,7 @@ int ClientSetPrivateKey(const char* privKeyName)
 {
     int ret;
 
+#if !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
     userPrivateKeyAlloc = 0;
     userPrivateKey = NULL; /* create new buffer based on parsed input */
     ret = wolfSSH_ReadKey_file(privKeyName,
@@ -704,6 +818,11 @@ int ClientSetPrivateKey(const char* privKeyName)
         userPrivateKeySz = sizeof(userPrivateKeyBuf);
         userPrivateKeyType = NULL;
     }
+#else
+    WOLFSSH_UNUSED(privKeyName);
+    fprintf(stderr, "File system not compiled in\n");
+    ret = WS_NOT_COMPILED;
+#endif
 
     return ret;
 }
@@ -715,6 +834,7 @@ int ClientUsePubKey(const char* pubKeyName)
 {
     int ret;
 
+#if !defined(NO_FILESYSTEM) && !defined(WOLFSSH_USER_FILESYSTEM)
     userPublicKeyAlloc = 0;
     userPublicKey = NULL; /* create new buffer based on parsed input */
     ret = wolfSSH_ReadKey_file(pubKeyName,
@@ -730,6 +850,11 @@ int ClientUsePubKey(const char* pubKeyName)
         userPublicKey = userPublicKeyBuf;
         userPublicKeySz = 0;
     }
+#else
+    WOLFSSH_UNUSED(pubKeyName);
+    fprintf(stderr, "File system not compiled in\n");
+    ret = WS_NOT_COMPILED;
+#endif
 
     return ret;
 }
@@ -740,22 +865,15 @@ int ClientLoadCA(WOLFSSH_CTX* ctx, const char* caCert)
 
     /* CA certificate to verify host cert with */
     if (caCert) {
-    #ifdef WOLFSSH_CERTS
-        byte* der = NULL;
-        word32 derSz;
-
-        ret = load_der_file(caCert, &der, &derSz);
-        if (ret == 0) {
-            if (wolfSSH_CTX_AddRootCert_buffer(ctx, der, derSz,
-                WOLFSSH_FORMAT_ASN1) != WS_SUCCESS) {
-                fprintf(stderr, "Couldn't parse in CA certificate.");
-                ret = WS_PARSE_E;
-            }
-            WFREE(der, NULL, 0);
+    #if defined(WOLFSSH_CERTS) && !defined(NO_FILESYSTEM) && \
+            !defined(WOLFSSH_USER_FILESYSTEM)
+        ret = wolfSSH_CTX_AddRootCert_file(ctx, caCert);
+        if (ret != WS_SUCCESS) {
+            fprintf(stderr, "Couldn't parse in CA certificate.\n");
         }
     #else
         WOLFSSH_UNUSED(ctx);
-        fprintf(stderr, "Support for certificates not compiled in.");
+        fprintf(stderr, "Support for certificate files not compiled in.\n");
         ret = WS_NOT_COMPILED;
     #endif
     }
@@ -773,9 +891,156 @@ void ClientFreeBuffers(void)
     }
 
     if (userPrivateKeyAlloc && userPrivateKey != NULL) {
+        wc_ForceZero(userPrivateKey, userPrivateKeySz);
         WFREE(userPrivateKey, NULL, DYNTYPE_PRIVKEY);
         userPrivateKey = userPrivateKeyBuf;
-        userPrivateKeySz = sizeof(userPrivateKeyBuf);
         userPrivateKeyAlloc = 0;
     }
+
+    wc_ForceZero(userPrivateKeyBuf, sizeof(userPrivateKeyBuf));
+    userPrivateKeySz = 0;
+    wc_ForceZero(userPassword, sizeof(userPassword));
+}
+
+
+/* Parse an SSH destination into its parts. Two forms are accepted:
+ *   - [user@]hostname
+ *   - ssh://[user@]hostname[:port]
+ * The "ssh://" prefix is only recognized at the start of the string. Parsing
+ * builds into local buffers and only commits to the outputs once the whole
+ * destination has parsed successfully, so on failure the caller's
+ * user/hostname/port are left untouched (no partial output, no leak). When a
+ * user is present, any existing *user is freed and replaced; likewise for
+ * *hostname. *hostname is set only when host text is present, so a malformed
+ * "ssh://" or "ssh://user@" leaves it untouched and the caller's NULL check can
+ * reject it cleanly. *port is overwritten only when an explicit port is given
+ * (URI form); a port that is non-numeric or outside 1..65535 is rejected with
+ * WS_BAD_ARGUMENT rather than silently truncated. Returns WS_SUCCESS on
+ * success, or a negative WS error code. */
+int ClientParseDestination(const char* in, char** user, char** hostname,
+        word16* port)
+{
+    int ret = WS_SUCCESS;
+    const char* uriPrefix = "ssh://";
+    char* dest = NULL;
+    char* cursor = NULL;
+    char* found = NULL;
+    char* newUser = NULL;
+    char* newHostname = NULL;
+    char* endptr = NULL;
+    long portVal = 0;
+    word16 newPort = 0;
+    size_t sz = 0;
+    int checkPort = 0;
+
+    if (in == NULL || user == NULL || hostname == NULL || port == NULL) {
+        ret = WS_BAD_ARGUMENT;
+    }
+
+    if (ret == WS_SUCCESS) {
+        newPort = *port; /* keep the caller's default unless overridden */
+        sz = WSTRLEN(in) + 1;
+        dest = (char*)WMALLOC(sz, NULL, 0);
+        if (dest == NULL) {
+            ret = WS_MEMORY_E;
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        WMEMCPY(dest, in, sz);
+        cursor = dest;
+
+        if (WSTRNCMP(cursor, uriPrefix, WSTRLEN(uriPrefix)) == 0) {
+            checkPort = 1;
+            cursor += WSTRLEN(uriPrefix);
+        }
+
+        found = WSTRCHR(cursor, '@');
+        if (found == cursor) {
+            fprintf(stderr, "note: empty user name before '@'\n");
+        }
+        if (found != NULL) {
+            *found = '\0';
+            sz = WSTRLEN(cursor) + 1;
+            newUser = (char*)WMALLOC(sz, NULL, 0);
+            if (newUser == NULL) {
+                ret = WS_MEMORY_E;
+            }
+            else {
+                WMEMCPY(newUser, cursor, sz);
+                cursor = found + 1;
+            }
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        if (checkPort) {
+            found = WSTRCHR(cursor, ':');
+            if (found != NULL) {
+                *found = '\0';
+            }
+        }
+        else {
+            found = NULL;
+        }
+
+        if (*cursor != 0) {
+            sz = WSTRLEN(cursor) + 1;
+            newHostname = (char*)WMALLOC(sz, NULL, 0);
+            if (newHostname == NULL) {
+                ret = WS_MEMORY_E;
+            }
+            else {
+                WMEMCPY(newHostname, cursor, sz);
+            }
+        }
+    }
+
+    if (ret == WS_SUCCESS && found != NULL) {
+        cursor = found + 1;
+        if (*cursor != 0) {
+            portVal = strtol(cursor, &endptr, 10);
+            if (endptr == cursor || *endptr != '\0'
+                    || portVal < 1 || portVal > 65535) {
+                fprintf(stderr, "invalid port \"%s\"\n", cursor);
+                ret = WS_BAD_ARGUMENT;
+            }
+            else {
+                newPort = (word16)portVal;
+            }
+        }
+    }
+
+    if (ret == WS_SUCCESS) {
+        /* Commit: replace the caller's values only now that parsing has fully
+         * succeeded, freeing any prior allocations. */
+        if (newUser != NULL) {
+            if (*user != NULL) {
+                WFREE(*user, NULL, 0);
+            }
+            *user = newUser;
+            newUser = NULL;
+        }
+        if (newHostname != NULL) {
+            if (*hostname != NULL) {
+                WFREE(*hostname, NULL, 0);
+            }
+            *hostname = newHostname;
+            newHostname = NULL;
+        }
+        *port = newPort;
+    }
+
+    /* Free the working buffer and any allocations not committed above. */
+    if (dest != NULL) {
+        WFREE(dest, NULL, 0);
+    }
+    if (newUser != NULL) {
+        WFREE(newUser, NULL, 0);
+    }
+    if (newHostname != NULL) {
+        WFREE(newHostname, NULL, 0);
+    }
+
+    return ret;
 }

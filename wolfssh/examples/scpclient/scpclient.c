@@ -103,6 +103,7 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
     byte nonBlock = 0;
     enum copyDir dir = copyNone;
     int ch;
+    int userEcc = 0;
     char* pubKeyName = NULL;
     char* privKeyName = NULL;
     char* certName = NULL;
@@ -209,7 +210,11 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
         err_sys("Empty path values");
     }
 
-    ret = ClientSetPrivateKey(privKeyName, 0, NULL, NULL);
+#ifdef WOLFSSH_NO_RSA
+    userEcc = 1;
+#endif
+
+    ret = ClientSetPrivateKey(privKeyName, userEcc, NULL, NULL);
     if (ret != 0) {
         err_sys("Error setting private key");
     }
@@ -222,7 +227,7 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
     else
 #endif
     {
-        ret = ClientUsePubKey(pubKeyName, 0, NULL);
+        ret = ClientUsePubKey(pubKeyName, userEcc, NULL);
     }
     if (ret != 0) {
         err_sys("Error setting public key");
@@ -287,9 +292,6 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
     if (ret != WS_SUCCESS)
         err_sys("Couldn't set the session's socket.");
 
-    if (ret != WS_SUCCESS)
-        err_sys("Couldn't set the channel type.");
-
     do {
         if (dir == copyFromSrv)
             ret = wolfSSH_SCP_from(ssh, path1, path2);
@@ -306,16 +308,19 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
     }
 
     ret = wolfSSH_shutdown(ssh);
-    /* do not continue on with shutdown process if peer already disconnected */
+    /* do not continue on with shutdown process if peer already disconnected.
+     * A peer EOF is not a disconnect: the channel is still open and its close
+     * is still owed, so the drain below is exactly what is wanted. */
     if (ret != WS_CHANNEL_CLOSED && ret != WS_SOCKET_ERROR_E &&
             wolfSSH_get_error(ssh) != WS_SOCKET_ERROR_E &&
             wolfSSH_get_error(ssh) != WS_CHANNEL_CLOSED) {
-        if (ret != WS_SUCCESS) {
+        if (ret != WS_SUCCESS && ret != WS_WANT_WRITE) {
             WLOG(WS_LOG_DEBUG, "Sending the shutdown messages failed.");
         }
         else {
             ret = wolfSSH_worker(ssh, NULL);
-            if (ret != WS_SUCCESS && ret != WS_CHANNEL_CLOSED) {
+            if (ret != WS_SUCCESS && ret != WS_CHANNEL_CLOSED
+                    && ret != WS_EOF) {
                 WLOG(WS_LOG_DEBUG,
                     "Failed to listen for close messages from the peer.");
             }
@@ -323,19 +328,21 @@ THREAD_RETURN WOLFSSH_THREAD scp_client(void* args)
     }
     WCLOSESOCKET(sockFd);
     wolfSSH_free(ssh);
+    /* release the example's own key buffers before CTX teardown */
+    ClientFreeBuffers(pubKeyName, privKeyName, NULL);
     wolfSSH_CTX_free(ctx);
     if (ret != WS_SUCCESS && ret != WS_SOCKET_ERROR_E &&
-            ret != WS_CHANNEL_CLOSED) {
+            ret != WS_CHANNEL_CLOSED && ret != WS_EOF) {
         WLOG(WS_LOG_DEBUG,
         "Closing scp stream failed. Connection could have been closed by peer");
     }
 
-    ClientFreeBuffers(pubKeyName, privKeyName, NULL);
 #if !defined(WOLFSSH_NO_ECC) && defined(FP_ECC) && defined(HAVE_THREAD_LS)
     wc_ecc_fp_free();  /* free per thread cache */
 #endif
 
-    if ((ret != WS_SUCCESS) && (ret != WS_CHANNEL_CLOSED))
+    if ((ret != WS_SUCCESS) && (ret != WS_CHANNEL_CLOSED)
+            && (ret != WS_EOF) && (ret != WS_WANT_WRITE))
         ((func_args*)args)->return_code = 1;
     return 0;
 }

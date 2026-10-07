@@ -32,6 +32,12 @@
 /*#include <wolfssh/error.h>*/
 #endif
 
+#ifdef WOLFSSH_SCP
+    /* for WS_CallbackScpSend used in func_args; test.h is included by sources
+     * (e.g. testsuite.c) that do not otherwise pull in wolfscp.h */
+    #include <wolfssh/wolfscp.h>
+#endif
+
 #ifdef USE_WINDOWS_API
     #ifndef _WIN32_WCE
         #include <process.h>
@@ -119,10 +125,21 @@
     #define NUM_SOCKETS 5
 #elif defined(WOLFSSH_ZEPHYR)
     #include <zephyr/kernel.h>
+    #include <zephyr/version.h>
     #include <zephyr/posix/posix_types.h>
     #include <zephyr/posix/pthread.h>
     #include <zephyr/posix/fcntl.h>
     #include <zephyr/net/socket.h>
+    #if ZEPHYR_VERSION_CODE >= ZEPHYR_VERSION(4, 1, 0)
+        /* Zephyr 4.1 removed NET_SOCKETS_POSIX_NAMES; the BSD/POSIX names
+         * (fd_set, select(), struct timeval, getaddrinfo()) now come from
+         * the POSIX headers, enabled via CONFIG_POSIX_API. Older Zephyr
+         * exposes them through <zephyr/net/socket.h> above. */
+        #include <zephyr/posix/sys/time.h>
+        #include <zephyr/posix/sys/select.h>
+        #include <zephyr/posix/sys/socket.h>
+        #include <zephyr/posix/netdb.h>
+    #endif
     #include <zephyr/sys/printk.h>
     #include <zephyr/sys/util.h>
     #include <stdlib.h>
@@ -375,7 +392,7 @@ static INLINE int mygetopt(int argc, char** argv, const char* optstring)
 }
 
 
-#ifdef USE_WINDOWS_API
+#if defined(USE_WINDOWS_API) && defined(_MSC_VER)
     #pragma warning(push)
     #pragma warning(disable:4996)
     /* For Windows builds, disable compiler warnings for:
@@ -537,7 +554,7 @@ static INLINE void build_addr(SOCKADDR_IN_T* addr, const char* peer,
 }
 #endif /* WOLFSSH_NUCLEUS */
 
-#ifdef USE_WINDOWS_API
+#if defined(USE_WINDOWS_API) && defined(_MSC_VER)
     #pragma warning(pop)
 #endif
 
@@ -667,7 +684,7 @@ static INLINE void tcp_listen(WS_SOCKET_T* sockfd, word16* port, int useAnyAddr)
         err_sys("tcp listen failed");
 #endif
 
-    #if !defined(USE_WINDOWS_API) && !defined(WOLFSSL_TIRTOS) && !defined(WOLFSSL_NUCLEUS)
+    #if !defined(WOLFSSL_TIRTOS) && !defined(WOLFSSL_NUCLEUS)
         if (*port == 0) {
             socklen_t len = sizeof(addr);
             if (getsockname(*sockfd, (struct sockaddr*)&addr, &len) == 0) {
@@ -688,7 +705,8 @@ enum {
     WS_SELECT_FAIL,
     WS_SELECT_TIMEOUT,
     WS_SELECT_RECV_READY,
-    WS_SELECT_ERROR_READY
+    WS_SELECT_ERROR_READY,
+    WS_SELECT_SEND_READY
 };
 
 #if (defined(WOLFSSH_TEST_SERVER) || defined(WOLFSSH_TEST_CLIENT)) && !defined(FREESCALE_MQX)
@@ -769,6 +787,35 @@ static INLINE int tcp_select(SOCKET_T socketfd, int to_sec)
     return WS_SELECT_FAIL;
 }
 
+
+/* tcp_select() waits on the read side. This is the write side, for a caller
+ * holding output the socket would not take. */
+static INLINE int tcp_select_write(SOCKET_T socketfd, int to_sec)
+{
+    WFD_SET_TYPE sendfds, errfds;
+    int nfds = (int)socketfd + 1;
+    struct timeval timeout = {(to_sec > 0) ? to_sec : 0, 100};
+    int result;
+
+    WFD_ZERO(&sendfds);
+    WFD_SET(socketfd, &sendfds);
+    WFD_ZERO(&errfds);
+    WFD_SET(socketfd, &errfds);
+
+    result = wSelect(nfds, NULL, &sendfds, &errfds, &timeout);
+
+    if (result == 0)
+        return WS_SELECT_TIMEOUT;
+    else if (result > 0) {
+        if (WFD_ISSET(socketfd, &sendfds))
+            return WS_SELECT_SEND_READY;
+        else if (WFD_ISSET(socketfd, &errfds))
+            return WS_SELECT_ERROR_READY;
+    }
+
+    return WS_SELECT_FAIL;
+}
+
 #endif /* WOLFSSH_TEST_SERVER || WOLFSSH_TEST_CLIENT */
 
 
@@ -817,6 +864,8 @@ typedef struct tcp_ready {
 #if defined(_POSIX_THREADS) && !defined(__MINGW32__)
     pthread_mutex_t mutex;
     pthread_cond_t  cond;
+#elif defined(USE_WINDOWS_API)
+    HANDLE           readyEvent; /* manual-reset event, set when ready */
 #endif
 } tcp_ready;
 
@@ -835,10 +884,22 @@ typedef struct func_args {
     /* callback for example sftp client commands instead of WFGETS */
     WS_CallbackSftpCommand sftp_cb;
 #endif
+#ifdef WOLFSSH_SCP
+    /* override the server's default scp send callback (test injection) */
+    WS_CallbackScpSend scp_send;
+#endif
 } func_args;
 
 
 #ifdef WOLFSSH_TEST_LOCKING
+
+#if defined(USE_WINDOWS_API) && defined(NO_MAIN_DRIVER) && \
+    !defined(SINGLE_THREADED)
+/* Upper bound on the wait for the server to become ready. The signal fires
+ * right after the listen() so the real wait is sub-second; this generous
+ * bound only keeps a dead server from hanging the run. */
+#define TCP_READY_TIMEOUT_MS 30000
+#endif
 
 static INLINE void InitTcpReady(tcp_ready* ready)
 {
@@ -849,6 +910,12 @@ static INLINE void InitTcpReady(tcp_ready* ready)
     !defined(__MINGW32__) && !defined(SINGLE_THREADED)
     pthread_mutex_init(&ready->mutex, NULL);
     pthread_cond_init(&ready->cond, NULL);
+#elif defined(USE_WINDOWS_API) && defined(NO_MAIN_DRIVER) && \
+    !defined(SINGLE_THREADED)
+    ready->readyEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (ready->readyEvent == NULL) {
+        err_sys("Create tcp ready event failed");
+    }
 #endif
 }
 
@@ -859,6 +926,12 @@ static INLINE void FreeTcpReady(tcp_ready* ready)
     !defined(__MINGW32__) && !defined(SINGLE_THREADED)
     pthread_mutex_destroy(&ready->mutex);
     pthread_cond_destroy(&ready->cond);
+#elif defined(USE_WINDOWS_API) && defined(NO_MAIN_DRIVER) && \
+    !defined(SINGLE_THREADED)
+    if (ready->readyEvent != NULL) {
+        CloseHandle(ready->readyEvent);
+        ready->readyEvent = NULL;
+    }
 #else
     WOLFSSH_UNUSED(ready);
 #endif
@@ -882,6 +955,14 @@ static INLINE void WaitTcpReady(tcp_ready* ready)
      * seems to help. This is not ideal. (XXX) */
     k_sleep(Z_TIMEOUT_TICKS(300));
 #endif /* WOLFSSH_ZEPHYR */
+#elif defined(USE_WINDOWS_API) && defined(NO_MAIN_DRIVER) && \
+    !defined(SINGLE_THREADED)
+    /* timeout or unset predicate means the server never signalled; abort
+     * so the failure points at startup, not a later bogus connect */
+    if (WaitForSingleObject(ready->readyEvent, TCP_READY_TIMEOUT_MS)
+            != WAIT_OBJECT_0 || !ready->ready) {
+        err_sys("wait for tcp ready failed");
+    }
 #else
     WOLFSSH_UNUSED(ready);
 #endif
@@ -1098,23 +1179,45 @@ static INLINE void build_addr_ipv6(struct sockaddr_in6* addr, const char* peer,
 
 #ifdef WOLFSSH_TEST_HEX2BIN
 
-#define BAD 0xFF
+/* Included unconditionally, and before the fallback below defines the
+ * Base16_Decode macro: a later transitive include of coding.h (e.g. via
+ * wolfssl/ssl.h in OPENSSL_EXTRA builds) is then an include-guard no-op
+ * instead of having its Base16_Decode declaration rewritten by the macro
+ * into a conflicting WS_Base16_Decode declaration. */
+#include <wolfssl/wolfcrypt/coding.h>
+
+/* Use the local fallback whenever wolfSSL will not supply Base16_Decode:
+ * only --enable-base16 and the options that imply it (openssh, sm2, all)
+ * build it, and coding.c compiles to nothing under NO_CODING even with
+ * WOLFSSL_BASE16 set. The fallback has a private name mapped onto
+ * Base16_Decode so it can never collide with coding.h's declaration, which
+ * is present under WOLFSSL_BASE16 even when NO_CODING empties the
+ * implementation, or with its prefix map. */
+#if !defined(WOLFSSL_BASE16) || defined(NO_CODING)
+
+#define WS_HEX_BAD 0xFF
 
 static const byte hexDecode[] =
 {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-    BAD, BAD, BAD, BAD, BAD, BAD, BAD,
+    WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD,
     10, 11, 12, 13, 14, 15,  /* upper case A-F */
-    BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD,
-    BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD,
-    BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD,
-    BAD, BAD,  /* G - ` */
+    WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD,
+    WS_HEX_BAD, WS_HEX_BAD,  /* G - ` */
     10, 11, 12, 13, 14, 15   /* lower case a-f */
 };  /* A starts at 0x41 not 0x3A */
 
+#undef Base16_Decode
+#define Base16_Decode WS_Base16_Decode
 
-static int Base16_Decode(const byte* in, word32 inLen,
-                         byte* out, word32* outLen)
+static int WS_Base16_Decode(const byte* in, word32 inLen,
+                            byte* out, word32* outLen)
 {
     word32 inIdx = 0;
     word32 outIdx = 0;
@@ -1131,7 +1234,7 @@ static int Base16_Decode(const byte* in, word32 inLen,
 
         b  = hexDecode[b];
 
-        if (b == BAD)
+        if (b == WS_HEX_BAD)
             return -1;
 
         out[outIdx++] = b;
@@ -1159,7 +1262,7 @@ static int Base16_Decode(const byte* in, word32 inLen,
         b  = hexDecode[b];
         b2 = hexDecode[b2];
 
-        if (b == BAD || b2 == BAD)
+        if (b == WS_HEX_BAD || b2 == WS_HEX_BAD)
             return -1;
 
         out[outIdx++] = (byte)((b << 4) | b2);
@@ -1170,6 +1273,9 @@ static int Base16_Decode(const byte* in, word32 inLen,
     return 0;
 }
 
+#undef WS_HEX_BAD
+
+#endif /* !WOLFSSL_BASE16 || NO_CODING */
 
 static void FreeBins(byte* b1, byte* b2, byte* b3, byte* b4)
 {

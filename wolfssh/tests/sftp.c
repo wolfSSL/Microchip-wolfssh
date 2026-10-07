@@ -127,6 +127,36 @@ static int checkLsSize(void)
                 sizeof(inBuf)) == NULL) ? 1 : 0;
 }
 
+/* a creat parse failure prints an error and creates nothing, so verify the
+ * tab-separated form actually created the file */
+static int checkLsHasCreatMtab(void)
+{
+    return (WSTRNSTR(inBuf, "test-creat-mtab",
+                sizeof(inBuf)) == NULL) ? 1 : 0;
+}
+
+/* same for the leading-whitespace form */
+static int checkLsHasCreatWs(void)
+{
+    return (WSTRNSTR(inBuf, "test-creat-ws",
+                sizeof(inBuf)) == NULL) ? 1 : 0;
+}
+
+/* same for the tab-separator form */
+static int checkLsHasCreatTab(void)
+{
+    return (WSTRNSTR(inBuf, "test-creat-tab",
+                sizeof(inBuf)) == NULL) ? 1 : 0;
+}
+
+/* guards the anchored creat matcher: if "rm mycreat" were mis-dispatched to
+ * creat, its argument parse would fail and the rm would silently never run,
+ * leaving mycreat behind for this check to find */
+static int checkLsHasNoMycreat(void)
+{
+    return (WSTRNSTR(inBuf, "mycreat", sizeof(inBuf)) != NULL) ? 1 : 0;
+}
+
 static int checkCdNonexistent(void)
 {
     if (WSTRNSTR(inBuf, "Error changing directory",
@@ -137,6 +167,87 @@ static int checkCdNonexistent(void)
     }
     return 0;
 }
+
+#if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_FATFS) && \
+    !defined(WOLFSSH_ZEPHYR)
+/* The umask wolfSSH_SftpTest() installs before any threads start, so the
+ * modes the server creates files and directories with are known. */
+#define SFTP_TEST_UMASK 0022
+
+/* Verify SFTP_SetFileAttributes stripped setuid/setgid/sticky bits when
+ * the client sent chmod 4777 (setuid + rwxrwxrwx). */
+static int checkChmodStripsSpecialBits(void)
+{
+    WSTAT_T st;
+
+    WMEMSET(&st, 0, sizeof(WSTAT_T));
+    if (WSTAT(NULL, "test-get-2", &st) != 0) {
+        fprintf(stderr, "stat test-get-2 failed\n");
+        return 1;
+    }
+    if (st.st_mode & 07000) {
+        fprintf(stderr,
+            "WOLFSSH_SFTP_SAFE_MODE: special bits not stripped: mode=%06o\n",
+            (unsigned)(st.st_mode & 07777));
+        return 1;
+    }
+    if ((st.st_mode & 0777) != 0777) {
+        fprintf(stderr,
+            "WOLFSSH_SFTP_SAFE_MODE: unexpected base mode=%06o, want 0777\n",
+            (unsigned)(st.st_mode & 07777));
+        return 1;
+    }
+    return 0;
+}
+
+/* Verify wolfSSH_SFTP_RecvOpen stripped setuid/setgid/sticky bits when the
+ * client sent creat 04755 (setuid + rwxr-xr-x).  The expected base mode is
+ * 0755 with SFTP_TEST_UMASK applied. */
+static int checkCreatStripsSpecialBits(void)
+{
+    WSTAT_T st;
+    unsigned int expectedMode;
+
+    expectedMode = (unsigned int)(0755 & ~SFTP_TEST_UMASK);
+    WMEMSET(&st, 0, sizeof(WSTAT_T));
+    if (WSTAT(NULL, "test-creat-special", &st) != 0) {
+        fprintf(stderr, "stat test-creat-special failed\n");
+        return 1;
+    }
+    if (st.st_mode & 07000) {
+        fprintf(stderr,
+            "WOLFSSH_SFTP_SAFE_MODE (RecvOpen): special bits not stripped: "
+            "mode=%06o\n", (unsigned)(st.st_mode & 07777));
+        return 1;
+    }
+    if ((st.st_mode & 0777) != expectedMode) {
+        fprintf(stderr,
+            "WOLFSSH_SFTP_SAFE_MODE (RecvOpen): unexpected base mode=%06o, "
+            "want %04o\n", (unsigned)(st.st_mode & 07777), expectedMode);
+        return 1;
+    }
+    return 0;
+}
+
+/* Verify the chmod of a directory landed: mkdir asks for 0777, which
+ * SFTP_TEST_UMASK leaves at 0755, so only the chmod can make it 0700. */
+static int checkChmodDirectory(void)
+{
+    WSTAT_T st;
+
+    WMEMSET(&st, 0, sizeof(WSTAT_T));
+    if (WSTAT(NULL, "test-chmod-dir", &st) != 0) {
+        fprintf(stderr, "stat test-chmod-dir failed\n");
+        return 1;
+    }
+    if ((st.st_mode & 0777) != 0700) {
+        fprintf(stderr, "chmod on directory: mode=%06o, want 0700\n",
+            (unsigned)(st.st_mode & 07777));
+        return 1;
+    }
+    return 0;
+}
+#endif /* !USE_WINDOWS_API && !WOLFSSH_FATFS && !WOLFSSH_ZEPHYR */
 
 #if !defined(NO_WOLFSSH_DIR) && !defined(WOLFSSH_FATFS)
 static int checkLlsHasConfigureAc(void)
@@ -200,8 +311,14 @@ static const SftpTestCmd cmds[] = {
      * the files may not exist. */
     { "rm a/configure.ac", NULL },
     { "rmdir a",        NULL },
-    { "rm test-get",    NULL },
-    { "rm test-get-2",  NULL },
+    { "rm test-get",           NULL },
+    { "rm test-get-2",         NULL },
+    { "rm test-creat-special", NULL },
+    { "rmdir test-chmod-dir",  NULL },
+    { "rm test-creat-ws",      NULL },
+    { "rm test-creat-tab",     NULL },
+    { "rm test-creat-mtab",    NULL },
+    { "rm mycreat",            NULL },
 
     /* --- test sequence starts here --- */
     { "mkdir a",        NULL },
@@ -226,8 +343,44 @@ static const SftpTestCmd cmds[] = {
     { "rename test-get test-get-2", NULL },
     { "rmdir a",        NULL },
     { "ls",             checkLsHasTestGet2 },
+#if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_FATFS) && \
+    !defined(WOLFSSH_ZEPHYR)
+    /* chmod with setuid bit set; checkChmodStripsSpecialBits verifies
+     * SFTP_SetFileAttributes applied WOLFSSH_SFTP_SAFE_MODE. */
+    { "chmod 4777 test-get-2", checkChmodStripsSpecialBits },
+    /* creat with setuid bit; checkCreatStripsSpecialBits verifies
+     * wolfSSH_SFTP_RecvOpen applied WOLFSSH_SFTP_SAFE_MODE. */
+    { "creat 04755 test-creat-special", checkCreatStripsSpecialBits },
+    { "rm test-creat-special",          NULL },
+    /* chmod of a directory; checkChmodDirectory verifies the mode landed
+     * and the directory survived. */
+    { "mkdir test-chmod-dir",           NULL },
+    { "chmod 700 test-chmod-dir",       checkChmodDirectory },
+    { "rmdir test-chmod-dir",           NULL },
+#endif
     { "chmod 600 test-get-2", NULL },
     { "rm test-get-2",  NULL },
+    /* the creat matcher is anchored to the line start: an argument
+     * containing the substring must stay with its own command. A
+     * mis-dispatched "rm mycreat" would fail creat's argument parse and
+     * silently skip the rm, so the ls check would still find mycreat. */
+    { "creat 0644 mycreat", NULL },
+    { "rm mycreat",     NULL },
+    { "ls",             checkLsHasNoMycreat },
+    /* leading whitespace and a tab separator both reach the creat handler;
+     * a parse failure would skip creation silently (rm ignores a missing
+     * file), so check each with ls before removing */
+    { "  creat 0644 test-creat-ws",  NULL },
+    { "ls",                          checkLsHasCreatWs },
+    { "rm test-creat-ws",            NULL },
+    { "creat\t0644 test-creat-tab",  NULL },
+    { "ls",                          checkLsHasCreatTab },
+    { "rm test-creat-tab",           NULL },
+    /* tab between mode and path must also parse; a parse failure would skip
+     * creation silently (rm ignores a missing file), so check with ls */
+    { "creat 0644\ttest-creat-mtab", NULL },
+    { "ls",                          checkLsHasCreatMtab },
+    { "rm test-creat-mtab",          NULL },
     { "ls -s",          checkLsSize },
     { "cd /nonexistent_path_xyz", checkCdNonexistent },
 #if !defined(NO_WOLFSSH_DIR) && !defined(WOLFSSH_FATFS)
@@ -249,6 +402,7 @@ static const SftpTestCmd cmds[] = {
     { "cd",             NULL },
     { "ls",             NULL },
     { "chmod",          NULL },
+    { "creat",          NULL },
     { "rmdir",          NULL },
     { "rm",             NULL },
     { "rename",         NULL },
@@ -306,9 +460,15 @@ int wolfSSH_SftpTest(int flag)
     int ret = 0;
     int argsCount;
 
-    const char* args[10];
+    /* The server thread holds ser.argv, so the client cannot share it. */
+    const char* argsServer[10];
+    const char* argsClient[10];
 #ifndef USE_WINDOWS_API
     char  portNumber[8];
+#endif
+#if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_FATFS) && \
+    !defined(WOLFSSH_ZEPHYR)
+    mode_t callerUmask;
 #endif
 
     THREAD_TYPE serThread;
@@ -321,17 +481,24 @@ int wolfSSH_SftpTest(int flag)
 
     wolfSSH_Debugging_ON();
 
+#if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_FATFS) && \
+    !defined(WOLFSSH_ZEPHYR)
+    /* Fix the umask before spawning threads so the file and directory
+     * modes the checks expect do not depend on the caller's umask. */
+    callerUmask = umask(SFTP_TEST_UMASK);
+#endif
+
     argsCount = 0;
-    args[argsCount++] = ".";
-    args[argsCount++] = "-1";
+    argsServer[argsCount++] = ".";
+    argsServer[argsCount++] = "-1";
 #ifndef USE_WINDOWS_API
-    args[argsCount++] = "-p";
-    args[argsCount++] = "0";
+    argsServer[argsCount++] = "-p";
+    argsServer[argsCount++] = "0";
 #endif
     if (flag)
-        args[argsCount++] = "-N";
+        argsServer[argsCount++] = "-N";
 
-    ser.argv   = (char**)args;
+    ser.argv   = (char**)argsServer;
     ser.argc    = argsCount;
     ser.signal = &ready;
     InitTcpReady(ser.signal);
@@ -339,23 +506,23 @@ int wolfSSH_SftpTest(int flag)
     WaitTcpReady(&ready);
 
     argsCount = 0;
-    args[argsCount++] = ".";
-    args[argsCount++] = "-u";
-    args[argsCount++] = "jill";
-    args[argsCount++] = "-P";
-    args[argsCount++] = "upthehill";
+    argsClient[argsCount++] = ".";
+    argsClient[argsCount++] = "-u";
+    argsClient[argsCount++] = "jill";
+    argsClient[argsCount++] = "-P";
+    argsClient[argsCount++] = "upthehill";
 
 #ifndef USE_WINDOWS_API
     /* use port that server has found */
-    args[argsCount++] = "-p";
+    argsClient[argsCount++] = "-p";
     snprintf(portNumber, sizeof(portNumber), "%d", ready.port);
-    args[argsCount++] = portNumber;
+    argsClient[argsCount++] = portNumber;
 #endif
 
     if (flag)
-        args[argsCount++] = "-N";
+        argsClient[argsCount++] = "-N";
 
-    cli.argv    = (char**)args;
+    cli.argv    = (char**)argsClient;
     cli.argc    = argsCount;
     cli.signal  = &ready;
     cli.sftp_cb = commandCb;
@@ -369,6 +536,11 @@ int wolfSSH_SftpTest(int flag)
     ThreadJoin(serThread);
     wolfSSH_Cleanup();
     FreeTcpReady(&ready);
+
+#if !defined(USE_WINDOWS_API) && !defined(WOLFSSH_FATFS) && \
+    !defined(WOLFSSH_ZEPHYR)
+    umask(callerUmask);
+#endif
 
     return ret;
 }

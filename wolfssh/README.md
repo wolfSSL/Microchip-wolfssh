@@ -451,22 +451,30 @@ The wolfSSH client and server will automatically negotiate using Curve25519.
 POST-QUANTUM
 ============
 
-wolfSSH now supports the post-quantum algorithm ML-KEM (formerly known as
-Kyber). It uses the ML-KEM-768 parameter set and is hybridized with ECDHE over
-the P-256 ECC curve.
+wolfSSH supports both post-quantum key exchange via ML-KEM (formerly known as
+Kyber) and post-quantum signature verification via ML-DSA (formerly known as
+Dilithium).
 
-In order to use this key exchange you must build and install wolfSSL on your
-system. Here is an example of an effective configuration:
+* **ML-KEM**: Uses the ML-KEM-768 parameter set hybridized with ECDHE over the
+  P-256 ECC curve.
+* **ML-DSA**: Supports ML-DSA-44, ML-DSA-65, and ML-DSA-87 parameter sets for
+  both server host keys and client public key authentication. When built with
+  certificate support, ML-DSA X.509 certificates (`x509v3-ssh-mldsa-44`,
+  `x509v3-ssh-mldsa-65`, and `x509v3-ssh-mldsa-87`) are also supported.
 
-    $ ./configure --enable-wolfssh --enable-mlkem
+In order to use these algorithms you must build and install wolfSSL with
+support for them. Here is an example of an effective configuration:
 
-After that, simply configure and build wolfssh as usual:
+    $ ./configure --enable-wolfssh --enable-mlkem --enable-mldsa
+
+After that, configure and build wolfSSH as usual:
 
     $ ./configure
     $ make all
 
 The wolfSSH client and server will automatically negotiate using ML-KEM-768
-hybridized with ECDHE over the P-256 ECC curve.
+hybridized with ECDHE over the P-256 ECC curve and ML-DSA for host keys/client
+public key authentication.
 
     $ ./examples/echoserver/echoserver -f
 
@@ -476,7 +484,7 @@ On the client side, you will see the following output:
 
 Server said: Hello, wolfSSH!
 
-If you want to see interoperability with OpenQauntumSafe's fork of OpenSSH, you
+If you want to see interoperability with OpenQuantumSafe's fork of OpenSSH, you
 can build and execute the fork while the echoserver is running. Download the
 release from here:
 
@@ -498,6 +506,7 @@ NOTE: when prompted, enter the password which is "upthehill".
 You can type a line of text and when you press enter, the line will be echoed
 back. Use CTRL-C to terminate the connection.
 
+
 CERTIFICATE SUPPORT
 ===================
 
@@ -514,6 +523,14 @@ For this example, we are disabling the FPKI checking as the included
 certificate for "fred" does not have the required FPKI extensions. If the
 flag WOLFSSH_NO_FPKI is removed, you can see the certificate get rejected.
 
+With or without FPKI, a peer certificate is held to RFC 6187 section 2.2: a
+KeyUsage extension must assert digitalSignature, and an ExtendedKeyUsage
+extension must name anyExtendedKeyUsage or a purpose for the role being
+verified (id-kp-secureShellClient or clientAuth for a user certificate,
+id-kp-secureShellServer or serverAuth for a host certificate). A certificate
+without those extensions is accepted. A mismatch fails with
+`WS_CERT_KEY_USAGE_E`.
+
 To provide a CA root certificate to validate a user's certificate, give the
 echoserver the command line option `-a`.
 
@@ -528,6 +545,73 @@ fred-cert.der would be:
     $ ./examples/echoserver/echoserver -a ./keys/ca-cert-ecc.pem -K fred:./keys/fred-cert.der
 
     $ ./examples/client/client -u fred -J ./keys/fred-cert.der -i ./keys/fred-key.der
+
+WINDOWS CERTIFICATE STORE
+=========================
+
+On Windows, host and user keys can come from the MS Certificate Store instead
+of files. Requires certificate support (`--enable-certs` or `WOLFSSH_CERTS`);
+enable it with the `--enable-windows-cert-store` build option (mingw hosts
+only) or by defining `WOLFSSH_WINDOWS_CERT_STORE`. The build links against
+`crypt32` and `ncrypt`. For the Visual Studio build see the comment block in
+`ide/winvs/user_settings.h`, including the `WOLFSSH_NO_SHA1_SOFT_DISABLE` and
+`WC_SIG_MIN_HASH_TYPE` caveats an RSA store certificate needs (RFC 6187's only
+RSA algorithm, `x509v3-ssh-rsa`, signs with SHA-1); ECDSA store keys need
+neither.
+
+The echoserver and the SFTP client take a `-W store:subject[:flags]` option
+naming the store, the certificate's subject CN, and optionally the store
+location. Accepted location names are CURRENT_USER (the default),
+LOCAL_MACHINE, USERS, CURRENT_SERVICE, SERVICES, CURRENT_USER_GROUP_POLICY,
+LOCAL_MACHINE_GROUP_POLICY and LOCAL_MACHINE_ENTERPRISE, each also accepted
+with a `CERT_SYSTEM_STORE_` prefix or as a number. `-W` supplies both the
+certificate and its private key; in the SFTP client it therefore cannot be
+combined with `-i`, `-j`, or `-J` (the echoserver's options of those names are
+unrelated and remain usable). `-W` also skips the wolfssh home directory
+search so file arguments resolve against the current directory.
+
+    $ ./examples/echoserver/echoserver -W "My:wolfSSH-Server:LOCAL_MACHINE" -a ./keys/ca-cert-ecc.pem
+
+    $ ./examples/sftpclient/wolfsftp -u testuser -W "My:testuser:CURRENT_USER" -A ./keys/ca-cert-ecc.der -X
+
+wolfSSHd gains these configuration directives, all global only (they are
+rejected inside a `Match` block):
+
+* `wolfSSH_HostKeyStore <store>`, `wolfSSH_HostKeyStoreSubject <CN>`, and
+  `wolfSSH_HostKeyStoreFlags <location>` select the host key from a certificate
+  store. All three must be set together, and they conflict with `HostKey`,
+  `HostCertificate`, and the `-h` command line option.
+* `wolfSSH_TrustedUserCAStore yes|no` loads the client-certificate trust
+  anchors from a Windows store named by `wolfSSH_WinUserPvPara <store>` at
+  the mandatory location `wolfSSH_WinUserDwFlags <location>`
+  (`wolfSSH_WinUserStores` optionally names the provider; only
+  `CERT_STORE_PROV_SYSTEM` is supported). Only certificates with
+  basicConstraints CA:TRUE are loaded, and the OS-managed public trust
+  stores (`Root`, `AuthRoot`, `CA`, ...) are refused: every CA in the named
+  store becomes an SSH login authority, so point it at a store created for
+  this purpose that holds nothing but your own CA.
+* `wolfSSH_TrustedSystemCAKeys yes|no` imports the OS trust store via
+  wolfSSL (`WOLFSSL_SYS_CA_CERTS`) as the client-certificate trust anchors.
+  On CN-binding builds (no FPKI) this additionally requires a per-user
+  `AuthorizedKeysFile` on every config node, so a subject CN match alone can
+  never log in. On FPKI builds every config node must set
+  `AuthorizedUPNDomains` or a per-user `AuthorizedKeysFile`; note
+  `AuthorizedUPNDomains` constrains only the certificate's UPN realm, not
+  which trusted CA issued it, so use it only when the OS trust store holds
+  solely your organization's CA.
+
+Note that the pre-existing `HostKey` and `HostCertificate` directives are now
+also rejected when they appear after a `Match` block (matching OpenSSH); they
+were previously accepted there and silently ignored, so a config that relied
+on that will now stop the daemon at startup with a parse error. Builds made
+with `WOLFSSH_IGNORE_UNKNOWN_CONFIG` instead log a warning and ignore the
+directive, preserving the old behavior as a migration path.
+
+Without FPKI, a client certificate is bound to the requested account by a
+case-insensitive subject CN match only, after the RFC 6187 key usage check
+described under CERTIFICATE SUPPORT; keep the trusted CA set narrow. Note
+also that the config parser requires whitespace between an option name and
+its value; the OpenSSH `Keyword=value` form is rejected.
 
 TPM PUBLIC KEY AUTHENTICATION
 =============================
@@ -588,8 +672,188 @@ If you used a custom password for keygen you must specify the password you used:
 
     $ ./examples/client/client -i ../wolfTPM/keyblob.bin -u hansel -K <custompassword>
 
+TPM SERVER HOST KEY (ECDSA / RSA)
+=================================
+
+The server can also keep its own host key inside the TPM so the host private
+key is never present in RAM. Build wolfSSL, wolfTPM, and wolfSSH the same way
+as above (`--enable-tpm`). Both ECDSA and RSA host keys are supported.
+
+Generate a host key blob under the endorsement hierarchy (ECC or RSA):
+
+    $ ./examples/keygen/keygen hostkey.bin -ecc -t -eh
+    $ ./examples/keygen/keygen hostkey.bin -rsa -t -eh
+
+Start the echoserver with the TPM-resident host key using `-G`:
+
+    $ ./examples/echoserver/echoserver -G ../wolfTPM/hostkey.bin
+
+The server loads the key blob into the TPM, registers it with
+`wolfSSH_CTX_UseTpmHostKey()`, and advertises the matching host key algorithm
+(`ecdsa-sha2-nistp256` or `rsa-sha2-256`). The exchange hash is signed by the
+TPM; the host private key never leaves it. Any client that accepts the host
+key can connect:
+
+    $ ssh -o HostKeyAlgorithms=ecdsa-sha2-nistp256 user@host
+    $ ssh -o HostKeyAlgorithms=rsa-sha2-256 user@host
+
+To integrate this into your own server, provision the key once into the TPM,
+load its handle at boot into a `WOLFTPM2_KEY`, and register it:
+
+    wolfSSH_CTX_UseTpmHostKey(ctx, &tpmDev, &tpmKey);
+
+Note: RSA host keys are signed with `rsa-sha2-256`. The default echoserver key
+auth produced by keygen is `ThisIsMyKeyAuth` (override with the `-G` example's
+`ECHOSERVER_TPM_KEY_AUTH`).
+
+TPM SERVER HOST KEY WITH X.509 CERTIFICATE (ECDSA / RSA)
+=======================================================
+
+The server can present an X.509 certificate as its host key while the matching
+private key stays non-exportable inside the TPM. The client verifies the
+certificate against a trusted CA, so the server's identity is authenticated and
+a man-in-the-middle cannot impersonate it. The exchange hash is signed inside
+the TPM; the private key never enters RAM.
+
+This requires wolfSSH built with certificate support in addition to TPM support,
+and wolfSSL/wolfTPM built with certificate generation:
+
+    wolfSSL
+        $ ./configure --enable-wolfssh --enable-wolftpm --enable-keygen \
+              --enable-certgen --enable-certreq --enable-certext \
+              --enable-cryptocb \
+              CFLAGS="-DWC_RSA_NO_PADDING"
+    wolfTPM
+        $ ./configure --enable-fwtpm --enable-swtpm
+    wolfSSH
+        $ ./configure --enable-tpm --enable-certs
+
+The example under `examples/tpmcertserver` creates a signing key inside the TPM,
+generates a self-signed X.509 certificate from it with
+`wolfTPM2_CSR_Generate_ex()`, then serves with `wolfSSH_CTX_UseTpmHostKey()` and
+`wolfSSH_CTX_UseCert_buffer()`. Run a TPM simulator first (`fwtpm_server` or
+`ibmswtpm2`), then:
+
+    ECDSA:  $ ./examples/tpmcertserver/tpmcertserver -k ecc
+    RSA:    $ ./examples/tpmcertserver/tpmcertserver -k rsa
+
+The server writes its certificate to `tpm-server-cert.der`. The companion
+client verifies the server against that certificate used as the trusted root:
+
+    $ ./examples/tpmcertserver/tpmcertclient -A tpm-server-cert.der
+
+To integrate this into your own server, load the certificate and bind the TPM
+key. Call `wolfSSH_CTX_UseTpmHostKey()` before `wolfSSH_CTX_UseCert_buffer()` so
+the certificate is linked to the TPM key slot:
+
+    wolfSSH_CTX_UseTpmHostKey(ctx, &tpmDev, &tpmKey);
+    wolfSSH_CTX_UseCert_buffer(ctx, certDer, certDerSz, WOLFSSH_FORMAT_ASN1);
+
+On the client, restrict the accepted host key algorithms to the certificate
+algorithms so the connection cannot silently fall back to a plain host key and
+skip certificate (CA) verification:
+
+    wolfSSH_CTX_SetAlgoListKey(ctx,
+        "x509v3-ecdsa-sha2-nistp256,x509v3-ssh-rsa");
+    wolfSSH_CTX_AddRootCert_buffer(ctx, caDer, caDerSz, WOLFSSH_FORMAT_ASN1);
+
+Notes:
+
+- ECDSA is recommended. It uses SHA-256 and needs no extra build options.
+- RSA certificate host keys use the `x509v3-ssh-rsa` algorithm, which is defined
+  with SHA-1. Modern wolfSSL rejects SHA-1 RSA signatures by default, so RSA
+  additionally requires wolfSSL built with
+  `-DWC_SIG_MIN_HASH_TYPE=WC_HASH_TYPE_SHA`. This re-enables a deprecated hash;
+  prefer ECDSA unless RSA is mandated.
+
+STRICT KEY EXCHANGE
+===================
+
+wolfSSH implements strict key exchange, the mitigation for the Terrapin attack
+(CVE-2023-48795) described in `draft-miller-sshm-strict-kex`. It is negotiated
+in the initial KEXINIT and enabled whenever the peer asks for it too, so no
+configuration is needed for the usual case.
+
+With strict KEX in force, wolfSSH accepts nothing but the key exchange itself
+and SSH_MSG_DISCONNECT until the peer's SSH_MSG_NEWKEYS arrives, and it zeroes
+the packet sequence numbers at every SSH_MSG_NEWKEYS. Together those stop an
+attacker splicing packets into the unauthenticated initial exchange to shift
+the sequence numbers. A message that arrives out of turn ends the connection
+with SSH_MSG_DISCONNECT rather than being ignored.
+
+Note that wolfSSH offers neither `chacha20-poly1305@openssh.com` nor the
+`*-etm@openssh.com` MACs, the modes whose nonce comes from the sequence
+number. The full silent-truncation form of Terrapin needs one of those, so it
+was never reachable here; strict KEX closes the sequence-number shift the
+attack is built on.
+
+A caller that has to interoperate with a peer that mishandles the marker can
+turn it off on the context:
+
+    wolfSSH_CTX_SetStrictKex(ctx, 0);
+
+Each session copies the setting when it is made, so the change affects only
+later sessions; to opt out one connection, turn it off, make that session,
+and turn it back on. Only the initial KEXINIT decides whether the mitigation
+is on; a rekey does not revisit it. While strict KEX is offered,
+wolfSSH_SendIgnore() refuses to send until the initial KEX completes. To
+check a session:
+
+    wolfSSH_GetStrictKexNegotiated(ssh);   /* 1 if on, 0 if not */
+
 WOLFSSH APPLICATIONS
 ====================
 
 wolfSSH comes with a server daemon and a command line shell tool. Check out
 the apps directory for more information.
+
+## SBOM / EU CRA Compliance
+
+wolfSSH generates a Software Bill of Materials (SBOM) in CycloneDX 1.6 and
+SPDX 2.3 formats to support compliance with the EU Cyber Resilience Act (CRA).
+The SBOM records the configured build options, hashes the built library
+artifact (shared or static; ELF, Mach-O, or PE), and (with a sufficiently new
+`gen-sbom`) lists wolfSSL as a dependency so vulnerability scanners can
+associate wolfSSL advisories with a wolfSSH deployment. Output is reproducible:
+set `SOURCE_DATE_EPOCH` (or build
+from a git checkout, which uses the last commit time) and repeated runs are
+byte-identical.
+
+```sh
+make sbom WOLFSSL_DIR=/path/to/wolfssl
+```
+
+Requires `python3` and `pyspdxtools` (`pip install spdx-tools`). `WOLFSSL_DIR`
+must point to a wolfssl source tree containing `scripts/gen-sbom` (on `master`
+since wolfSSL/wolfssl#10343). This is a source checkout, not an install prefix.
+
+Output: `wolfssh-<version>.cdx.json`, `wolfssh-<version>.spdx.json`, `wolfssh-<version>.spdx`
+
+Optional overrides:
+
+- `SBOM_LICENSE_OVERRIDE` - SPDX expression to use instead of the licence
+  parsed from `LICENSING` (e.g. `LicenseRef-wolfSSL-Commercial` for commercial
+  licensees).
+- `SBOM_LICENSE_TEXT` - path to the licence text for any `LicenseRef-*` used in
+  `SBOM_LICENSE_OVERRIDE` (required by SPDX 2.3).
+- `SBOM_WOLFSSL_VERSION` - version recorded for the wolfSSL dependency. When
+  unset it is read from `WOLFSSL_DIR/wolfssl/version.h`, falling back to
+  `AC_INIT` in `WOLFSSL_DIR/configure.ac`. Note `wolfssl/version.h` is generated
+  by configure, so `make distclean` in the wolfSSL tree removes it until you
+  re-run configure; the `configure.ac` fallback covers that case. If neither is
+  readable, `make sbom` fails rather than falling back to `pkg-config`, which
+  reports the *installed* wolfSSL and may describe a different build than
+  `WOLFSSL_DIR`.
+
+```sh
+make install-sbom    # installs to $(datadir)/doc/wolfssh/
+make uninstall-sbom
+```
+
+Note: recording wolfSSL as a dependency and emitting wolfSSH-specific project
+URLs require the `gen-sbom` added in wolfSSL/wolfssl#10343 and present on
+wolfssl master. Against an older `gen-sbom`, `make sbom` still succeeds and
+produces a valid SBOM, but omits the wolfSSL dependency entry and inherits
+wolfSSL's project URLs.
+
+For further CRA guidance see [wolfssl/doc/CRA.md](https://github.com/wolfSSL/wolfssl/blob/master/doc/CRA.md).
